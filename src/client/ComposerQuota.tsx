@@ -36,7 +36,7 @@
  * inline sizes are the bar's `width` percent and the panel's fixed `left`/`top`,
  * which are geometry, not appearance.
  *
- * @module dsh-connect-qoder-x/client/composer-quota
+ * @module dsh-qoder-plugin/client/composer-quota
  */
 
 import {

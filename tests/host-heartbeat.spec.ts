@@ -51,7 +51,7 @@ describe('host heartbeat', () => {
     // After write: present and well-formed.
     const heartbeat = await readHostHeartbeat()
     expect(heartbeat).toBeDefined()
-    expect(heartbeat!.package).toBe('dsh-connect-qoder-x')
+    expect(heartbeat!.package).toBe('dsh-qoder-plugin')
     expect(heartbeat!.version).toBe(1)
     expect(heartbeat!.pid).toBe(process.pid)
     expect(typeof heartbeat!.registeredAt).toBe('number')
@@ -81,7 +81,7 @@ describe('host heartbeat', () => {
     ) as Record<string, unknown>
     expect(raw).toMatchObject({
       version: 1,
-      package: 'dsh-connect-qoder-x',
+      package: 'dsh-qoder-plugin',
       pluginVersion: QODER_CONNECT_VERSION,
       pid: process.pid,
     })
@@ -99,7 +99,7 @@ describe('host heartbeat', () => {
     await expect(writeHostHeartbeat()).resolves.toBeUndefined()
     const heartbeat = await readHostHeartbeat()
     expect(heartbeat).toBeDefined()
-    expect(heartbeat?.package).toBe('dsh-connect-qoder-x')
+    expect(heartbeat?.package).toBe('dsh-qoder-plugin')
   })
 
   it('detects a recycled PID as dead when the process start time is readable', async () => {
@@ -110,7 +110,7 @@ describe('host heartbeat', () => {
     const startAtMs = processStartTimeMs(process.pid)
     const recycled: QoderHostHeartbeat = {
       version: 1,
-      package: 'dsh-connect-qoder-x',
+      package: 'dsh-qoder-plugin',
       pluginVersion: '0.0.0-test',
       // 1 min before this process started (the recycled-PID case).
       registeredAt: (startAtMs ?? Date.now()) - 60_000,
@@ -141,7 +141,7 @@ describe('host heartbeat', () => {
     const dir = await tempStateRoot()
     await writeFile(
       join(dir, 'state', QODER_HOST_HEARTBEAT_FILENAME),
-      JSON.stringify({ version: 99, package: 'dsh-connect-qoder-x', registeredAt: Date.now(), pid: process.pid }),
+      JSON.stringify({ version: 99, package: 'dsh-qoder-plugin', registeredAt: Date.now(), pid: process.pid }),
       'utf8',
     )
     expect(await readHostHeartbeat()).toBeUndefined()
@@ -163,13 +163,13 @@ describe('host heartbeat', () => {
     const dir = await tempStateRoot()
     await writeFile(
       join(dir, 'state', QODER_HOST_HEARTBEAT_FILENAME),
-      JSON.stringify({ version: 1, package: 'dsh-connect-qoder-x', registeredAt: 5, pid: process.pid }),
+      JSON.stringify({ version: 1, package: 'dsh-qoder-plugin', registeredAt: 5, pid: process.pid }),
       'utf8',
     )
     const heartbeat = await readHostHeartbeat()
     expect(heartbeat).toEqual({
       version: 1,
-      package: 'dsh-connect-qoder-x',
+      package: 'dsh-qoder-plugin',
       pluginVersion: 'unknown',
       registeredAt: 5,
       pid: process.pid,

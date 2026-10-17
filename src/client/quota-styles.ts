@@ -21,14 +21,14 @@
  */
 
 /** Stylesheet id (the `data-plugin-css` value that makes injection idempotent). */
-export const QUOTA_CSS_ID = 'dsh-connect-qoder-x/QuotaPanel.module.css'
+export const QUOTA_CSS_ID = 'dsh-qoder-plugin/QuotaPanel.module.css'
 
 /** Install the stylesheet once; returns its disposer. */
 export function injectQuotaCss(): () => void {
   if (typeof document === 'undefined') return () => {}
   if (document.querySelector(`style[data-plugin-css="${QUOTA_CSS_ID}"]`) !== null) return () => {}
   const tag = document.createElement('style')
-  tag.dataset.plugin = 'dsh-connect-qoder-x'
+  tag.dataset.plugin = 'dsh-qoder-plugin'
   tag.dataset.pluginCss = QUOTA_CSS_ID
   tag.textContent = QUOTA_CSS
   document.head.appendChild(tag)

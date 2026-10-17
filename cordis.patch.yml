@@ -7,4 +7,4 @@
 # and the client's ROW_ID constant must agree.
 - insert:
     - id: llm-qoder-x
-      name: dsh-connect-qoder-x
+      name: dsh-qoder-plugin

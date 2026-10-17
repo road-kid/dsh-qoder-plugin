@@ -2,7 +2,7 @@
  * Probe orchestration: the serial queue, the consent gate, and the bridge from
  * an observation to what the adapter may expose.
  *
- * Kept separate from {@link module:dsh-connect-qoder-x/probe} so the protocol
+ * Kept separate from {@link module:dsh-qoder-plugin/probe} so the protocol
  * stays a pure function of one model's responses, while queueing, persistence,
  * and policy live here. Two rules from `docs/reasoning-effort-probe-plan.md`
  * §3.3 are structural rather than advisory:
@@ -10,7 +10,7 @@
  * - one probe at a time (a user's real chat must not contend with a sweep),
  * - nothing at all happens without explicit consent.
  *
- * @module dsh-connect-qoder-x/probe-service
+ * @module dsh-qoder-plugin/probe-service
  */
 
 import type { QoderCredentialStore } from './auth.ts'

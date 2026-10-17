@@ -17,7 +17,7 @@
  * made to qualify, and the caller is told so instead of being handed a
  * fabricated identity that the upstream will ignore.
  *
- * @module dsh-connect-qoder-x/qoder/transport/risk-identity
+ * @module dsh-qoder-plugin/qoder/transport/risk-identity
  */
 
 import { spawn } from 'node:child_process'

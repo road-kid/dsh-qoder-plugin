@@ -2,7 +2,7 @@
  * The plugin's data directory — the ONE place every file the plugin owns
  * lives.
  *
- * Layout: `<profile>/.dsh-connect-qoder-x/state/` (the profile discovered
+ * Layout: `<profile>/.dsh-qoder-plugin/state/` (the profile discovered
  * the same way the credential store always did). Everything — PAT files,
  * saved catalogs, probe records, the host heartbeat, and the machine-id
  * seed — writes there, so a profile directory never collects loose
@@ -16,16 +16,16 @@
  * directory without pulling in the credential code (and its upstream
  * dependency) — these modules stay leaf-light on purpose.
  *
- * @module dsh-connect-qoder-x/paths
+ * @module dsh-qoder-plugin/paths
  */
 
-import { readFileSync, readdirSync, realpathSync, type Dirent } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, type Dirent } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 
 /** The per-profile directory the plugin's data folder lives under. */
-export const QODER_DATA_DIR_NAME = '.dsh-connect-qoder-x'
+export const QODER_DATA_DIR_NAME = '.dsh-qoder-plugin'
 
 /** The directory inside the data dir where the rebuildable state files live. */
 export const QODER_STATE_DIR_NAME = 'state'
@@ -36,7 +36,7 @@ export const QODER_DATA_DIR_ENV = 'DSH_QODER_DATA_DIR'
 const PROFILES_DIR_NAME = 'profiles'
 
 /** The npm name of this package, as a profile's manifest declares it. */
-const PLUGIN_PACKAGE_NAME = 'dsh-connect-qoder-x'
+const PLUGIN_PACKAGE_NAME = 'dsh-qoder-plugin'
 
 function pluginPackageRoot(): string | undefined {
   try {
@@ -53,7 +53,7 @@ function pluginPackageRoot(): string | undefined {
  *
  * Read from the profile's manifest rather than inferred from this module's own
  * location, because DSH installs a plugin into a profile by *link*: the manifest
- * carries `"dsh-connect-qoder-x": "link:/path/to/checkout"`, while Node
+ * carries `"dsh-qoder-plugin": "link:/path/to/checkout"`, while Node
  * resolves the module to that real path, which lies outside `$DSH_HOME` entirely.
  * Walking up from the module would therefore miss the profile for exactly the
  * install shape a developer uses.
@@ -117,8 +117,31 @@ function discoverProfileDir(): string | undefined {
   return candidates.find(candidate => profileLinksToThisPackage(candidate))
 }
 
+/** The pre-0.5.0 folder name, migrated to {@link QODER_DATA_DIR_NAME} on first use. */
+const LEGACY_DATA_DIR_NAME = '.dsh-connect-qoder-x'
+
 /**
- * The plugin's data directory: `<profile>/.dsh-connect-qoder-x`.
+ * Move a pre-0.5.0 data folder to its new name, once.
+ *
+ * The plugin was called `dsh-connect-qoder-x` before 0.5.0, so an upgrade
+ * would otherwise start with an empty data dir and lose the saved PAT and
+ * settings. Only runs when the new folder does not exist yet and the legacy
+ * one does; failures (read-only home, locked files) are not fatal — the
+ * plugin simply starts fresh and the user can rename the folder by hand.
+ */
+function migrateLegacyDataDir(base: string): void {
+  const legacy = join(base, LEGACY_DATA_DIR_NAME)
+  const current = join(base, QODER_DATA_DIR_NAME)
+  try {
+    if (existsSync(current) || !existsSync(legacy)) return
+    renameSync(legacy, current)
+  } catch {
+    // Best effort: an unmigrated upgrade is a fresh start, not a crash.
+  }
+}
+
+/**
+ * The plugin's data directory: `<profile>/.dsh-qoder-plugin`.
  *
  * Falls back to the Harness home when no profile can be discovered — a
  * checkout running its own tests, or a host that loads the plugin from
@@ -129,6 +152,7 @@ export function qoderPluginDataDir(): string {
   const override = process.env[QODER_DATA_DIR_ENV]
   if (override !== undefined && override.trim() !== '') return override
   const base = discoverProfileDir() ?? resolveDshHome()
+  migrateLegacyDataDir(base)
   return join(base, QODER_DATA_DIR_NAME)
 }
 

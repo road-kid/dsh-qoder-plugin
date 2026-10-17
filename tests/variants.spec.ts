@@ -50,9 +50,9 @@ describe('variant descriptors', () => {
     expect(CHINA_VARIANT.ownFilename).toBe('.qoder-auth.json')
     expect(CHINA_VARIANT.probeFilename).toBe('.qoder-probe.json')
     expect(CHINA_VARIANT.catalogFilename).toBe('.qoder-catalog.json')
-    expect(CHINA_VARIANT.statusPath).toBe('/plugins/dsh-connect-qoder-x/status')
-    expect(CHINA_VARIANT.probePath).toBe('/plugins/dsh-connect-qoder-x/probe')
-    expect(CHINA_VARIANT.authPath).toBe('/plugins/dsh-connect-qoder-x/auth')
+    expect(CHINA_VARIANT.statusPath).toBe('/plugins/dsh-qoder-plugin/status')
+    expect(CHINA_VARIANT.probePath).toBe('/plugins/dsh-qoder-plugin/probe')
+    expect(CHINA_VARIANT.authPath).toBe('/plugins/dsh-qoder-plugin/auth')
   })
 
   it('gives the Global arm its own files and /global/ routes', () => {
@@ -63,9 +63,9 @@ describe('variant descriptors', () => {
     expect(GLOBAL_VARIANT.ownFilename).toBe('.qoder-global-auth.json')
     expect(GLOBAL_VARIANT.probeFilename).toBe('.qoder-global-probe.json')
     expect(GLOBAL_VARIANT.catalogFilename).toBe('.qoder-global-catalog.json')
-    expect(GLOBAL_VARIANT.statusPath).toBe('/plugins/dsh-connect-qoder-x/global/status')
-    expect(GLOBAL_VARIANT.probePath).toBe('/plugins/dsh-connect-qoder-x/global/probe')
-    expect(GLOBAL_VARIANT.authPath).toBe('/plugins/dsh-connect-qoder-x/global/auth')
+    expect(GLOBAL_VARIANT.statusPath).toBe('/plugins/dsh-qoder-plugin/global/status')
+    expect(GLOBAL_VARIANT.probePath).toBe('/plugins/dsh-qoder-plugin/global/probe')
+    expect(GLOBAL_VARIANT.authPath).toBe('/plugins/dsh-qoder-plugin/global/auth')
   })
 
   it('orders the table China-first as the default and compatibility anchor', () => {
@@ -111,9 +111,9 @@ describe('status-path literals', () => {
     expect(GLOBAL_VARIANT.statusPath).toBe(QODER_GLOBAL_STATUS_PATH)
     expect(GLOBAL_VARIANT.probePath).toBe(QODER_GLOBAL_PROBE_PATH)
     expect(GLOBAL_VARIANT.authPath).toBe(QODER_GLOBAL_AUTH_PATH)
-    expect(QODER_GLOBAL_STATUS_PATH).toBe('/plugins/dsh-connect-qoder-x/global/status')
-    expect(QODER_GLOBAL_PROBE_PATH).toBe('/plugins/dsh-connect-qoder-x/global/probe')
-    expect(QODER_GLOBAL_AUTH_PATH).toBe('/plugins/dsh-connect-qoder-x/global/auth')
+    expect(QODER_GLOBAL_STATUS_PATH).toBe('/plugins/dsh-qoder-plugin/global/status')
+    expect(QODER_GLOBAL_PROBE_PATH).toBe('/plugins/dsh-qoder-plugin/global/probe')
+    expect(QODER_GLOBAL_AUTH_PATH).toBe('/plugins/dsh-qoder-plugin/global/auth')
   })
 })
 

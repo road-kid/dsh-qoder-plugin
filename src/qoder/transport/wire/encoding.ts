@@ -12,7 +12,7 @@
  * byte-for-byte identical (the input is always Base64, i.e. ASCII) and about
  * 24x faster.
  *
- * @module dsh-connect-qoder-x/qoder/transport/wire/encoding
+ * @module dsh-qoder-plugin/qoder/transport/wire/encoding
  */
 
 const qoderCustomAlphabet = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!'

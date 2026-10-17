@@ -341,7 +341,7 @@ describe('plugin data directory', () => {
     await mkdir(join(home, 'profiles', 'web'), { recursive: true })
     await writeFile(
       join(home, 'profiles', 'web', 'package.json'),
-      JSON.stringify({ name: 'dsh-profile-web', dependencies: { 'dsh-connect-qoder-x': 'link:E:/elsewhere' } }),
+      JSON.stringify({ name: 'dsh-profile-web', dependencies: { 'dsh-qoder-plugin': 'link:E:/elsewhere' } }),
     )
     await mkdir(join(home, 'profiles', 'desktop'), { recursive: true })
     await writeFile(join(home, 'profiles', 'desktop', 'package.json'), JSON.stringify({ name: 'dsh-profile-desktop' }))
@@ -357,7 +357,7 @@ describe('plugin data directory', () => {
       await mkdir(join(home, 'profiles', name), { recursive: true })
       await writeFile(
         join(home, 'profiles', name, 'package.json'),
-        JSON.stringify({ dependencies: { 'dsh-connect-qoder-x': 'link:E:/elsewhere' } }),
+        JSON.stringify({ dependencies: { 'dsh-qoder-plugin': 'link:E:/elsewhere' } }),
       )
     }
     vi.stubEnv(QODER_DATA_DIR_ENV, '')

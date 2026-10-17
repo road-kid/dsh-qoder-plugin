@@ -8,12 +8,12 @@
  * small JSON document.
  *
  * One file per variant inside the plugin's data directory
- * (`<.dsh-connect-qoder-x>/`). The on-disk schema is
+ * (`<.dsh-qoder-plugin>/`). The on-disk schema is
  * `{version: 2, pat, region, savedAt}` — deliberately narrower than the
  * WorkBuddy-era document it replaces: anything this file does not name is
  * not a fact the plugin knows.
  *
- * @module dsh-connect-qoder-x/auth
+ * @module dsh-qoder-plugin/auth
  */
 
 import { createHash } from 'node:crypto'

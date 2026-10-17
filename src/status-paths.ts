@@ -6,7 +6,7 @@ import type { QoderRegion } from './qoder/region.ts'
 export type QoderVariantId = 'qoder' | 'qoder-global'
 
 /** Plugin-owned status endpoint consumed by its browser half. */
-export const QODER_STATUS_PATH = '/plugins/dsh-connect-qoder-x/status'
+export const QODER_STATUS_PATH = '/plugins/dsh-qoder-plugin/status'
 
 /**
  * Plugin-owned settings endpoint consumed by its browser half.
@@ -16,7 +16,7 @@ export const QODER_STATUS_PATH = '/plugins/dsh-connect-qoder-x/status'
  * surface, replacing writes through the host's settings service — see
  * {@link ./settings-store.ts} for why.
  */
-export const QODER_SETTINGS_FACE_PATH = '/plugins/dsh-connect-qoder-x/settings'
+export const QODER_SETTINGS_FACE_PATH = '/plugins/dsh-qoder-plugin/settings'
 
 /**
  * Plugin-owned probe control endpoint.
@@ -27,7 +27,7 @@ export const QODER_SETTINGS_FACE_PATH = '/plugins/dsh-connect-qoder-x/settings'
  * also requires the in-process key the browser half receives with the status
  * document.
  */
-export const QODER_PROBE_PATH = '/plugins/dsh-connect-qoder-x/probe'
+export const QODER_PROBE_PATH = '/plugins/dsh-qoder-plugin/probe'
 
 /**
  * Plugin-owned PAT endpoint, one per variant.
@@ -37,7 +37,7 @@ export const QODER_PROBE_PATH = '/plugins/dsh-connect-qoder-x/probe'
  * it persists a credential — so it also requires the in-process key the
  * browser half receives with the status document.
  */
-export const QODER_AUTH_PATH = '/plugins/dsh-connect-qoder-x/auth'
+export const QODER_AUTH_PATH = '/plugins/dsh-qoder-plugin/auth'
 
 /**
  * The international (Qoder Global) variant's own triple of routes.
@@ -47,9 +47,9 @@ export const QODER_AUTH_PATH = '/plugins/dsh-connect-qoder-x/auth'
  * independently, and a shared expression is one build-config drift away from
  * the desk asking a route the host never mounted.
  */
-export const QODER_GLOBAL_STATUS_PATH = '/plugins/dsh-connect-qoder-x/global/status'
-export const QODER_GLOBAL_PROBE_PATH = '/plugins/dsh-connect-qoder-x/global/probe'
-export const QODER_GLOBAL_AUTH_PATH = '/plugins/dsh-connect-qoder-x/global/auth'
+export const QODER_GLOBAL_STATUS_PATH = '/plugins/dsh-qoder-plugin/global/status'
+export const QODER_GLOBAL_PROBE_PATH = '/plugins/dsh-qoder-plugin/global/probe'
+export const QODER_GLOBAL_AUTH_PATH = '/plugins/dsh-qoder-plugin/global/auth'
 
 /**
  * One action the PAT route accepts.

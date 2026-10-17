@@ -3,7 +3,7 @@
  * shim and the same-origin web-status route. Both are only ever meant to be
  * addressed through the machine's loopback interface.
  *
- * @module dsh-connect-qoder-x/loopback
+ * @module dsh-qoder-plugin/loopback
  */
 
 /** Loopback hostnames a local plugin surface may be addressed by. */

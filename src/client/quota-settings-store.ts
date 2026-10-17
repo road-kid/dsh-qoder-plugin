@@ -45,7 +45,9 @@ export interface QuotaReadoutState {
  * preference needs no host round trip, survives reloads, and keeps both halves
  * honest about where the value lives.
  */
-const READOUT_STORAGE_KEY = 'dsh-connect-qoder-x:readout'
+const READOUT_STORAGE_KEY = 'dsh-qoder-plugin:readout'
+/** Pre-0.5.0 key (the plugin's former package name); read once and migrated to {@link READOUT_STORAGE_KEY}. */
+const LEGACY_READOUT_STORAGE_KEY = 'dsh-connect-qoder-x:readout'
 
 /** The all-on state used when nothing (or nothing valid) was stored. */
 function defaultQuotaReadout(): QuotaReadoutState {
@@ -76,16 +78,22 @@ function loadQuotaReadout(): QuotaReadoutState {
   const storage = readoutStorage()
   if (storage === undefined) return defaultQuotaReadout()
   try {
-    const raw = storage.getItem(READOUT_STORAGE_KEY)
+    const raw = storage.getItem(READOUT_STORAGE_KEY) ?? storage.getItem(LEGACY_READOUT_STORAGE_KEY)
     if (raw === null) return defaultQuotaReadout()
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return defaultQuotaReadout()
     const stored = parsed as { enabled?: unknown; cn?: unknown; global?: unknown }
-    return {
+    const state: QuotaReadoutState = {
       enabled: readoutFlag(stored.enabled),
       cn: readoutFlag(stored.cn),
       global: readoutFlag(stored.global),
     }
+    // A pre-0.5.0 preference follows the plugin's new package name.
+    if (storage.getItem(READOUT_STORAGE_KEY) === null) {
+      storage.setItem(READOUT_STORAGE_KEY, JSON.stringify(state))
+      storage.removeItem(LEGACY_READOUT_STORAGE_KEY)
+    }
+    return state
   } catch {
     // Corrupt JSON is not a reason to hide the chip: fall back to all-on.
     return defaultQuotaReadout()

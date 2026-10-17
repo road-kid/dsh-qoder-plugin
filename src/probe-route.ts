@@ -15,7 +15,7 @@
  * The route never accepts a prompt, a model id outside the live catalog, or a
  * sentinel from the browser: a probe request is assembled entirely host-side.
  *
- * @module dsh-connect-qoder-x/probe-route
+ * @module dsh-qoder-plugin/probe-route
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -264,5 +264,5 @@ export function registerQoderProbeRoute(
     return () => {
       dispose()
     }
-  }, 'dsh-connect-qoder-x: probe control route')
+  }, 'dsh-qoder-plugin: probe control route')
 }

@@ -17,7 +17,7 @@
  *   it belongs next to the thing it acts on, sized to one line plus two small
  *   buttons.
  *
- * @module dsh-connect-qoder-x/client/probe-control
+ * @module dsh-qoder-plugin/client/probe-control
  */
 
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'

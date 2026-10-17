@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0
+
+### Changed — renamed to `dsh-qoder-plugin`
+
+The plugin was `dsh-connect-qoder-x`, which collided in spirit with the
+unrelated `dsh-connect-qoder` and `dsh-qoder-connect` packages and could not be
+found in the plugin market under its own name. It is now **`dsh-qoder-plugin`**
+everywhere: npm package name, module registration id, HTTP route prefix
+(`/plugins/dsh-qoder-plugin/*`), CLI command (`dsh-qoder-plugin`), data
+directory (`.dsh-qoder-plugin/`) and the GitHub repository
+(`road-kid/dsh-qoder-plugin`). The profile row id stays `llm-qoder-x`, so the
+provider id and existing model selections are unchanged.
+
+**Upgrade from 0.4.x**
+
+1. Remove the old package from the profile (or let the new install replace it):
+   `dsh plugin --profile web add github:road-kid/dsh-qoder-plugin`.
+2. The plugin moves `<profile>/.dsh-connect-qoder-x/` to
+   `<profile>/.dsh-qoder-plugin/` on first use, so the saved PAT and settings
+   carry over. If the folder cannot be moved, rename it by hand; otherwise
+   re-save the PAT.
+3. The per-browser readout switches migrate from the old localStorage key
+   (`dsh-connect-qoder-x:readout`) to `dsh-qoder-plugin:readout`.
+
 ## 0.4.0
 
 ### Changed — quota moved into the composer, settings page compacted, models save in one step
@@ -126,7 +150,7 @@ got an answer" were indistinguishable, and the card rendered both as *That PAT w
 rejected* — sending users to regenerate a credential that had never been judged
 whenever the endpoint was slow, offline, or returning 5xx. The two are now separate
 outcomes with their own messages, in the card, the settings route and
-`dsh-connect-qoder-x pat set`.
+`dsh-qoder-plugin pat set`.
 
 ### Fixed — model-list refresh failures were silent
 
@@ -179,7 +203,7 @@ date. `清空日志 / Clear logs` stays within reach.
   0.1.7 and 0.2.x no longer read.
 - Model list, context-window slider and usage panels were reshaped; dead settings
   surfaces, the redundant card shell and orphaned styles were removed.
-- The plugin page now shows the package name `dsh-connect-qoder-x` with a description
+- The plugin page now shows the package name `dsh-qoder-plugin` with a description
   covering PAT-based access, dual-region support, model toggles, context windows,
   quota and check-in; the card's own one-liner was rewritten to match.
 

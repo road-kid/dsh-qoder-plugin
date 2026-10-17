@@ -8,7 +8,7 @@
  * This asymmetry is intentional: the host is the load-bearing half, and
  * a missing heartbeat unambiguously means the host never started.
  *
- * @module dsh-connect-qoder-x/host-heartbeat
+ * @module dsh-qoder-plugin/host-heartbeat
  */
 
 import { execFileSync } from 'node:child_process'
@@ -26,7 +26,7 @@ const HEARTBEAT_FORMAT_VERSION = 1
 /** On-disk shape of the heartbeat. */
 export interface QoderHostHeartbeat {
   version: typeof HEARTBEAT_FORMAT_VERSION
-  package: 'dsh-connect-qoder-x'
+  package: 'dsh-qoder-plugin'
   pluginVersion: string
   /** Epoch milliseconds when the host registered the provider. */
   registeredAt: number
@@ -47,7 +47,7 @@ export function qoderHostHeartbeatPath(): string {
 export async function writeHostHeartbeat(): Promise<void> {
   const document: QoderHostHeartbeat = {
     version: HEARTBEAT_FORMAT_VERSION,
-    package: 'dsh-connect-qoder-x',
+    package: 'dsh-qoder-plugin',
     pluginVersion: QODER_CONNECT_VERSION,
     registeredAt: Date.now(),
     pid: process.pid,
@@ -84,13 +84,13 @@ export async function readHostHeartbeat(): Promise<QoderHostHeartbeat | undefine
     const parsed = JSON.parse(raw) as Partial<QoderHostHeartbeat>
     if (
       parsed.version === HEARTBEAT_FORMAT_VERSION
-      && parsed.package === 'dsh-connect-qoder-x'
+      && parsed.package === 'dsh-qoder-plugin'
       && typeof parsed.registeredAt === 'number'
       && typeof parsed.pid === 'number'
     ) {
       return {
         version: HEARTBEAT_FORMAT_VERSION,
-        package: 'dsh-connect-qoder-x',
+        package: 'dsh-qoder-plugin',
         pluginVersion: typeof parsed.pluginVersion === 'string' ? parsed.pluginVersion : 'unknown',
         registeredAt: parsed.registeredAt,
         pid: parsed.pid,

@@ -4,7 +4,7 @@
  * Implements RSA + AES + MD5 signature generation required by the upstream
  * Qoder gateway.
  *
- * @module dsh-connect-qoder-x/qoder/transport/wire/cosy
+ * @module dsh-qoder-plugin/qoder/transport/wire/cosy
  */
 
 import crypto from 'node:crypto'

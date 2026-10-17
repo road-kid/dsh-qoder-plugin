@@ -17,7 +17,7 @@
  * - not a place for secrets: model metadata only, never a token. The account
  *   key is a one-way hash of the credential, not the credential itself.
  *
- * @module dsh-connect-qoder-x/catalog-store
+ * @module dsh-qoder-plugin/catalog-store
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'

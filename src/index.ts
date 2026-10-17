@@ -10,7 +10,7 @@
  * Neither variant's startup, catalog fetch, or credential state can stop the
  * other from registering — a user with only one token sees only that group.
  *
- * @module dsh-connect-qoder-x
+ * @module dsh-qoder-plugin
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -677,7 +677,7 @@ function createVariantRuntime(
   const resolveAttachmentService = (): AttachmentStore => {
     const service = ctx.get('attachments')
     if (service === undefined) {
-      throw new Error('dsh-connect-qoder-x: no attachment service is available')
+      throw new Error('dsh-qoder-plugin: no attachment service is available')
     }
     return service
   }
@@ -699,7 +699,7 @@ function createVariantRuntime(
     onJobTokenRefreshed: info => {
       jobTokenRefreshedAt = info.at
       ctx.logger.warn(
-        `dsh-connect-qoder-x: ${variant.displayName} job token was auto-refreshed after an upstream rejection`,
+        `dsh-qoder-plugin: ${variant.displayName} job token was auto-refreshed after an upstream rejection`,
       )
       // The visible channel: one line in the conversation that triggered the
       // refresh (the request this heal happened inside).
@@ -709,7 +709,7 @@ function createVariantRuntime(
       // The heal ran and lost. Announced at most once per outage by the
       // transport, so a long rejection storm prints one row, not one per retry.
       ctx.logger.warn(
-        `dsh-connect-qoder-x: ${variant.displayName} job token refresh did not recover the chat (upstream status ${info.status ?? 'unknown'})`,
+        `dsh-qoder-plugin: ${variant.displayName} job token refresh did not recover the chat (upstream status ${info.status ?? 'unknown'})`,
       )
       emitJobTokenRefreshFailedHint(info.at, jobTokenRefreshFailedHintText(info.at))
     },
@@ -859,7 +859,7 @@ function probeSection(runtime: VariantRuntime, consent: boolean): QoderWebProbeS
  */
 function detach(ctx: Context, work: Promise<unknown>, what: string): void {
   void work.catch((error: unknown) => {
-    ctx.logger.warn(`dsh-connect-qoder-x: ${what} failed`, error)
+    ctx.logger.warn(`dsh-qoder-plugin: ${what} failed`, error)
   })
 }
 
@@ -887,7 +887,7 @@ async function startVariant(ctx: Context, runtime: VariantRuntime, seedCatalog: 
   try {
     await shim.ready
   } catch (error: unknown) {
-    ctx.logger.error(`dsh-connect-qoder-x: ${variant.displayName} loopback endpoint failed to start`, error)
+    ctx.logger.error(`dsh-qoder-plugin: ${variant.displayName} loopback endpoint failed to start`, error)
     return false
   }
 
@@ -977,7 +977,7 @@ async function startVariant(ctx: Context, runtime: VariantRuntime, seedCatalog: 
     detach(ctx, seedCatalog(), `${variant.id} catalog seed`)
     return true
   } catch (error: unknown) {
-    ctx.logger.error(`dsh-connect-qoder-x: ${variant.displayName} provider registration failed`, error)
+    ctx.logger.error(`dsh-qoder-plugin: ${variant.displayName} provider registration failed`, error)
     detach(ctx, shim.close(), 'loopback endpoint close')
     return false
   }
@@ -1123,7 +1123,7 @@ function registerQoderSettingsFace(
       },
     })
     return () => { dispose() }
-  }, 'dsh-connect-qoder-x: settings face')
+  }, 'dsh-qoder-plugin: settings face')
 }
 
 /** JSON response helper for the settings face. */
@@ -1294,7 +1294,7 @@ async function cleanupEntryConfig(ctx: Parameters<typeof apply>[0], ownKeys: rea
       return
     } catch (error: unknown) {
       if (attempt === attempts - 1) {
-        ctx.logger?.warn?.('dsh-connect-qoder-x: entry config cleanup failed', error)
+        ctx.logger?.warn?.('dsh-qoder-plugin: entry config cleanup failed', error)
         return
       }
       await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1) + Math.random() * 500))
@@ -1859,7 +1859,7 @@ export function apply(ctx: Context, config: Config): void {
           return typeof dispose === 'function' ? (dispose as () => void) : () => {}
         })
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] settings.configure failed (own settings file still serves):', error)
+        console.error('[dsh-qoder-plugin] settings.configure failed (own settings file still serves):', error)
       }
     }
 
@@ -1998,7 +1998,7 @@ export function apply(ctx: Context, config: Config): void {
         runtime.lastFetchAtMs = Date.now()
         runtime.catalogError = error instanceof Error ? error.message.slice(0, 300) : String(error)
         ctx.logger.warn(
-          `dsh-connect-qoder-x: ${runtime.variant.displayName} catalog unavailable; serving the fallback list`,
+          `dsh-qoder-plugin: ${runtime.variant.displayName} catalog unavailable; serving the fallback list`,
           error,
         )
         runtime.invalidate()
@@ -2028,7 +2028,7 @@ export function apply(ctx: Context, config: Config): void {
           })
         } catch (error: unknown) {
           ctx.logger.warn(
-            `dsh-connect-qoder-x: ${runtime.variant.displayName} catalog could not be saved for this account`,
+            `dsh-qoder-plugin: ${runtime.variant.displayName} catalog could not be saved for this account`,
             error,
           )
         }
@@ -2060,7 +2060,7 @@ export function apply(ctx: Context, config: Config): void {
     const credential = await runtime.store.current().catch((error: unknown) => {
       // A region mismatch or an unreadable file is reported, not swallowed as
       // "signed out": the user needs to know which file to fix.
-      ctx.logger.warn(`dsh-connect-qoder-x: ${runtime.variant.displayName} credential read failed`, error)
+      ctx.logger.warn(`dsh-qoder-plugin: ${runtime.variant.displayName} credential read failed`, error)
       return undefined
     })
     if (stopped) return

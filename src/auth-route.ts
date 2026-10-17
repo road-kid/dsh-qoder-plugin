@@ -11,7 +11,7 @@
  * steer a token into the other's upstream — a token pasted into the Qoder
  * Global card is validated against, and stored for, Qoder Global only.
  *
- * @module dsh-connect-qoder-x/auth-route
+ * @module dsh-qoder-plugin/auth-route
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -193,5 +193,5 @@ export function registerQoderAuthRoute(
     return () => {
       dispose()
     }
-  }, 'dsh-connect-qoder-x: PAT route')
+  }, 'dsh-qoder-plugin: PAT route')
 }

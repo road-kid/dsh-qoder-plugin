@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "dsh-connect-qoder-x",
+    "title": "dsh-qoder-plugin",
     "description": "Bring Qoder models into DeepSeek Harness: use a PAT to reach the same model service Qoder CLI uses, with China/Global dual-region support, model toggles, context windows and daily check-in, plus a read-only credit overview."
   }
 }

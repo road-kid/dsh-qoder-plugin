@@ -11,7 +11,7 @@
  * This lives on its own so both the scheduler and the transport can share one
  * definition without importing each other.
  *
- * @module dsh-connect-qoder-x/claim-window
+ * @module dsh-qoder-plugin/claim-window
  */
 
 /**

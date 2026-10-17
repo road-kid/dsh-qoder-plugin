@@ -12,7 +12,7 @@
  * product's files, and carries no token, prompt, or response body — only
  * model ids, effort spellings, and timestamps.
  *
- * @module dsh-connect-qoder-x/probe-store
+ * @module dsh-qoder-plugin/probe-store
  */
 
 import { createHash } from 'node:crypto'

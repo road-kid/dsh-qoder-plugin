@@ -4,7 +4,7 @@
  * `dsh-llm-pi-ai` extension points the way `dsh-codex-connect` assembles its
  * Codex route.
  *
- * @module dsh-connect-qoder-x/adapter
+ * @module dsh-qoder-plugin/adapter
  */
 
 import { createProvider } from '@earendil-works/pi-ai'
@@ -50,7 +50,7 @@ const INERT_AUTH: { credentials: CredentialStore; authContext: AuthContext } = {
     async read() { return undefined },
     async list() { return [] },
     async modify() {
-      throw new Error('dsh-connect-qoder-x: Qoder routes have no pi-ai credential lifecycle')
+      throw new Error('dsh-qoder-plugin: Qoder routes have no pi-ai credential lifecycle')
     },
     async delete() {},
   },
@@ -271,7 +271,7 @@ export function createQoderAdapter(options: QoderAdapterOptions): QoderAdapter {
     provider: providerId,
     displayName,
     streamIdleTimeoutMs: QODER_STREAM_IDLE_TIMEOUT_MS,
-    retryPolicy: resolveRetryPolicy(undefined, `dsh-connect-qoder-x:${providerId} retryPolicy`),
+    retryPolicy: resolveRetryPolicy(undefined, `dsh-qoder-plugin:${providerId} retryPolicy`),
     configuredMaxTokens: new Map(),
     // Required since 0.1.5-alpha.2; the live catalog only exposes models that
     // probed successfully, so there is never a per-model failure to report.

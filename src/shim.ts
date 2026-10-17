@@ -12,7 +12,7 @@
  * own client satisfies all four by construction; local attackers cannot
  * read the secret out of the plugin process's memory.
  *
- * @module dsh-connect-qoder-x/shim
+ * @module dsh-qoder-plugin/shim
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -128,7 +128,7 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
     // into process termination — one refused local request must never be able
     // to take the whole Harness down.
     void handle(req, res).catch((error: unknown) => {
-      logger?.warn('dsh-connect-qoder-x: loopback request failed', error)
+      logger?.warn('dsh-qoder-plugin: loopback request failed', error)
       try {
         if (!res.headersSent) writeOpenAIError(res, 500, 'internal', 'loopback request failed')
         else res.end()
@@ -250,7 +250,7 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
       if (chunk.includes('[DONE]')) sawDone = true
     })
     body.on('error', (error: unknown) => {
-      logger?.warn('dsh-connect-qoder-x: upstream stream failed mid-flight', error)
+      logger?.warn('dsh-qoder-plugin: upstream stream failed mid-flight', error)
       if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
     })
     body.pipe(res)

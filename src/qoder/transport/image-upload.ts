@@ -7,7 +7,7 @@
  * sharing, bounded caching, and the degradation contract that keeps a model
  * request alive when publication fails.
  *
- * @module dsh-connect-qoder-x/qoder/transport/image-upload
+ * @module dsh-qoder-plugin/qoder/transport/image-upload
  */
 
 import crypto from 'node:crypto'

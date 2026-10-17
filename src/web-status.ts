@@ -4,7 +4,7 @@
  * half. The route answers loopback browser requests only and never carries
  * token material — the PAT summary is redacted at the store, not here.
  *
- * @module dsh-connect-qoder-x/web-status
+ * @module dsh-qoder-plugin/web-status
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -320,5 +320,5 @@ export function registerQoderStatusRoute(ctx: Context, deps: QoderStatusRouteOpt
     return () => {
       dispose()
     }
-  }, 'dsh-connect-qoder-x: Web status route')
+  }, 'dsh-qoder-plugin: Web status route')
 }

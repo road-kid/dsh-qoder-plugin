@@ -284,7 +284,7 @@ describe('Qoder Host settings integration', () => {
   })
 
   it('exposes the provider directory entry, the settings face, and the fallback model list', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-settings-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-settings-'))
     stubEnvRoot()
     // This case asserts the fallback roster, which is served only to a
     // signed-in variant. Pinning a credential of its own keeps that independent
@@ -369,7 +369,7 @@ describe('Qoder Host settings integration', () => {
    * DSH is already running surface without a restart.
    */
   it('registers both variants and keeps each variant identity separate', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-dual-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-dual-'))
     stubEnvRoot()
     // Shorten the credential sweep: a group appears only once the sweep has
     // adopted the credential it finds in the temporary home.
@@ -471,7 +471,7 @@ describe('Qoder Host settings integration', () => {
    * publish fallback models that could only fail on the first message.
    */
   it('hides a variant with no usable credential while still registering it', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-empty-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-empty-'))
     // The temporary data dir is empty: neither variant's own credential file
     // exists and no environment PAT is set, which is what "nobody has signed
     // in" now means.
@@ -506,7 +506,7 @@ describe('Qoder Host settings integration', () => {
    * the user's configuration.
    */
   it('guards the settings face with the key its GET document hands out', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-face-key-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-face-key-'))
     stubEnvRoot()
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline in tests') }))
     await boot({ web: true })
@@ -536,7 +536,7 @@ describe('Qoder Host settings integration', () => {
    * authority, and without one the arm's own env variable signs it in.
    */
   it('signs in a variant from its environment PAT when no file exists', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-env-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-env-'))
     stubEnvRoot()
     vi.stubEnv('QODER_PERSONAL_ACCESS_TOKEN', 'pt-from-environment')
     vi.stubEnv('DSH_QODER_POLL_MS', '100')
@@ -558,7 +558,7 @@ describe('Qoder Host settings integration', () => {
    * observable contract is that such a file never reveals models.
    */
   it('refuses a legacy credential file instead of treating it as a PAT', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-legacy-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-legacy-'))
     stubEnvRoot()
     vi.stubEnv('DSH_QODER_POLL_MS', '100')
     // The WorkBuddy-era shape: an accessToken document where a Qoder PAT
@@ -587,7 +587,7 @@ describe('Qoder Host settings integration', () => {
    * the face persists where the plugin reads it back.
    */
   it('validates and persists the quota section', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-quota-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-quota-'))
     stubEnvRoot()
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline in tests') }))
     const ctx = await boot({ web: true })
@@ -628,7 +628,7 @@ describe('Qoder Host settings integration', () => {
     expect(row.billing).toEqual({ credits: 'x1.0', free: false })
     expect(row.reasoning).toBeUndefined()
     // The roster lives where the plan says it does, one file per variant.
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-ident-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-ident-'))
     await mkdir(join(root, 'state'), { recursive: true })
     stubEnvRoot()
     expect(Qoder.qoderCatalogPath(Qoder.GLOBAL_VARIANT.catalogFilename))
@@ -638,7 +638,7 @@ describe('Qoder Host settings integration', () => {
   })
 
   it('supplies an attachment facade covering imageLimits, readImageRequest, and saveImage to transport and client', async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-connect-qoder-x-attachments-'))
+    root = await mkdtemp(join(tmpdir(), 'dsh-qoder-plugin-attachments-'))
     await mkdir(join(root, 'state'), { recursive: true })
     await writeFile(join(root, 'state', 'auth-qoder.json'), credentialDocument(PAT_CN, 'china'))
     stubEnvRoot()

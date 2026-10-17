@@ -1,4 +1,4 @@
-# dsh-connect-qoder-x
+# dsh-qoder-plugin
 
 [English](./README.en.md) | **简体中文**
 
@@ -19,17 +19,17 @@
 
 ## 这个仓库是什么
 
-`dsh-connect-qoder-x` 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的社区插件：用个人访问令牌（PAT）把 Qoder 的模型接入 DSH，国内版与国际版各自一套凭证、provider 与模型目录，互不混用。
+`dsh-qoder-plugin` 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的社区插件：用个人访问令牌（PAT）把 Qoder 的模型接入 DSH，国内版与国际版各自一套凭证、provider 与模型目录，互不混用。
 
 **本插件的标识**（安装、排障、看数据目录时会用到）：
 
 | 项 | 值 |
 |---|---|
-| 包名 | `dsh-connect-qoder-x` |
+| 包名 | `dsh-qoder-plugin` |
 | profile 行 id | `llm-qoder-x` |
-| 数据目录 | `<profile>/.dsh-connect-qoder-x/` |
-| HTTP 路由前缀 | `/plugins/dsh-connect-qoder-x/*` |
-| CLI 命令 | `dsh-connect-qoder-x` |
+| 数据目录 | `<profile>/.dsh-qoder-plugin/` |
+| HTTP 路由前缀 | `/plugins/dsh-qoder-plugin/*` |
+| CLI 命令 | `dsh-qoder-plugin` |
 
 **为什么行 id 与包名不一致**：DSH 的插件配置槽 key 是 `` `${包名}#${行id}` ``，包名来自 `package.json`、行 id 来自插件 patch 声明的 `id`。两者都写全名，是为了让这个 key 在任何 profile 里都唯一、不与其它 Qoder 插件相撞。详见[设置界面与 DSH 版本](#设置界面与-dsh-版本)。
 
@@ -74,7 +74,7 @@
 
 DSH 0.1.7 起把插件配置统一收进**「插件」页**（0.2.x 沿用同一套槽位）。装好后它出现在「插件」页的**「已安装」**分组里：
 
-![插件页中的 dsh-connect-qoder-x](assets/plugin-list.png)
+![插件页中的 dsh-qoder-plugin](assets/plugin-list.png)
 
 点它进入包详情页，设置正文**直接内联**在包描述下方——这就是本插件的设置界面：
 
@@ -106,12 +106,21 @@ DSH 0.1.7 起把插件配置统一收进**「插件」页**（0.2.x 沿用同一
 
 ```sh
 # 从 GitHub 安装
-dsh plugin --profile web add github:road-kid/dsh-connect-qoder-x
+dsh plugin --profile web add github:road-kid/dsh-qoder-plugin
 ```
 
 按你使用的 profile 换 `--profile` 的值（`web` / `desktop` / `tui`）。装到哪个 profile，数据就落在哪个 profile 目录里，各自独立。
 
 > **与其它 Qoder 插件共存**：本插件的包名、行 id、路由前缀与数据目录都是独立命名，因此可以与其它 Qoder 插件同时安装、配置互不干扰。（同一个插件装两次则不行——profile 里同名的行只应存在一个。）
+
+> **从 0.4.x 升级**：本插件已从 `dsh-connect-qoder-x` 更名为 `dsh-qoder-plugin`
+> （包名、模块 id、路由前缀、数据目录与仓库名一起改；profile 行 id 仍是
+> `llm-qoder-x`，provider 与已选模型不受影响）。重新执行上面的安装命令即可，
+> 首次运行会把旧的 `<profile>/.dsh-connect-qoder-x/` 数据目录迁移为
+> `.dsh-qoder-plugin/`（PAT 与设置保留），浏览器里的额度读数开关也会自动迁移。
+> 旧包请从 profile 移除（插件管理器里的「卸载」，或
+> `dsh plugin --profile web remove dsh-connect-qoder-x`）。
+
 
 ---
 
@@ -141,10 +150,10 @@ dsh plugin --profile web add github:road-kid/dsh-connect-qoder-x
 
 ## 数据与隐私
 
-插件的全部自有文件收在数据目录一处：`<profile>/.dsh-connect-qoder-x/`（凭据在根，可重建的缓存在 `state/` 子目录）：
+插件的全部自有文件收在数据目录一处：`<profile>/.dsh-qoder-plugin/`（凭据在根，可重建的缓存在 `state/` 子目录）：
 
 ```text
-<profile>/.dsh-connect-qoder-x/
+<profile>/.dsh-qoder-plugin/
 ├── .qoder-auth.json              # 中国版 PAT（{version:2, pat, region, savedAt}）
 ├── .qoder-global-auth.json       # 国际版 PAT
 ├── settings.json                 # 刷新间隔 / 签到时刻等自有配置
@@ -177,8 +186,8 @@ DSH 0.1.7 起，插件配置改由 `ui-plugin-manager` 的**键控槽**承载：
 
 | 槽 | key | 作用 |
 |---|---|---|
-| `plugins.row.config` | `dsh-connect-qoder-x#llm-qoder-x` | 行列表出现「配置」按钮，点开是本卡片 |
-| `plugins.bundle.config` | `dsh-connect-qoder-x` | 包详情页内联渲染同一张卡片 |
+| `plugins.row.config` | `dsh-qoder-plugin#llm-qoder-x` | 行列表出现「配置」按钮，点开是本卡片 |
+| `plugins.bundle.config` | `dsh-qoder-plugin` | 包详情页内联渲染同一张卡片 |
 
 行 key 是 `` `${包名}#${行id}` ``：包名来自 `package.json`，行 id 来自本插件 patch 声明的 `id`。**两者都写全名，正是为了让这个 key 在任何 profile 里唯一**，不与其它 Qoder 插件相撞。
 

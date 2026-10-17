@@ -33,7 +33,7 @@ import { QODER_PROBE_PATH } from '../src/status-paths.ts'
 const ENTRY_ID = 'llm-qoder-x'
 const ROW_CONFIG_SLOT = 'plugins.row.config'
 const BUNDLE_CONFIG_SLOT = 'plugins.bundle.config'
-const PACKAGE_NAME = 'dsh-connect-qoder-x'
+const PACKAGE_NAME = 'dsh-qoder-plugin'
 const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ENTRY_ID}`
 
 /** The composer seats: the quota readout chip, and the context-window probe. */
@@ -58,7 +58,7 @@ const injectQuotaCssStandIn = (): (() => void) => () => {}
 function apply(ctx: any): void {
   try {
     const namespace = 'settings.qoder'
-    ctx.effect(() => ctx.locale.register(namespace, { zh: {}, en: {} }), 'dsh-connect-qoder-x: settings copy')
+    ctx.effect(() => ctx.locale.register(namespace, { zh: {}, en: {} }), 'dsh-qoder-plugin: settings copy')
     const t = ctx.locale.bind(namespace)
 
     let quotaScope: any
@@ -89,7 +89,7 @@ function apply(ctx: any): void {
       try {
         ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, key, inject: cardFace }, Component))
       } catch (error: unknown) {
-        console.error(`[dsh-connect-qoder-x] card slot "${slot}" failed to register (host provider unaffected):`, error)
+        console.error(`[dsh-qoder-plugin] card slot "${slot}" failed to register (host provider unaffected):`, error)
       }
     }
     registerCard(ROW_CONFIG_SLOT, ROW_CONFIG_KEY)
@@ -100,7 +100,7 @@ function apply(ctx: any): void {
       subscribe: () => () => {},
     })
 
-    ctx.effect(() => injectQuotaCssStandIn(), 'dsh-connect-qoder-x: quota styles')
+    ctx.effect(() => injectQuotaCssStandIn(), 'dsh-qoder-plugin: quota styles')
 
     // The composer quota readout (session-scoped list; renders only while the
     // session's selected model belongs to this plugin).
@@ -116,7 +116,7 @@ function apply(ctx: any): void {
           }),
         }, Component))
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] could not register the composer quota readout:', error)
+        console.error('[dsh-qoder-plugin] could not register the composer quota readout:', error)
       }
     })
 
@@ -133,12 +133,12 @@ function apply(ctx: any): void {
           }),
         }, Component))
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] could not register the context probe:', error)
+        console.error('[dsh-qoder-plugin] could not register the context probe:', error)
       }
     })
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
-    console.error('[dsh-connect-qoder-x] client card failed to load (host provider unaffected):', error)
+    console.error('[dsh-qoder-plugin] client card failed to load (host provider unaffected):', error)
   }
 }
 
@@ -269,7 +269,7 @@ describe('client card fallback', () => {
     // The composer seats, by their ids.
     const seatIds = registerCalls.flatMap(call => typeof call['id'] === 'string' ? [call['id']] : [])
     expect(seatIds.sort()).toEqual([PROBE_ID, READOUT_ID].sort())
-    expect(QODER_PROBE_PATH).toBe('/plugins/dsh-connect-qoder-x/probe')
+    expect(QODER_PROBE_PATH).toBe('/plugins/dsh-qoder-plugin/probe')
 
     restore()
   })
@@ -303,7 +303,7 @@ describe('client card fallback', () => {
     expect(errors).toEqual([])
 
     const row = registerCalls.find(call => call['name'] === ROW_CONFIG_SLOT)
-    expect(row?.['key']).toBe('dsh-connect-qoder-x#llm-qoder-x')
+    expect(row?.['key']).toBe('dsh-qoder-plugin#llm-qoder-x')
 
     restore()
   })
@@ -352,8 +352,8 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
   })
 
   it('every effect label and the locale namespace in the entry are mirrored', () => {
-    const labels = [...entrySource.matchAll(/,\s*'(dsh-connect-qoder-x: [^']+)'/g)].map(match => match[1]!)
-    expect(labels).toEqual(['dsh-connect-qoder-x: settings copy', 'dsh-connect-qoder-x: quota styles'])
+    const labels = [...entrySource.matchAll(/,\s*'(dsh-qoder-plugin: [^']+)'/g)].map(match => match[1]!)
+    expect(labels).toEqual(['dsh-qoder-plugin: settings copy', 'dsh-qoder-plugin: quota styles'])
     for (const label of labels) expect(mirrorSource).toContain(label)
     expect(entrySource).toContain("'settings.qoder'")
     expect(mirrorSource).toContain("'settings.qoder'")
@@ -379,9 +379,9 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
     // The row key is COMPOSED in the entry (`${PACKAGE_NAME}#${ENTRY_ID}`), not
     // written as one literal, so assert the two halves and their concatenation.
     expect(entrySource).toContain(`const ROW_CONFIG_KEY = \`\${PACKAGE_NAME}#\${ENTRY_ID}\``)
-    expect(entrySource).toContain("const PACKAGE_NAME = 'dsh-connect-qoder-x'")
+    expect(entrySource).toContain("const PACKAGE_NAME = 'dsh-qoder-plugin'")
     expect(entrySource).toContain("const ENTRY_ID = 'llm-qoder-x'")
-    expect(mirrorSource).toContain('dsh-connect-qoder-x#llm-qoder-x')
+    expect(mirrorSource).toContain('dsh-qoder-plugin#llm-qoder-x')
 
     // Seats the plugin must NOT claim any more. Read from the CALL SITES, not
     // the whole file: the entry's comments name the retired slots on purpose.

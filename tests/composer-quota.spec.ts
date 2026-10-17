@@ -17,7 +17,7 @@
  * supplies one, `document`/`window` are stubbed only where the component talks
  * to them, and `fetch` is a global stub like the other composer specs.
  *
- * @module dsh-connect-qoder-x/test/composer-quota.spec
+ * @module dsh-qoder-plugin/test/composer-quota.spec
  */
 
 import { createElement, type ReactElement } from 'react'

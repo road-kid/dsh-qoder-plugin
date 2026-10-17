@@ -263,12 +263,12 @@ describe('route identity is the variant', () => {
     const china = fakeCtx()
     registerQoderAuthRoute(china.ctx as never, deps, 'k')
     expect(china.registered).toEqual([{ path: QODER_AUTH_PATH, kind: 'exact' }])
-    expect(QODER_AUTH_PATH).toBe('/plugins/dsh-connect-qoder-x/auth')
+    expect(QODER_AUTH_PATH).toBe('/plugins/dsh-qoder-plugin/auth')
 
     const global = fakeCtx()
     registerQoderAuthRoute(global.ctx as never, { ...deps, path: QODER_GLOBAL_AUTH_PATH }, 'k')
     expect(global.registered).toEqual([{ path: QODER_GLOBAL_AUTH_PATH, kind: 'exact' }])
-    expect(QODER_GLOBAL_AUTH_PATH).toBe('/plugins/dsh-connect-qoder-x/global/auth')
+    expect(QODER_GLOBAL_AUTH_PATH).toBe('/plugins/dsh-qoder-plugin/global/auth')
   })
 
   it('never reads a region from the body: the save closure owns it', async () => {

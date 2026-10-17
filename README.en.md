@@ -1,4 +1,4 @@
-# dsh-connect-qoder-x
+# dsh-qoder-plugin
 
 **English** | [简体中文](./README.md)
 
@@ -17,17 +17,17 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 
 ## What this repository is
 
-`dsh-connect-qoder-x` is a community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): it brings Qoder's models into DSH through a Personal Access Token (PAT), with China and Global served by separate credentials, providers and model catalogs that never mix.
+`dsh-qoder-plugin` is a community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): it brings Qoder's models into DSH through a Personal Access Token (PAT), with China and Global served by separate credentials, providers and model catalogs that never mix.
 
 **This plugin's identity** (what you need when installing, troubleshooting, or looking for its data):
 
 | Item | Value |
 |---|---|
-| Package name | `dsh-connect-qoder-x` |
+| Package name | `dsh-qoder-plugin` |
 | Profile row id | `llm-qoder-x` |
-| Data directory | `<profile>/.dsh-connect-qoder-x/` |
-| HTTP route prefix | `/plugins/dsh-connect-qoder-x/*` |
-| CLI command | `dsh-connect-qoder-x` |
+| Data directory | `<profile>/.dsh-qoder-plugin/` |
+| HTTP route prefix | `/plugins/dsh-qoder-plugin/*` |
+| CLI command | `dsh-qoder-plugin` |
 
 **Why the row id differs from the package name**: DSH keys a plugin-configuration seat by `` `${package name}#${row id}` `` — the package name comes from `package.json`, the row id from the `id` this plugin's patch declares. Spelling both out in full is what keeps that key unique in any profile and clear of other Qoder plugins. See [Settings surface and DSH versions](#settings-surface-and-dsh-versions).
 
@@ -70,7 +70,7 @@ The quota readout in the composer toolbar (only while the session uses a Qoder m
 
 DSH 0.1.7 gathers every plugin's configuration into the **Plugins page** (0.2.x keeps the same seats — verified). Once installed, the plugin appears under **Installed** on that page:
 
-![dsh-connect-qoder-x on the Plugins page](assets/plugin-list.png)
+![dsh-qoder-plugin on the Plugins page](assets/plugin-list.png)
 
 Click it to open the package page; the settings body renders **inline** under the package description — that is this plugin's settings UI:
 
@@ -104,12 +104,23 @@ Prerequisites:
 
 ```sh
 # From GitHub
-dsh plugin --profile web add github:road-kid/dsh-connect-qoder-x
+dsh plugin --profile web add github:road-kid/dsh-qoder-plugin
 ```
 
 Swap the `--profile` value for the profile you use (`web` / `desktop` / `tui`) — data stays inside that profile, so web / desktop / tui never collide.
 
 > **Coexists with other Qoder plugins**: this plugin's package name, row id, route prefix and data directory are all independently named, so it can be installed alongside other Qoder plugins without either configuration touching the other. (Installing *this* plugin twice is a different matter — a profile should carry only one row of the same name.)
+
+> **Upgrading from 0.4.x**: the plugin moved from `dsh-connect-qoder-x` to
+> `dsh-qoder-plugin` (package name, module id, route prefix, data directory and
+> repository all changed; the profile row id stays `llm-qoder-x`, so the
+> provider and existing model selections are unaffected). Re-run the install
+> command above: on first use the old `<profile>/.dsh-connect-qoder-x/` data
+> folder is migrated to `.dsh-qoder-plugin/` (PAT and settings preserved), and
+> the per-browser readout switches migrate to their new localStorage key.
+> Remove the old package from the profile (the plugin manager's Remove action,
+> or `dsh plugin --profile web remove dsh-connect-qoder-x`).
+
 
 ---
 
@@ -141,10 +152,10 @@ The precedence is **file > env**: as soon as a valid credential file is saved, a
 
 ### File layout
 
-Everything the plugin owns lives in one data directory: `<profile>/.dsh-connect-qoder-x/` — credentials at the root, rebuildable caches under `state/` (so “clear the cache” can never touch a credential):
+Everything the plugin owns lives in one data directory: `<profile>/.dsh-qoder-plugin/` — credentials at the root, rebuildable caches under `state/` (so “clear the cache” can never touch a credential):
 
 ```text
-<profile>/.dsh-connect-qoder-x/
+<profile>/.dsh-qoder-plugin/
 ├── .qoder-auth.json              # China PAT ({version:2, pat, region, savedAt})
 ├── .qoder-global-auth.json       # Global PAT
 ├── settings.json                 # refresh interval / check-in time and other own config
@@ -182,8 +193,8 @@ Since DSH 0.1.7, plugin configuration is carried by `ui-plugin-manager`'s **keye
 
 | Slot | Key | Effect |
 |---|---|---|
-| `plugins.row.config` | `dsh-connect-qoder-x#llm-qoder-x` | the row gains a *Configure* control that opens this card |
-| `plugins.bundle.config` | `dsh-connect-qoder-x` | the same card renders inline on the package page |
+| `plugins.row.config` | `dsh-qoder-plugin#llm-qoder-x` | the row gains a *Configure* control that opens this card |
+| `plugins.bundle.config` | `dsh-qoder-plugin` | the same card renders inline on the package page |
 
 The row key is `` `${package name}#${row id}` `` — the package name comes from `package.json`, the row id from the `id` this plugin's patch declares. **Spelling both out in full is what keeps that key unique in any profile**, clear of other Qoder plugins.
 

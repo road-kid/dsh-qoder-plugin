@@ -32,7 +32,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 /** Stable browser-plugin name. */
-export const name = 'dsh-connect-qoder-x-client'
+export const name = 'dsh-qoder-plugin-client'
 /**
  * Client services this bundle requires BEFORE it activates.
  *
@@ -66,7 +66,7 @@ export const inject = ['slots', 'locale', 'remote', 'remote.session']
 /**
  * The profile ROW ID this plugin runs as — the id its own patch declares.
  *
- * `cordis.patch.yml` inserts `- id: llm-qoder-x, name: dsh-connect-qoder-x`, so
+ * `cordis.patch.yml` inserts `- id: llm-qoder-x, name: dsh-qoder-plugin`, so
  * the Plugins page reports this plugin's row as `llm-qoder-x`. The browser half
  * needs it for exactly one thing: the right half of {@link ROW_CONFIG_KEY}.
  */
@@ -89,7 +89,7 @@ const ROW_CONFIG_SLOT = 'plugins.row.config'
 const BUNDLE_CONFIG_SLOT = 'plugins.bundle.config'
 
 /** This plugin's package name — the `plugins.bundle.config` key, and the left half of the row key. */
-const PACKAGE_NAME = 'dsh-connect-qoder-x'
+const PACKAGE_NAME = 'dsh-qoder-plugin'
 
 /** The complete `plugins.row.config` key (`` `${pkg.name}#${rowId}` ``). */
 const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ENTRY_ID}`
@@ -102,7 +102,7 @@ const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ENTRY_ID}`
  * example the rc.6→rc.7 `id`→`key` / `order`→`priority` rename) degrades
  * to a `console.error` instead of throwing into the DSH loader and raising
  * the red "Failed to load plugins" banner. The host provider keeps working:
- * the `qoder` model channel is unaffected, and `dsh-connect-qoder-x
+ * the `qoder` model channel is unaffected, and `dsh-qoder-plugin
  * status` reports host health via the heartbeat file.
  *
  * NOTE: the try/catch boundary of this function is mirrored (duplicated) in
@@ -116,7 +116,7 @@ const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ENTRY_ID}`
 export function apply(ctx: ClientContext): void {
   try {
     const namespace = 'settings.qoder'
-    ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-connect-qoder-x: settings copy')
+    ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-qoder-plugin: settings copy')
     const t = ctx.locale.bind(namespace) as QoderPluginCardInjected['t']
 
     // 1. The quota settings values the card edits, bound to this plugin's OWN
@@ -175,14 +175,14 @@ export function apply(ctx: ClientContext): void {
         // typed against that same contract.
         } as never, QoderPluginCard as never))
       } catch (error: unknown) {
-        console.error(`[dsh-connect-qoder-x] card slot "${slot}" failed to register (host provider unaffected):`, error)
+        console.error(`[dsh-qoder-plugin] card slot "${slot}" failed to register (host provider unaffected):`, error)
       }
     }
     registerCard(ROW_CONFIG_SLOT, ROW_CONFIG_KEY)
     registerCard(BUNDLE_CONFIG_SLOT, PACKAGE_NAME)
 
     /**
-     * 插件自有配置（`<profile>/.dsh-connect-qoder-x/settings.json`）：两条宿主线的
+     * 插件自有配置（`<profile>/.dsh-qoder-plugin/settings.json`）：两条宿主线的
      * 读写都走宿主半的 settings face，不再经过 settingsScope / configForms。
      *
      * 0.1.7 的 configForms 写入会整树 reconcile + fiber 热重载（每次约
@@ -193,7 +193,7 @@ export function apply(ctx: ClientContext): void {
     void ownQuotaScope.load()
     adoptQuotaScope(ownQuotaScope as unknown as QuotaSettingsScope<QuotaSection>)
 
-    ctx.effect(() => injectQuotaCss(), 'dsh-connect-qoder-x: quota styles')
+    ctx.effect(() => injectQuotaCss(), 'dsh-qoder-plugin: quota styles')
 
     // 2. The composer quota readout. It lives in the composer toolbar
     //    (`conversation.input.left`, a session-scoped list) and renders ONLY
@@ -214,7 +214,7 @@ export function apply(ctx: ClientContext): void {
           }),
         } as never, ComposerQuotaChip as never))
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] could not register the composer quota readout:', error)
+        console.error('[dsh-qoder-plugin] could not register the composer quota readout:', error)
       }
     })
 
@@ -234,12 +234,12 @@ export function apply(ctx: ClientContext): void {
           }),
         }, QoderProbeControl))
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] could not register the context probe:', error)
+        console.error('[dsh-qoder-plugin] could not register the context probe:', error)
       }
     })
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
     // Developers see the full cause in the browser console; users see no banner.
-    console.error('[dsh-connect-qoder-x] client card failed to load (host provider unaffected):', error)
+    console.error('[dsh-qoder-plugin] client card failed to load (host provider unaffected):', error)
   }
 }
