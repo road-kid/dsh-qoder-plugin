@@ -1,15 +1,26 @@
 /**
- * Stylesheet for the Qoder quota surfaces (the sidebar footer card and the
- * dashboard it opens) — a direct translation of commandcode's panel stylesheet
- * (src/client/panel-styles.ts), which the user held up as the reference look.
- * Classes are `qdp-` prefixed to stay clear of commandcode's `ccp-` set: both
- * plugins inject GLOBAL CSS into the same document, so the prefixes must not
- * collide.
+ * Stylesheet for the Qoder quota surfaces: the plugin configuration page, its
+ * plugins-list summary line, the sidebar footer card (wide + 56px rail) and the
+ * quota dashboard panel.
  *
- * Same contract as the original: returned as a string (no DOM side effects at
- * import time), installed once by the client entry keyed by `data-plugin-css`,
- * and removed when the plugin's fiber unwinds. Every colour comes from a
- * harness theme alias with a neutral fallback.
+ * Design contract (DSH web UI, 0.2.1-rc.1):
+ * - every colour, radius, font role and stroke comes from a `--dsw-*` token
+ *   (docs/web-styling.md); no literal palette values, no dark-theme selectors;
+ * - radii follow the role table (docs/ui-radius.md): 20px cards (`xl`), 16px
+ *   nested groups (`lg`), 12px controls (`md`), 8px
+ *   compact (`sm`), 999px capsules paired with `corner-shape: round`;
+ * - flat neutral borders draw at 0.5px; elevated/floating surfaces would use
+ *   `--dsw-elevation-*` (these surfaces are flat, so they keep a real hairline);
+ * - typography uses the composed `--dsw-font-*` roles so size and line height
+ *   never drift apart; numbers are tabular;
+ * - focus rings come from the global `:focus-visible` rule (2px, theme colour),
+ *   never from a hardcoded outline colour.
+ *
+ * Classes are `qdp-` prefixed: several plugins inject GLOBAL CSS into the same
+ * document, so prefixes must not collide. The stylesheet is returned as a
+ * string (no DOM side effects at import time), installed once by the client
+ * entry keyed by `data-plugin-css`, and removed when the plugin's fiber
+ * unwinds.
  */
 
 /** Stylesheet id (the `data-plugin-css` value that makes injection idempotent). */
@@ -29,303 +40,327 @@ export function injectQuotaCss(): () => void {
   }
 }
 
-/** The quota panel stylesheet. */
+/** The quota surfaces stylesheet. */
 export const QUOTA_CSS = `
 /* ------------------------------------------------- sidebar footer card */
-/* The shell's foot area renders this list ABOVE the Settings seat. The shell
-   supplies no chrome: the entry is the button. Deliberately quiet — a surface
-   beside Settings should read as part of the column — one hover step and a
-   hairline border, exactly like commandcode's card.
-
-   The shell's container is a flex ROW whose occupants each declare a
-   full-width line, so as a row it overflows the column. The fix is the same
-   load-bearing anchored rule commandcode ships (their issue #48): force the
-   sidebar's footer-action container into a column, anchored to "_footArea"
-   because "footerActions" is also used by the ask-user-question dialog — an
-   unanchored rule would stack THAT dialog's buttons too. Anchoring keeps the
-   fix scoped to the sidebar; the descendant combinator survives a wrapper
-   appearing between the two. The rule is idempotent when commandcode is also
-   installed (same selector, same declaration) and makes this plugin
-   self-sufficient when it is not. */
+/* The shell's foot area renders this list ABOVE the Settings seat, inside a
+   flex ROW container whose occupants each declare a full-width line, so as a
+   row it overflows the column. Force the sidebar's footer-action container into
+   a column, anchored to "_footArea" because "footerActions" is also used by the
+   ask-user-question dialog — an unanchored rule would stack THAT dialog's
+   buttons too. Anchoring keeps the fix scoped to the sidebar; the descendant
+   combinator survives a wrapper appearing between the two. The rule is
+   idempotent when another plugin ships the same fix. */
 [class*="_footArea"] [class*="_footerActions"]{flex-direction:column}
-.qdp-foot{box-sizing:border-box;flex:0 0 auto;width:100%;min-width:0;font:inherit;color:var(--dsw-alias-label-secondary);text-align:left;cursor:pointer;background:0 0;border:1px solid transparent;border-radius:10px;flex-direction:column;gap:6px;margin:0 0 4px;padding:8px;display:flex}
-.qdp-foot:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-border-l2)}
-.qdp-foot:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+
+/* The wide card: the shell supplies no chrome, the occupant owns its surface.
+   Settings-card material, radius xl, and a quiet one-step hover. */
+.qdp-foot{box-sizing:border-box;flex:0 0 auto;width:100%;min-width:0;display:flex;flex-direction:column;gap:8px;margin:0 0 4px;padding:10px 12px;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-secondary);text-align:left;cursor:pointer;border:0.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-xl);background:var(--dsw-alias-settings-card-fill);transition:background .16s var(--ds-ease-in-out),border-color .16s var(--ds-ease-in-out)}
+.qdp-foot:hover{background:var(--dsw-alias-interactive-bg-hover-solid);border-color:var(--dsw-alias-border-l3)}
+.qdp-foot:active{background:var(--dsw-alias-interactive-bg-active)}
+.qdp-foot:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
 .qdp-footTop{align-items:center;gap:8px;min-width:0;display:flex}
-.qdp-footName{white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-primary);min-width:0;overflow:hidden;font-size:13px;font-weight:500;line-height:20px}
-.qdp-updated{flex:none;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qdp-footName{white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-primary);min-width:0;overflow:hidden;font:var(--dsw-font-s-strong-14)}
+.qdp-updated{flex:none;margin-left:auto;color:var(--dsw-alias-label-caption);font:var(--dsw-font-xxxs-11);font-variant-numeric:tabular-nums;white-space:nowrap}
 /* One block per merged package group: a head line carrying the group's own
-   remain/total, then the FULL-WIDTH bar under it. Stacking the two lets the
-   card show the figures — the reason this surface exists — without squeezing
-   the bar into what is left beside them. */
-.qdp-footRow{flex-direction:column;gap:4px;min-width:0;display:flex}
+   remain/total, then the FULL-WIDTH bar under it. */
+.qdp-footRow{display:flex;flex-direction:column;gap:4px;min-width:0}
 .qdp-footHead{align-items:baseline;gap:8px;min-width:0;display:flex}
-.qdp-footLabel{flex:1;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.qdp-footAmount{flex:none;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums;white-space:nowrap}
-/* The card's markup must stay PHRASING content — it renders inside the shell's
-   own button — so these bars are spans, not divs. display:block is
-   load-bearing on BOTH: an inline box ignores width and height outright, so
-   without it the fill collapses to 0x0 and the bar shows no usage. */
-.qdp-footBar{display:block;background:var(--dsw-alias-bg-layer-2);border-radius:999px;height:5px;overflow:hidden}
-.qdp-footFill{display:block;background:var(--dsw-alias-brand-primary);border-radius:999px;height:100%;transition:width .3s ease}
+.qdp-footLabel{flex:1;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qdp-footAmount{flex:none;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* The card's markup must stay PHRASING content — it can render inside a host
+   button — so these bars are spans, not divs. display:block is load-bearing:
+   an inline box ignores width and height. */
+.qdp-footBar{display:block;background:var(--dsw-alias-bg-module-platform);border-radius:999px;corner-shape:round;height:4px;overflow:hidden}
+.qdp-footFill{display:block;background:var(--dsw-alias-state-business-primary);border-radius:999px;corner-shape:round;height:100%;transition:width .3s var(--ds-ease-in-out)}
 .qdp-footFillWarn{background:var(--dsw-alias-state-error-primary)}
-.qdp-footPct{flex:none;width:34px;color:var(--dsw-alias-label-secondary);text-align:right;font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
+.qdp-footPct{flex:none;width:34px;color:var(--dsw-alias-label-secondary);text-align:right;font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
 
-/* The 56px rail: one icon button on the shell's own rail geometry (36px cell),
-   so the collapsed column keeps a single glyph like its siblings. */
-.qdp-railButton{box-sizing:border-box;width:36px;height:36px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid transparent;border-radius:8px;flex:none;justify-content:center;align-items:center;margin:0 0 4px;padding:0;display:inline-flex}
+/* The 56px rail: one icon button on the shell's own rail geometry (36px cell). */
+.qdp-railButton{box-sizing:border-box;width:36px;height:36px;flex:none;display:inline-flex;justify-content:center;align-items:center;margin:0 0 4px;padding:0;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:0;border-radius:var(--dsw-radius-sm)}
 .qdp-railButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
-.qdp-railButton:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.qdp-railButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
 
-/* The ring glyph. Sized entirely by its own width/height attribute, so the
-   footer row and the rail button can each ask for their own. */
-.qdp-glyph{flex:none;justify-content:center;align-items:center;display:inline-flex;color:var(--dsw-alias-brand-primary)}
+/* The ring glyph: sized by its own width/height attribute. */
+.qdp-glyph{flex:none;display:inline-flex;justify-content:center;align-items:center;color:var(--dsw-alias-state-business-primary)}
 
-/* Pure-CSS caret for the card's collapsible sections. The host primitives'
-   chevron icon names differ per DSH line, so no static import can serve both —
-   a border caret in the plugin's own CSS is version-proof (workbuddy's
-   approach, restated under this plugin's qdp- prefix). */
+/* ------------------------------------------------- shared primitives */
+/* Sections are settings cards on the plugin page and plain groups inside the
+   dashboard. fill/stroke tokens are bound on body by ui-theme (base.css). */
+.qdp-section{box-sizing:border-box;display:flex;flex-direction:column;gap:16px;padding:20px 22px;border:0.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-xl);background:var(--dsw-alias-settings-card-fill)}
+.qdp-sectionHead{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+.qdp-sectionTitle{margin:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-strong-14)}
+.qdp-sectionMeta{color:var(--dsw-alias-label-caption);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+.qdp-sectionBody{display:flex;flex-direction:column;gap:12px;min-width:0}
+
+/* A settings row: text block left, control flush right, hairline under. */
+.qdp-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:12px 0;border-bottom:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-row:last-child{border-bottom:0;padding-bottom:0}
+.qdp-row:first-child{padding-top:0}
+.qdp-rowText{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.qdp-rowTitle{color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14)}
+.qdp-rowDesc{margin:0;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12)}
+.qdp-rowControl{display:flex;align-items:center;gap:8px;flex:none}
+.qdp-stack{display:flex;flex-direction:column;gap:12px;min-width:0}
+.qdp-inline{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+.qdp-muted{margin:0;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12)}
+.qdp-caption{margin:0;color:var(--dsw-alias-label-caption);font:var(--dsw-font-xxxs-11)}
+.qdp-num{font-variant-numeric:tabular-nums}
+.qdp-link{color:var(--dsw-alias-link);font:var(--dsw-font-s-strong-14);font-weight:500;text-decoration:none;border-radius:var(--dsw-radius-xs)}
+.qdp-link:hover,.qdp-link:focus-visible{text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px}
+.qdp-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:24px 16px;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xs-13);text-align:center}
+.qdp-alert{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px solid var(--dsw-alias-state-warn-primary);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-label);font:var(--dsw-font-xs-13)}
+.qdp-alertError{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-state-error-primary)}
+.qdp-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.qdp-iconButton{box-sizing:border-box;width:28px;height:28px;flex:none;display:inline-flex;justify-content:center;align-items:center;padding:0;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:0;border-radius:var(--dsw-radius-sm)}
+.qdp-iconButton:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-iconButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.qdp-iconButton:disabled{color:var(--dsw-alias-label-tertiary);cursor:default}
+.qdp-skeleton{display:block;height:8px;border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-bg-skeleton);animation:qdp-pulse 1.4s var(--ds-ease-in-out) infinite}
+@keyframes qdp-pulse{0%,100%{opacity:.6}50%{opacity:1}}
 
 /* ------------------------------------------------------------ dashboard */
 /* The center column in the layout frame: fill it, scroll the content column,
    and cap the reading width like the harness's own panels. */
-.qdp-main{background:var(--dsw-alias-bg-layer-1);width:100%;height:100%;overflow:auto;display:block}
-.qdp-mainInner{max-width:760px;margin:0 auto;padding:24px 20px 40px;flex-direction:column;gap:14px;display:flex;color:var(--dsw-alias-label-primary)}
-.qdp-header{align-items:center;gap:10px;display:flex;flex-wrap:wrap}
-.qdp-headerText{flex-direction:column;gap:2px;display:flex;min-width:0}
-.qdp-title{margin:0;font-size:18px;font-weight:600;line-height:1.4}
-.qdp-subtitle{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5}
+.qdp-main{display:block;width:100%;height:100%;overflow:auto;background:var(--dsw-alias-bg-layer-1)}
+.qdp-mainInner{display:flex;flex-direction:column;gap:20px;max-width:720px;margin:0 auto;padding:28px 24px 48px;color:var(--dsw-alias-label-primary)}
+.qdp-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
+.qdp-headerText{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.qdp-title{margin:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-l-20)}
+.qdp-subtitle{margin:0;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xs-13)}
 .qdp-spacer{flex:1}
-.qdp-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.5;font-variant-numeric:tabular-nums}
-/* The dashboard's exit: an icon-sized glyph button. */
-.qdp-close{min-width:28px;justify-content:center;padding-left:0;padding-right:0;box-sizing:border-box;align-items:center;cursor:pointer;font:inherit;color:var(--dsw-alias-label-secondary);background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;height:28px;display:inline-flex}
-.qdp-close:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
-.qdp-close:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.qdp-meta{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+.qdp-close,.qdp-refresh{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;padding:0 10px;color:var(--dsw-alias-label-secondary);cursor:pointer;font:var(--dsw-font-xxs-12);background:0 0;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}
+.qdp-close{min-width:28px;padding:0}
+.qdp-close:hover,.qdp-refresh:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-close:focus-visible,.qdp-refresh:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.qdp-refresh:disabled{color:var(--dsw-alias-label-tertiary);cursor:default}
 .qdp-close span{font-size:16px;line-height:1}
-.qdp-refresh{box-sizing:border-box;align-items:center;cursor:pointer;font:inherit;color:var(--dsw-alias-label-secondary);background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:4px 12px;display:inline-flex;gap:6px;font-size:12px;line-height:18px}
-.qdp-refresh:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
-.qdp-refresh:disabled{opacity:.5;cursor:default}
-.qdp-refresh:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 
-/* Notices: signed-out and error states. */
-.qdp-notice{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:12px;padding:12px 14px;flex-direction:column;gap:4px;display:flex}
+/* Notices (signed-out / error). */
+.qdp-notice{display:flex;flex-direction:column;gap:6px;padding:16px 18px;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-bg-module-platform)}
 .qdp-noticeError{border-color:var(--dsw-alias-state-error-primary)}
-.qdp-noticeTitle{margin:0;font-size:13px;font-weight:600;line-height:1.5}
+.qdp-noticeTitle{margin:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-strong-14)}
 
-/* One card per variant. The dashboard's OWN names: the plugin card further
-   down used to share qdp-card/qdp-cardHead/qdp-cardTitle with this block, and
-   being later in the sheet it silently overrode them — which is how the plugin
-   card's border-width:.5px; border-radius:16px leaked onto the dashboard. The
-   plugin card keeps those three names (its consumers and the specs pin them);
-   this surface is renamed instead.
-
-   The declarations below are exactly what the cascade had ALREADY resolved to
-   for the dashboard, with the plugin card's later contributions folded in:
-   list-style, border-width, border-style, border-color, border-radius and
-   transition from its rule, plus its :hover tone (restated below), while every
-   declaration that survived from this block is unchanged. Rendered result is
-   identical for both surfaces. (No backticks in these comments: the sheet is a
-   template literal.) */
-.qdp-dashCard{list-style:none;border-width:.5px;border-style:solid;border-color:var(--dsw-alias-border-l4);border-radius:16px;background:var(--dsw-alias-bg-layer-3);transition:border-color .16s,background .16s;padding:16px 18px;flex-direction:column;gap:16px;display:flex}
-.qdp-dashCard:hover{border-color:var(--dsw-alias-label-dimmed)}
-.qdp-dashCardHead{flex-wrap:wrap;flex-direction:column;align-items:flex-start;gap:4px;flex:1;min-width:0;display:flex}
-.qdp-avatar{flex:none;width:28px;height:28px;color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform);border-radius:50%;justify-content:center;align-items:center;font-size:12px;font-weight:600;line-height:1;display:inline-flex}
-.qdp-cardIdentity{flex-direction:column;gap:1px;min-width:0;display:flex}
-.qdp-dashCardTitle{font-size:15px;line-height:1.4;font-weight:600;color:var(--dsw-alias-label-primary);text-align:left}
-.qdp-cardOwner{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
+/* One card per variant on the dashboard. Flat settings-card material. */
+.qdp-dashCard{list-style:none;display:flex;flex-direction:column;gap:16px;padding:20px 22px;border:0.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-xl);background:var(--dsw-alias-settings-card-fill)}
+.qdp-dashCardHead{display:flex;flex:1;flex-direction:column;align-items:flex-start;gap:4px;min-width:0;flex-wrap:wrap}
+.qdp-avatar{flex:none;display:inline-flex;justify-content:center;align-items:center;width:32px;height:32px;color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-state-business-primary);border-radius:50%;corner-shape:round;font:var(--dsw-font-xxs-strong-12)}
+.qdp-cardIdentity{display:flex;flex-direction:column;gap:1px;min-width:0}
+.qdp-dashCardTitle{color:var(--dsw-alias-label-primary);text-align:left;font:var(--dsw-font-base-strong-16)}
+.qdp-cardOwner{max-width:220px;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* Quota blocks: each merged group is a label row plus the track. */
-.qdp-bar{overflow:hidden;background:var(--dsw-alias-bg-layer-1);border-radius:999px;height:8px}
-.qdp-barFill{background:var(--dsw-alias-brand-primary);border-radius:999px;height:100%;transition:width .3s ease}
+.qdp-bar{height:6px;overflow:hidden;background:var(--dsw-alias-bg-module-platform);border-radius:999px;corner-shape:round}
+.qdp-barFill{height:100%;background:var(--dsw-alias-state-business-primary);border-radius:999px;corner-shape:round;transition:width .3s var(--ds-ease-in-out)}
 .qdp-barFillWarn{background:var(--dsw-alias-state-error-primary)}
-.qdp-windowReset{color:var(--dsw-alias-label-tertiary);margin:0;font-size:11px;line-height:1.5}
+.qdp-barFillIndeterminate{width:100%;opacity:.25}
+.qdp-windowReset{margin:0;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12)}
 
-/* Badges. */
-.qdp-badge{white-space:nowrap;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;line-height:17px}
+/* Read-only badges. */
+.qdp-badge{display:inline-flex;align-items:center;height:20px;padding:0 8px;white-space:nowrap;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);border-radius:999px;corner-shape:round;font:var(--dsw-font-xxxs-strong-11)}
 
 /* Overall remaining + share line, ahead of the detail table. */
-.qdp-totalLine{margin:0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary)}
-.qdp-totalValue{font-size:22px;font-weight:600;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;margin-left:6px}
-.qdp-totalSub{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}
-/* The heading over the detail table. Applied by the dashboard but never
-   given a rule, so it rendered with the browser's h3 defaults; stated here
-   to match its neighbour headings (.qdp-panelTitle / .qdp-noticeTitle:
-   13px, 600, 1.5, primary label) rather than inventing a new style. */
-.qdp-blockTitle{margin:0;font-size:13px;font-weight:600;line-height:1.5;color:var(--dsw-alias-label-primary)}
+.qdp-totalLine{margin:0;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-s-14)}
+.qdp-totalValue{margin-left:auto;color:var(--dsw-alias-label-primary);font:var(--dsw-font-l-20);font-variant-numeric:tabular-nums}
+.qdp-totalSub{margin:0;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+.qdp-blockTitle{margin:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-strong-14)}
 
-/* Detail table: every package, unmerged. Column heads are the settings
-   shell's tertiary smallcaps; numbers are tabular; the mini bar rides under
-   the figures in the same cell like the reference layout. */
-.qdp-table{width:100%;border-collapse:collapse;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary)}
-.qdp-table th{text-align:left;color:var(--dsw-alias-label-tertiary);font-size:11px;font-weight:600;line-height:1.5;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--dsw-alias-border-l2);padding:4px 8px}
-.qdp-table td{padding:7px 8px;border-bottom:1px solid var(--dsw-alias-border-l2);vertical-align:top}
-.qdp-table tr:last-child td{border-bottom:0}
-.qdp-num{min-width:150px}
-.qdp-numText{display:block;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);margin-bottom:3px}
-.qdp-miniBar{display:block;height:4px;border-radius:999px;background:var(--dsw-alias-bg-layer-1);overflow:hidden}
+/* Detail table: every package, unmerged. Hairlines, tabular numbers, quiet
+   column heads. */
+.qdp-table{width:100%;border-collapse:collapse;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12)}
+.qdp-table th{padding:6px 10px;color:var(--dsw-alias-label-caption);text-align:left;font:var(--dsw-font-xxxs-strong-11);letter-spacing:.02em;border-bottom:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-table td{padding:9px 10px;vertical-align:top;border-bottom:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-table tbody tr:last-child td{border-bottom:0}
+.qdp-num{min-width:140px}
+.qdp-numText{display:block;margin-bottom:4px;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}
+.qdp-miniBar{display:block;height:4px;overflow:hidden;background:var(--dsw-alias-bg-module-platform);border-radius:999px;corner-shape:round}
 .qdp-expiry{white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
 
-/* Variant switch: plain buttons, like the settings page's usage carousel. */
-.qdp-tabs{flex-wrap:wrap;gap:6px;display:flex}
-.qdp-tab{align-items:center;font:inherit;color:var(--dsw-alias-label-secondary);cursor:pointer;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:2px 10px;font-size:12px;line-height:18px;display:inline-flex;gap:6px}
+/* Variant switcher on the dashboard: text tabs (kept quiet next to the cards). */
+.qdp-tabs{display:flex;flex-wrap:wrap;gap:2px;padding:4px;border-radius:var(--dsw-radius-md);background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-tab{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;color:var(--dsw-alias-label-tertiary);cursor:pointer;font:var(--dsw-font-xxs-strong-12);background:0 0;border:0;border-radius:var(--dsw-radius-sm)}
 .qdp-tab:hover:not(.qdp-tabActive){color:var(--dsw-alias-label-primary)}
-.qdp-tabActive{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-brand-primary)}
+.qdp-tabActive{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-soft)}
+.qdp-tab:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
 
-/* ------------------------------------------------- plugin card */
-/* The Plugins-page configuration card. One rule set replaces the card's
-   ~30 inline CSSProperties objects: same declarations, but themeable in one
-   place, shareable between the unified card and any future surface, and
-   free of the per-object fallback drift (identical rgba hexes had been
-   restated by hand across objects). Dynamic values — progress widths,
-   active-tab state, status-dot colour — stay inline on the element.
-   The declarations here are the UNION of this rule and the dashboard's card
-   rule above, because the plugin card used to match BOTH: the dashboard's
-   padding, flex-direction, gap and display were never overridden, so they
-   applied here too. Kept verbatim so this surface renders as before. */
-.qdp-card{list-style:none;border-width:.5px;border-style:solid;border-color:var(--dsw-alias-border-l4);border-radius:16px;background:var(--dsw-alias-bg-layer-3);transition:border-color .16s,background .16s;padding:16px 18px;flex-direction:column;gap:16px;display:flex}
-.qdp-card:hover{border-color:var(--dsw-alias-label-dimmed)}
-.qdp-cardOpen{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}
-/* The disclosure header, shaped like workbuddy's .dsm-plugin-card-header:
-   one full-width button so the whole row toggles, with the icon and the
-   two-line title block on the left and the caret pushed right. */
-.qdp-cardHeader{align-items:flex-start;gap:12px;width:100%;padding:14px 16px;border:0;background:none;color:inherit;cursor:pointer;text-align:left;display:flex}
-.qdp-cardHead{flex-wrap:wrap;flex-direction:column;align-items:flex-start;gap:4px;flex:1;min-width:0;display:flex}
-.qdp-cardTitle{font-size:15px;line-height:1.4;font-weight:600;color:var(--dsw-alias-label-primary);text-align:left}
-.qdp-cardDescription{font-size:13px;line-height:1.45;color:var(--dsw-alias-label-tertiary);text-align:left}
-.qdp-cardIcon{flex:none;width:32px;height:32px;border-radius:7px;display:block}
-/* A border-drawn caret rather than a host icon: the icon primitive's names
-   differ across DSH lines (0.1.5 Outline14 vs 0.1.7 OutlineRegular), so no
-   single static import serves both — the same reason workbuddy draws its own. */
-.qdp-cardChevron{flex:none;width:9px;height:9px;margin-right:4px;border-right:1.5px solid var(--dsw-alias-label-tertiary);border-bottom:1.5px solid var(--dsw-alias-label-tertiary);transform:rotate(45deg);transition:transform .16s}
+/* ------------------------------------------------- plugin card (page) */
+/* The page body: the host detail page already draws the crumb, icon, title,
+   version and description, so this is a plain column of sections — no outer
+   card chrome, no second heading. */
+.qdp-card{display:flex;flex-direction:column;gap:20px;min-width:0;padding:0;margin:0;background:none;border:0;list-style:none}
+.qdp-cardOpen{background:none}
+.qdp-cardBody{display:flex;flex-direction:column;gap:20px;margin:0;padding:0;min-width:0}
+/* Legacy disclosure header (kept for the bundle-config seat and for the
+   summary-line anatomy; the page seat renders body-only). */
+.qdp-cardHeader{display:flex;align-items:flex-start;gap:12px;width:100%;padding:14px 16px;color:inherit;cursor:pointer;text-align:left;background:none;border:0;border-radius:var(--dsw-radius-xl)}
+.qdp-cardHeader:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-cardHead{display:flex;flex:1;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;flex-wrap:wrap}
+.qdp-cardTitle{color:var(--dsw-alias-label-primary);text-align:left;font:var(--dsw-font-base-strong-16)}
+.qdp-cardDescription{color:var(--dsw-alias-label-tertiary);text-align:left;font:var(--dsw-font-xs-13)}
+.qdp-cardIcon{flex:none;display:block;width:36px;height:36px;border-radius:var(--dsw-radius-sm)}
+.qdp-cardChevron{flex:none;width:7px;height:7px;margin:6px 4px 0 0;border-right:1.5px solid var(--dsw-alias-label-tertiary);border-bottom:1.5px solid var(--dsw-alias-label-tertiary);transform:rotate(45deg);transition:transform .16s var(--ds-ease-in-out)}
 .qdp-cardChevronOpen{transform:rotate(225deg)}
-/* No border-top: the host already draws a rule under the header row, so one
-   here read as a second, doubled line across the card (and looked like an
-   outer box around the panes). The rule belongs to whoever draws the header. */
-.qdp-cardBody{margin:0 16px;padding:12px 0 8px;display:flex;flex-direction:column;gap:18px}
-.qdp-body{margin:0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-.qdp-error{margin:0;font-size:13px;line-height:1.5;color:var(--dsw-alias-state-error-primary)}
-.qdp-list{flex-direction:column;gap:18px;padding-top:2px;display:flex}
-.qdp-group{flex-direction:column;gap:10px;display:flex}
-.qdp-label{justify-content:space-between;gap:12px;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-secondary);display:flex}
-.qdp-rate{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-/* Buttons. Primary fills the row's main action; danger is graded: quiet
-   outline while armed, solid error fill once confirmed. */
-.qdp-btn{box-sizing:border-box;padding:5px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;line-height:1.5;cursor:pointer}
-.qdp-btn:disabled{opacity:.4;cursor:default}
-.qdp-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.qdp-btnPrimary{border-color:var(--dsw-alias-button-primary-fill);background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
-.qdp-btnDanger{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-label-primary-foreground)}
+
+/* Status header inside the account section. */
+.qdp-accountBox{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}
+.qdp-accountState{display:flex;align-items:center;gap:8px;color:var(--dsw-alias-label-primary);font:var(--dsw-font-base-strong-16)}
+.qdp-accountExpiry{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12)}
+.qdp-accountMain{display:flex;flex-direction:column;gap:3px;min-width:0}
+
+/* PAT (credential) group. */
+.qdp-patBox{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:12px 0;border-top:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-patBoxCopy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.qdp-patBoxMeta{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+.qdp-body{margin:0;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xs-13)}
+.qdp-error{margin:0;color:var(--dsw-alias-state-error-primary);font:var(--dsw-font-xs-13)}
+.qdp-rate{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12)}
+
+/* Buttons: the local 'QdpButton' control (src/client/controls.tsx) renders
+   these classes on the official small-button geometry (28px / R8 / 12-18). */
+.qdp-btn{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:28px;padding:0 10px;color:var(--dsw-alias-label-secondary);cursor:pointer;font:var(--dsw-font-xxs-strong-12);background:0 0;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}
+.qdp-btn:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-btn:disabled{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-interactive-bg-hover);border-color:transparent;cursor:default}
+.qdp-btn:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.qdp-btnPrimary{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill);border-color:var(--dsw-alias-button-primary-fill)}
+.qdp-btnPrimary:hover:not(:disabled){color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-hover);border-color:var(--dsw-alias-button-primary-hover)}
+.qdp-btnDanger{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
 .qdp-btnDangerQuiet{color:var(--dsw-alias-state-error-primary)}
-/* PAT entry row and its input. */
-.qdp-patRow{align-items:center;gap:8px;flex-wrap:wrap;display:flex}
-.qdp-patInput{box-sizing:border-box;flex:1;min-width:200px;padding:6px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.5}
-/* The one level of variant tabs. */
-.qdp-seg{align-items:center;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:3px;gap:4px;display:flex}
-.qdp-segItem{flex:1;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;line-height:18px;cursor:pointer;appearance:none;outline:none;color:var(--dsw-alias-label-tertiary);transition:all .16s ease;display:flex}
+.qdp-btnDangerQuiet:hover:not(:disabled){color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-interactive-bg-hover-danger)}
+.qdp-btnGhost{border-color:transparent}
+
+/* Medium action button (36px / R12) for the one CTA that deserves emphasis. */
+.qdp-btnMd{height:36px;padding:0 14px;font:var(--dsw-font-s-strong-14);border-radius:var(--dsw-radius-md)}
+
+/* Toggle: 36x20 capsule with a 16px thumb — the official switch geometry. */
+.qdp-switch{box-sizing:border-box;position:relative;display:inline-flex;flex:none;align-items:center;width:36px;height:20px;padding:2px;cursor:pointer;background:var(--dsw-alias-border-l3);border:0;border-radius:999px;corner-shape:round;transition:background .12s var(--ds-ease-in-out)}
+.qdp-switch[aria-checked="true"]{background:var(--dsw-alias-brand-primary)}
+.qdp-switch:disabled{opacity:.5;cursor:default}
+.qdp-switch:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.qdp-switchThumb{display:block;width:16px;height:16px;background:var(--dsw-alias-switch-thumb);border-radius:50%;corner-shape:round;transition:transform .12s var(--ds-ease-in-out)}
+.qdp-switch[aria-checked="true"] .qdp-switchThumb{background:var(--dsw-alias-label-primary-foreground)}
+.qdp-switch[aria-checked="true"] .qdp-switchThumb{transform:translateX(16px)}
+
+/* Status dot (8px), the shell's own state vocabulary. */
+.qdp-dot{display:inline-flex;flex:none;width:8px;height:8px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-state-idle-primary)}
+.qdp-dotDone{background:var(--dsw-alias-state-success-primary)}
+.qdp-dotOngoing{background:var(--dsw-alias-state-business-primary);animation:qdp-pulse 1.4s var(--ds-ease-in-out) infinite}
+.qdp-dotWarn{background:var(--dsw-alias-state-warn-primary)}
+.qdp-dotError{background:var(--dsw-alias-state-error-primary)}
+
+/* Read-only tag/capsule. */
+.qdp-tag{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 8px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-module-platform);border-radius:999px;corner-shape:round;font:var(--dsw-font-xxxs-strong-11);white-space:nowrap}
+.qdp-tagSuccess{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-state-success-tertiary)}
+.qdp-tagWarn{color:var(--dsw-alias-state-warn-label);background:var(--dsw-alias-state-warn-tertiary)}
+.qdp-tagError{color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-interactive-bg-hover-danger)}
+
+/* Single-line text input (local 'QdpInput'): 32px / R12, hairline at rest. */
+.qdp-input{box-sizing:border-box;display:flex;flex:1;min-width:200px;height:32px;padding:0 10px;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14);background:var(--dsw-alias-bg-module-platform);border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md)}
+.qdp-input::placeholder{color:var(--dsw-alias-label-caption)}
+.qdp-input:hover:not(:disabled){border-color:var(--dsw-alias-border-l3)}
+.qdp-input:focus-visible{border-color:var(--dsw-alias-state-business-primary);outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+.qdp-input:disabled{opacity:.5;cursor:default}
+.qdp-inputShort{flex:0 0 auto;width:56px;min-width:0;padding:0 8px;text-align:center;font-variant-numeric:tabular-nums}
+
+/* Credential input row (local 'QdpInput'): 32px / R12, hairline at rest. */
+.qdp-patRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.qdp-patInput{box-sizing:border-box;flex:1;min-width:200px;height:32px;padding:0 8px;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14);background:var(--dsw-alias-bg-module-platform);border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md)}
+.qdp-patInput::placeholder{color:var(--dsw-alias-label-caption)}
+.qdp-patInput:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+
+/* Segmented control: 4px inset track, R12 outer / R8 segments (local control). */
+.qdp-seg{display:flex;align-items:center;gap:2px;padding:4px;background:var(--dsw-alias-interactive-bg-hover);border-radius:var(--dsw-radius-md)}
+.qdp-segItem{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;height:28px;padding:0 16px;color:var(--dsw-alias-label-secondary);cursor:pointer;font:var(--dsw-font-xs-strong-13);background:0 0;border:0;border-radius:var(--dsw-radius-sm);transition:background .16s var(--ds-ease-in-out),color .16s var(--ds-ease-in-out)}
 .qdp-segItem:hover{color:var(--dsw-alias-label-primary)}
-.qdp-segItem:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.qdp-segItemActive{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font-weight:500}
-/* Context preference + model rows. */
-.qdp-contextPicker{align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;display:flex}
-/* Column headings for the model list, sitting on the divider the user drew
-   above the list: the rule separates the refresh toolbar from the list, and
-   the two captions name the columns the rows are laid out in. */
-.qdp-modelColumns{border-top:.5px solid var(--dsw-alias-border-l2);align-items:center;justify-content:space-between;gap:12px;padding:8px 12px 6px;display:flex;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
-/* Model rows as one framed list: rows are separated by hairlines INSIDE a
-   single rounded frame (workbuddy's list shape) rather than each being its
-   own filled chip, which read as a stack of unrelated boxes. The frame owns
-   the radius and the border; the rows own the dividers. */
-.qdp-modelList{border:.5px solid var(--dsw-alias-border-l4);border-radius:10px;background:var(--dsw-alias-bg-layer-3);overflow:hidden}
-.qdp-modelRow{align-items:flex-start;justify-content:space-between;gap:12px;background:none;border-radius:0;padding:10px 12px;display:flex}
-.qdp-modelRow + .qdp-modelRow{border-top:.5px solid var(--dsw-alias-border-l2)}
-/* The row's left half: the visibility checkbox plus the two-line name/id
-   block. These classes were referenced by the card from the start but never
-   had rules, so the block rendered with browser defaults; stated properly
-   here as part of the framed-list restyle. */
-.qdp-modelEnable{align-items:center;gap:9px;flex:1;min-width:0;cursor:pointer;display:flex}
-.qdp-modelEnable input{flex:none;margin:0;cursor:pointer}
-.qdp-modelCopy{flex-direction:column;gap:1px;min-width:0;display:flex}
-.qdp-modelName{font-size:13px;line-height:1.4;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* The credit multiplier rides the name, quiet and slightly apart from it:
-   the name identifies the model, the rate is a secondary fact about it. */
-.qdp-modelRate{margin-left:6px;font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
-/* The per-model window slider, shaped like Qoder's own control: a light
-   green wash filling the groove up to a slim green bar handle. Green here is
-   the success tone Qoder uses for this control, not the blue brand fill.
-   The width is fixed so every row's track is the same length and its stops
-   line up in one column down the list. */
-.qdp-windowSlider{flex-direction:column;gap:4px;flex:none;width:170px;display:flex}
-.qdp-windowTrack{position:relative;height:18px;display:flex;align-items:center}
-.qdp-windowTrack::before{content:"";position:absolute;left:0;right:0;height:8px;border-radius:3px;background:var(--dsw-alias-bg-layer-3);border:.5px solid var(--dsw-alias-border-l2)}
-/* The wash runs from the left edge to the handle, so the travel in effect
-   reads at a glance even when the handle sits at stop 0. */
-.qdp-windowFill{position:absolute;left:0;height:8px;border-radius:3px;background:var(--dsw-alias-state-success-primary,#3e8e5a);opacity:.22}
-/* The handle is a slim vertical bar (Qoder's), not a round dot. It is inset
-   by half its width so stop 0 sits ON the left edge instead of hanging half
-   outside the track — which is what made it look unrendered at 0. */
-.qdp-windowKnob{position:absolute;width:4px;height:16px;border-radius:2px;background:var(--dsw-alias-state-success-primary,#3e8e5a);transform:translateX(-2px)}
+.qdp-segItem:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+.qdp-segItemActive{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-soft)}
+.qdp-segCell{display:flex;align-items:center;gap:2px;flex:1;min-width:0}
+.qdp-segSwitch{display:inline-flex;flex:none;align-items:center;padding:0 8px 0 2px;cursor:pointer}
+.qdp-segSwitch input{margin:0;cursor:pointer;accent-color:var(--dsw-alias-state-business-primary)}
+.qdp-segSwitch input:disabled{opacity:.4;cursor:default}
+.qdp-contextPicker{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+
+/* Usage & check-in group: one surfaced block, usage above a hairline, check-in
+   below. Nested group radius = outer card 20 − inset 4 → 16. */
+.qdp-panel{display:flex;flex-direction:column;gap:14px;padding:16px;background:var(--dsw-alias-bg-module-platform);border:0;border-radius:var(--dsw-radius-lg)}
+.qdp-panel + .qdp-panel{margin-top:-4px}
+.qdp-panelHead{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.qdp-panelTitle{margin:0;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-strong-14)}
+.qdp-panelMeta{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+.qdp-list{display:flex;flex-direction:column;gap:10px;min-width:0}
+.qdp-group{display:flex;flex-direction:column;gap:10px;min-width:0}
+.qdp-label{display:flex;justify-content:space-between;gap:12px;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12)}
+.qdp-logList{display:flex;flex-direction:column;gap:4px}
+.qdp-track{height:6px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);border-radius:999px;corner-shape:round}
+.qdp-settingsFlat{display:flex;flex-direction:column;gap:4px;padding-top:14px;border-top:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-twoUp{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch}
+@media (max-width:760px){.qdp-twoUp{grid-template-columns:1fr}}
+
+/* Pane tabs: underline strip like the plugins settings tabs. */
+.qdp-paneTabs{display:flex;gap:20px;margin-top:2px;border-bottom:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-paneTab{margin-bottom:-1px;padding:7px 1px 9px;color:var(--dsw-alias-label-tertiary);cursor:pointer;font:var(--dsw-font-xs-13);background:0 0;border:0;border-bottom:2px solid transparent}
+.qdp-paneTab:hover{color:var(--dsw-alias-label-primary)}
+.qdp-paneTab:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px;border-radius:2px}
+.qdp-paneTabActive{color:var(--dsw-alias-label-primary);font-weight:500;border-bottom-color:var(--dsw-alias-label-primary)}
+
+/* Model list: one framed list (R16) whose rows own the hairline dividers. */
+.qdp-modelHead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.qdp-modelColumns{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 2px 2px;color:var(--dsw-alias-label-caption);font:var(--dsw-font-xxxs-11)}
+.qdp-modelList{overflow:hidden;background:var(--dsw-alias-settings-card-fill);border:0.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-lg)}
+.qdp-modelRow{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:12px 14px}
+.qdp-modelRow + .qdp-modelRow{border-top:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-modelEnable{display:flex;flex:1;align-items:center;gap:10px;min-width:0;cursor:pointer}
+.qdp-modelEnable input{flex:none;width:16px;height:16px;margin:0;cursor:pointer;accent-color:var(--dsw-alias-state-business-primary)}
+.qdp-modelCopy{display:flex;flex-direction:column;gap:1px;min-width:0}
+.qdp-modelName{overflow:hidden;color:var(--dsw-alias-label-primary);text-overflow:ellipsis;white-space:nowrap;font:var(--dsw-font-s-14)}
+.qdp-modelRate{margin-left:6px;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);font-variant-numeric:tabular-nums}
+.qdp-modelMeta{white-space:nowrap;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11)}
+
+/* Per-model context-window slider (Qoder's own control: success-toned). */
+.qdp-windowSlider{display:flex;flex:none;flex-direction:column;gap:4px;width:170px}
+.qdp-windowTrack{position:relative;display:flex;align-items:center;height:18px}
+.qdp-windowTrack::before{content:"";position:absolute;left:0;right:0;height:6px;background:var(--dsw-alias-bg-module-platform);border-radius:999px;corner-shape:round}
+.qdp-windowFill{position:absolute;left:0;height:6px;background:var(--dsw-alias-state-business-primary);opacity:.22;border-radius:999px;corner-shape:round}
+.qdp-windowKnob{position:absolute;width:2px;height:14px;background:var(--dsw-alias-state-business-primary);border-radius:1px;corner-shape:round;transform:translateX(-1px)}
 .qdp-windowInput{position:absolute;left:0;right:0;width:100%;height:18px;margin:0;opacity:0;cursor:pointer;-webkit-appearance:none;appearance:none}
 .qdp-windowInput:disabled{cursor:default}
-.qdp-windowTicks{position:relative;height:14px;font-size:11px;line-height:14px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
-.qdp-windowTick{position:absolute;transform:translateX(-50%);white-space:nowrap}
-/* The origin marker: the track starts at 0 for every model, and the user
-   asked for that start to be visible without printing the number 0. */
+.qdp-windowTicks{position:relative;height:14px;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);font-variant-numeric:tabular-nums}
+.qdp-windowTick{position:absolute;white-space:nowrap;transform:translateX(-50%)}
 .qdp-windowTickMark{display:inline-block;width:1px;height:4px;background:var(--dsw-alias-border-l4)}
-.qdp-track{height:8px;overflow:hidden;border-radius:999px;background:var(--dsw-alias-bg-layer-2)}
-.qdp-logList{flex-direction:column;gap:6px;display:flex}
-/* Usage & check-in panel: one bordered surface, usage above a divider,
-   check-in below (workbuddy's credit-panel shape, restated for qdp-). */
-.qdp-panel{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-2);padding:14px;gap:12px;display:flex;flex-direction:column}
-.qdp-panelHead{align-items:baseline;justify-content:space-between;gap:12px;display:flex}
-.qdp-panelTitle{margin:0;font-size:13px;font-weight:600;line-height:1.5;color:var(--dsw-alias-label-primary)}
-.qdp-panelMeta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.5;font-variant-numeric:tabular-nums}
-/* Bottom tab strip: two panes side by side, an underline marks the active
-   one. Quiet pills would compete with the panel headings above. */
-.qdp-paneTabs{gap:18px;border-bottom:1px solid var(--dsw-alias-border-l2);margin-top:2px;display:flex}
-.qdp-paneTab{font:inherit;font-size:13px;line-height:20px;cursor:pointer;background:0 0;border:0;border-bottom:2px solid transparent;color:var(--dsw-alias-label-tertiary);padding:6px 2px;margin-bottom:-1px}
-.qdp-paneTab:hover{color:var(--dsw-alias-label-primary)}
-.qdp-paneTab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.qdp-paneTabActive{border-bottom-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);font-weight:600}
-/* The merged model pane: header row carries the refresh control; each row
-   states its own context capacity beside the enable toggle. */
-.qdp-modelHead{align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;display:flex}
-.qdp-modelMeta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;white-space:nowrap}
-/* Per-model context picker: a compact select like workbuddy's account
-   picker, sharing the select-wrap caret pattern. */
-/* Variant tabs with an enable checkbox per side (workbuddy tab-switch). */
-.qdp-segCell{align-items:center;gap:2px;flex:1;min-width:0;display:flex}
-.qdp-segSwitch{display:inline-flex;align-items:center;flex:none;padding:0 8px 0 2px;cursor:pointer}
-.qdp-segSwitch input{margin:0;cursor:pointer;accent-color:var(--dsw-alias-brand-primary)}
-.qdp-segSwitch input:disabled{opacity:.4;cursor:default}
-/* Account box + PAT box (workbuddy usage-account shape). */
-.qdp-accountBox{align-items:center;justify-content:space-between;gap:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-layer-2);padding:12px 14px;display:flex}
-.qdp-accountState{align-items:center;gap:10px;font-size:15px;font-weight:500;color:var(--dsw-alias-label-primary);display:flex}
-.qdp-accountExpiry{padding-left:19px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.qdp-patBox{align-items:center;justify-content:space-between;gap:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-3);padding:8px 12px;display:flex}
-.qdp-patBoxCopy{flex-direction:column;gap:1px;min-width:0;display:flex}
-.qdp-patBoxMeta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
-/* Settings listed flat on the Usage pane: no fold, just grouped rows. */
-.qdp-settingsFlat{border-top:1px solid var(--dsw-alias-border-l2);padding-top:12px;gap:4px;display:flex;flex-direction:column}
-/* 可用额度与最近领取并列两栏:workbuddy 的 credit-panels 布局,窄屏回落单列。 */
-.qdp-twoUp{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;align-items:stretch;display:grid}
-@media (max-width:760px){.qdp-twoUp{grid-template-columns:1fr}}
-/* 领取台账的一行:左边日期,右边到期情况(与需求 4 的排版一致)。 */
-.qdp-ledgerRow{align-items:baseline;justify-content:space-between;gap:10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);display:flex}
-/*
- * 台账本体占满左框的剩余高度,超出就滚动而不是把框撑长(需求 1:
- * 界面能显示几条显示几条)。行高 18px + 行距 6px,9 行 ≈ 216px;
- * 底部的「3 天内到期」小结只占自己一行,高度都留给上面的列表。
- */
-.qdp-ledgerList{max-height:216px;overflow-y:auto}
-.qdp-ledgerDate{color:var(--dsw-alias-label-tertiary);white-space:nowrap;font-variant-numeric:tabular-nums}
-.qdp-ledgerAmount{flex:none;color:var(--dsw-alias-label-primary);font-weight:600;font-variant-numeric:tabular-nums}
-.qdp-ledgerExpiry{margin-left:auto;color:var(--dsw-alias-label-tertiary);white-space:nowrap;font-variant-numeric:tabular-nums}
-.qdp-ledgerExpired{color:var(--dsw-alias-state-error-primary)}
-/* 右侧额度框里的领取按钮:占满整行、贴在剩余额度/进度下面(需求 4)。 */
-.qdp-claimBtn{width:100%;justify-content:center}
-/* 左框底部的到期小结行,与它上面的台账行用一条分隔线断开。 */
-.qdp-ledgerFoot{border-top:1px solid var(--dsw-alias-border-l2);padding-top:10px;align-items:baseline;justify-content:space-between;gap:10px;display:flex}
-.qdp-ledgerFootValue{color:var(--dsw-alias-label-primary);font-weight:600;font-variant-numeric:tabular-nums}
 
-@media (prefers-reduced-motion:reduce){.qdp-footFill,.qdp-barFill{transition:none}}
+/* Check-in ledger. */
+.qdp-ledgerRow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xxs-12)}
+.qdp-ledgerList{max-height:216px;overflow-y:auto}
+.qdp-ledgerDate{white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.qdp-ledgerAmount{flex:none;color:var(--dsw-alias-label-primary);font-weight:500;font-variant-numeric:tabular-nums}
+.qdp-ledgerExpiry{margin-left:auto;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.qdp-ledgerExpired{color:var(--dsw-alias-state-error-primary)}
+.qdp-claimBtn{width:100%;justify-content:center}
+.qdp-ledgerFoot{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding-top:10px;border-top:0.5px solid var(--dsw-alias-border-l2)}
+.qdp-ledgerFootValue{color:var(--dsw-alias-label-primary);font-weight:500;font-variant-numeric:tabular-nums}
+
+/* The composer probe control: a compact pill button. */
+.qdp-probe{box-sizing:border-box;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;color:var(--dsw-alias-label-secondary);cursor:pointer;font:var(--dsw-font-xxs-strong-12);background:0 0;border:0.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm)}
+.qdp-probe:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.qdp-probe:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.qdp-probe:disabled{opacity:.4;cursor:default}
+.qdp-probeDot{flex:none;width:6px;height:6px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-state-idle-primary)}
+.qdp-probeDotOn{background:var(--dsw-alias-state-success-primary)}
+.qdp-probeDotWarn{background:var(--dsw-alias-state-warn-primary)}
+.qdp-probeDotError{background:var(--dsw-alias-state-error-primary)}
+.qdp-probeWrap{display:inline-flex;position:relative;align-items:center;transform:translateY(2px);margin-right:-8px}
+.qdp-probeLabel{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);white-space:nowrap}
+/* Tooltip: dark capsule, elevation carries the edge (no border + shadow pairing). */
+.qdp-probeTip{position:absolute;left:50%;bottom:calc(100% + 8px);z-index:1000;transform:translateX(-50%);padding:4px 8px;white-space:nowrap;pointer-events:none;color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-tooltip-bg);border-radius:var(--dsw-radius-sm);box-shadow:var(--dsw-elevation-soft);font:var(--dsw-font-xxs-12)}
+/* Confirmation/result surface: light elevated popover, same anchor. */
+.qdp-probeBubble{position:absolute;right:0;bottom:calc(100% + 8px);z-index:1001;display:flex;flex-direction:column;gap:10px;width:260px;padding:12px 14px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-md);box-shadow:var(--dsw-elevation-panel);font:var(--dsw-font-xxs-12)}
+.qdp-probeBubbleRow{display:flex;justify-content:flex-end;gap:8px}
+.qdp-probeNote{position:absolute;right:0;bottom:calc(100% + 8px);z-index:1001;display:flex;align-items:center;gap:12px;padding:8px 10px;white-space:nowrap;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-md);box-shadow:var(--dsw-elevation-panel);font:var(--dsw-font-xxs-12)}
+.qdp-bubble{position:absolute;z-index:120;display:flex;flex-direction:column;gap:6px;min-width:200px;max-width:320px;padding:10px 12px;background:var(--dsw-alias-tooltip-bg);border-radius:var(--dsw-radius-md);box-shadow:var(--dsw-elevation-panel);color:var(--dsw-alias-label-primary-foreground);font:var(--dsw-font-xxs-12)}
+.qdp-bubbleTitle{font:var(--dsw-font-xxs-strong-12)}
+.qdp-bubbleNote{opacity:.85}
+
+@media (prefers-reduced-motion:reduce){
+  .qdp-foot,.qdp-footFill,.qdp-barFill,.qdp-skeleton,.qdp-cardChevron,.qdp-segItem{transition:none;animation:none}
+}
 `

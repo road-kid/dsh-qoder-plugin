@@ -113,19 +113,29 @@ describe('Qoder plugin card', () => {
   async function mount(variant?: QoderCardVariant): Promise<void> {
     const props = { t, ...variant === undefined ? {} : { variant } } as unknown as Parameters<typeof QoderPluginCard>[0]
     await act(async () => { view = create(createElement(QoderPluginCard, props)) })
-    // 大标题默认展开(m01317 第 1 条),所以这里不再点任何按钮。旧版本为了
-    // 「把折叠的卡片打开」点了 findAllByType('button')[0],而那个位置现在正是
-    // 新的大标题 —— 点下去反而把正文收起来,整套断言随之找不到元素。
-    expect(view!.root.findAll(n => n.props.className === 'qdp-cardHeader')[0]!.props['aria-expanded']).toBe(true)
+    // 插件配置页由宿主画面包屑/图标/标题/版本/描述,卡片自己只渲染正文:
+    // 恒为展开态,没有 disclosure 头可点。旧版本在这里点
+    // findAllByType('button')[0] 把折叠卡片打开;现在第一个按钮属于正文,
+    // 点了反而会误触(例如刷新)。这里改为断言正文容器与五个分区都在。
+    expect(view!.root.findAll(n => n.props.className === 'qdp-card qdp-cardOpen')).toHaveLength(1)
+    // 未登录时只有账户/额度/高级设置三个分区;登录后再加上使用与签到、模型。
+    const titles = view!.root
+      .findAll(n => n.props.className === 'qdp-sectionTitle')
+      .map(node => node.children.join(''))
+    expect(titles.slice(0, 2)).toEqual([en.accountHeading, en.creditsHeading])
+    expect(titles).toContain(en.quotaSectionAdvanced)
+    expect(view!.root.findAll(n => n.props.className === 'qdp-cardHeader')).toHaveLength(0)
   }
 
-  /** Switch the signed-in body's bottom pane (「用量与签到」 / 「模型」). */
+  /**
+   * 「用量与签到」与「模型」现在是页面上并排的两个分区,不再是 pane tab:
+   * 切页动作消失,只需确认该分区标题在同一棵树上。
+   */
   const openPane = async (label: string): Promise<void> => {
-    const tab = view!.root.findAll(n =>
-      n.props.role === 'tab' && n.children.includes(label),
-    )[0]
-    if (tab === undefined) throw new Error(`no pane tab "${label}"`)
-    await act(async () => { tab.props.onClick() })
+    const titles = view!.root
+      .findAll(n => n.props.className === 'qdp-sectionTitle')
+      .map(node => node.children.join(''))
+    expect(titles).toContain(label)
   }
 
   const buttonLabels = (): string[] => view!.root.findAllByType('button').map(node => node.children.join(''))
@@ -240,10 +250,10 @@ describe('Qoder plugin card', () => {
     expect(tree).toContain(t('patTail', { tail: '****abcd' }))
     expect(tree).toContain(en.patSourceCard)
     expect(tree).not.toContain('pt-test')
-    // The PAT box carries the delete action; 「更换」 is gone — removing the
-    // token and saving a fresh one IS the replace flow now.
+    // 账户分区的动作行同时给出「更换」与「删除」:两者都已接线路由,
+    // 删除仍要过内联确认。
     expect(buttonLabels()).toContain(en.patRemove)
-    expect(buttonLabels()).not.toContain(en.patReplace)
+    expect(buttonLabels()).toContain(en.patReplace)
   })
 
   it('Remove PAT arms a cancellable confirm over the live document', async () => {
@@ -462,8 +472,11 @@ describe('Qoder plugin card', () => {
     statusBody = null
     await mount()
     const tree = JSON.stringify(view!.toJSON())
+    // 首次读取就给了不可解析的 200:账号状态落到 error 臂并给出无效响应提示,
+    // 而不是把 null 当文档解引用崩掉。
     expect(tree).toContain(en.statusResponseInvalid)
-    expect(tree).toContain(en.requestFailed) // the header label
+    expect(tree).toContain(en.requestFailed) // the account state label
+    expect(tree).not.toContain(en.signedIn)
   })
 
   // ---- variant copy and routes -------------------------------------------------
@@ -474,7 +487,8 @@ describe('Qoder plugin card', () => {
     const asked = (await vi.mocked(fetch).mock.calls).map(call => String(call[0]))
     expect(asked).toContain(QODER_GLOBAL_CARD.statusPath)
     const tree = JSON.stringify(view!.toJSON())
-    expect(tree).toContain(en.titleAI)
+    // 标题/图标/描述归宿主详情页,组件只画正文;Global 变体自己的文案
+    // 落在正文里 —— PAT 指引与占位符。
     expect(tree).toContain(en.patGuideAI)
     expect(tree).toContain(en.patPlaceholderAI)
     expect(tree).not.toContain('qoder.com.cn')

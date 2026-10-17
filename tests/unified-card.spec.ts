@@ -103,55 +103,44 @@ describe('Unified Qoder Plugin Card', () => {
     })
   }
 
-  it('draws the disclosure header on the page view, and nothing on the summary view', async () => {
+  it('draws the body-only configuration on the page view, and only the one-liner on the summary view', async () => {
     await mountUnified()
     const json = JSON.stringify(view!.toJSON())
-    // 需求(m01317 第 1 条):设置页的卡片要有像 workbuddy 那样的展开大标题
-    // —— 图标 + 标题 + 说明 + 展开箭头,默认展开。所以这一版起卡片自身
-    // 就画 disclosure 头,标题行正当地重复一次 intro。
-    expect(json).toContain(en.unifiedIntro)
-    // 大标题默认展开:aria-expanded 为 true 的恰好是它 + 两个选中的 tab
-    // (国内版 tab 与「用量与签到」pane tab)。
-    const header = view!.root.findAll(n => n.props.className === 'qdp-cardHeader')[0]
-    expect(header).toBeDefined()
-    expect(header!.props['aria-expanded']).toBe(true)
-    // 展开态下卡片带 qdp-cardOpen。
+    // 插件详情页的标题/图标/描述由宿主画:本组件不再画 disclosure 头,
+    // 也不再重复一遍 intro 文案。
+    expect(json).not.toContain(en.unifiedIntro)
+    expect(view!.root.findAll(n => n.props.className === 'qdp-cardHeader')).toHaveLength(0)
+    expect(json).not.toContain('aria-expanded')
+    // 正文:恒展开的容器 + 五个分区(账户/额度/使用与签到/模型/高级设置)。
     const root = view!.root.findAll(n => typeof n.props.className === 'string' && n.props.className.includes('qdp-card '))[0]
     expect(root!.props.className).toContain('qdp-cardOpen')
-    expect(view!.root.findAllByProps({ 'aria-selected': true })).toHaveLength(2)
+    expect(view!.root.findAll(n => n.props.className === 'qdp-section')).toHaveLength(5)
+    // 变体切换只剩一层 tablist,且恰好一个 tab 处于选中态。
+    expect(view!.root.findAllByProps({ 'aria-selected': true })).toHaveLength(1)
   })
 
-  it('collapses the body when the header is clicked, and re-expands it', async () => {
+  it('renders usage and models side by side on one page — there is no pane to switch', async () => {
     await mountUnified()
-    const header = () => view!.root.findAll(n => n.props.className === 'qdp-cardHeader')[0]!
-    // 默认展开:正文在 DOM 里。
-    expect(JSON.stringify(view!.toJSON())).toContain(en.variantTabCN)
-    await act(async () => { header().props.onClick() })
-    // 收起后正文整体不渲染(不是 visibility 隐藏),卡片也不再有 open 态。
-    expect(header().props['aria-expanded']).toBe(false)
     const json = JSON.stringify(view!.toJSON())
-    // The body's own controls are gone; note `variantTabCN` ("China") is NOT a
-    // usable marker here — it also occurs in the description line that stays.
-    expect(json).not.toContain(en.quotaPollLabel)
-    expect(json).not.toContain(en.patBoxLabel)
-    // 标题与说明仍在:收起的是正文,不是这个卡片的身份。
-    expect(json).toContain(en.unifiedIntro)
-    const root = view!.root.findAll(n => typeof n.props.className === 'string' && n.props.className.includes('qdp-card'))[0]
-    expect(root!.props.className).not.toContain('qdp-cardOpen')
-    // 再点一次回到展开态。
-    await act(async () => { header().props.onClick() })
-    expect(header().props['aria-expanded']).toBe(true)
-    expect(JSON.stringify(view!.toJSON())).toContain(en.variantTabCN)
+    // 旧的 pane tab 已删:两个分区与高级设置同时挂载,不需要切页/展开。
+    expect(view!.root.findAll(n => n.props.role === 'tab' && n.children.includes(en.paneModels))).toHaveLength(0)
+    expect(json).toContain(en.ledgerHeading)
+    expect(view!.root.findAll(n => n.props.className === 'qdp-sectionTitle').map(node => node.children.join('')))
+      .toEqual([en.accountHeading, en.creditsHeading, en.quotaSectionUsage, en.paneModels, en.quotaSectionAdvanced])
+    expect(json).toContain(en.quotaPollLabel)
+    expect(json).toContain(en.patBoxLabel)
   })
 
-  it('labels the header toggle for assistive tech in both states', async () => {
+  it('labels the variant switcher for assistive tech', async () => {
     await mountUnified()
-    const header = () => view!.root.findAll(n => n.props.className === 'qdp-cardHeader')[0]!
-    // 与 workbuddy 相同的做法:aria-label 说清这一按会发生什么 —— 展开时
-    // 写「收起」,收起时写「展开」,并带上标题,读屏才分得清是哪张卡。
-    expect(header().props['aria-label']).toBe(`${en.cardCollapse}: ${en.unifiedTitle}`)
-    await act(async () => { header().props.onClick() })
-    expect(header().props['aria-label']).toBe(`${en.cardExpand}: ${en.unifiedTitle}`)
+    const tabList = view!.root.find(n => n.props.role === 'tablist' && n.props['aria-label'] === 'Qoder Version Selection')
+    const tabs = tabList.findAllByType('button')
+    expect(tabs).toHaveLength(2)
+    // 选中态唯一,其余用 roving tabIndex 收成一个 tab stop。
+    expect(tabs[0]!.props['aria-selected']).toBe(true)
+    expect(tabs[1]!.props['aria-selected']).toBe(false)
+    expect(tabs[0]!.props.tabIndex).toBe(0)
+    expect(tabs[1]!.props.tabIndex).toBe(-1)
   })
 
   it('renders only the one-liner when the owner asks for the summary view', async () => {
@@ -279,13 +268,12 @@ describe('Unified Qoder Plugin Card', () => {
       view = create(createElement(QoderPluginCard, props))
     })
 
-    // Settings sit flat on the Usage pane, scoped to the CN variant.
-    // Find the toggle switches: first one is China quota toggle
-    const switches = view!.root.findAll(n => n.props.role === 'switch')
-    expect(switches.length).toBeGreaterThanOrEqual(1)
-    const cnSwitch = switches[0]!
+    // 高级设置里的侧栏开关。按 aria-label 精确定位 —— 账户分区的变体
+    // 启用开关也叫 role=switch,不能按顺序取第一个。
+    const quotaSwitch = () =>
+      view!.root.findAll(n => n.props.role === 'switch' && n.props['aria-label'] === en.quotaToggleCN)[0]!
     // Initially disabled because cn is signed out
-    expect(cnSwitch.props.disabled).toBe(true)
+    expect(quotaSwitch().props.disabled).toBe(true)
 
     // Fill in PAT input and click save
     const patInput = view!.root.find(n => n.type === 'input' && n.props.type === 'password')
@@ -300,9 +288,7 @@ describe('Unified Qoder Plugin Card', () => {
     })
 
     // After saving PAT, China switch must be reactively enabled!
-    const updatedSwitches = view!.root.findAll(n => n.props.role === 'switch')
-    const updatedCnSwitch = updatedSwitches[0]!
-    expect(updatedCnSwitch.props.disabled).toBe(false)
+    expect(quotaSwitch().props.disabled).toBe(false)
   })
 
   it('(a) disables quota switches when accounts are not signed in and (b) prevents disabled click from calling scope.set', async () => {
@@ -333,16 +319,16 @@ describe('Unified Qoder Plugin Card', () => {
       view = create(createElement(QoderPluginCard, props))
     })
 
-    // 卡片默认展开(大标题初值 true),这里不需要再点开;原先的
-    // findAllByType('button')[0] 现在命中的是大标题本身,点下去反而会把
-    // 正文收起来 —— 那正是先前这一条断言失败的原因。
-    expect(view!.root.findAll(n => n.props.className === 'qdp-cardHeader')[0]!.props['aria-expanded']).toBe(true)
+    // 正文恒挂载:没有 disclosure 头,也就没有「先展开」这一步。
+    expect(view!.root.findAll(n => n.props.className === 'qdp-cardHeader')).toHaveLength(0)
+    // 未登录时只有账户/额度/高级设置三个分区。
+    expect(view!.root.findAll(n => n.props.className === 'qdp-sectionTitle').map(node => node.children.join('')))
+      .toContain(en.quotaSectionAdvanced)
 
     // (a) Verify switches are disabled when not signed in (CN-scoped rows).
-    const switches = view!.root.findAll(n => n.props.role === 'switch')
-    expect(switches.length).toBeGreaterThanOrEqual(1)
-    const [cnSwitch] = switches
-    expect(cnSwitch!.props.disabled).toBe(true)
+    // 按 aria-label 定位高级设置里的侧栏开关(账户分区的变体开关也是 switch)。
+    const cnSwitch = view!.root.findAll(n => n.props.role === 'switch' && n.props['aria-label'] === en.quotaToggleCN)[0]!
+    expect(cnSwitch.props.disabled).toBe(true)
 
     // (b) Simulate clicking switches in disabled state; verify scope.set is NEVER triggered
     await act(async () => {
@@ -765,10 +751,13 @@ describe('Unified Qoder Plugin Card', () => {
 
     // Two rows, each an hour and a minute field — typeable under any input
     // method, unlike the `type="time"` spinner segments this replaced.
-    const part = (name: string, index = 0) =>
-      renderer!.root.findAll(n => n.props['data-checkin-part'] === name)[index]!
-    expect(renderer!.root.findAll(n => n.props['data-checkin-part'] === 'hour')).toHaveLength(2)
-    expect(renderer!.root.findAll(n => n.props['data-checkin-part'] === 'minute')).toHaveLength(2)
+    // data-checkin-part 现在是 QdpInput 组合件 + 它渲染出的原生 <input> 两处
+    // 都带:只数 type 为字符串的宿主节点,才是真正的输入框。
+    const hostParts = (name: string) =>
+      renderer!.root.findAll(n => n.props['data-checkin-part'] === name && typeof n.type === 'string')
+    const part = (name: string, index = 0) => hostParts(name)[index]!
+    expect(hostParts('hour')).toHaveLength(2)
+    expect(hostParts('minute')).toHaveLength(2)
     expect(renderer!.root.findAll(n => n.props.type === 'time')).toHaveLength(0)
 
     // The stored minute count renders as 10:00.

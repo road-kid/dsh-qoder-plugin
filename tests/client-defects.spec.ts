@@ -303,14 +303,16 @@ describe('QoderPluginCard', () => {
      * exists, and with a model that declares a larger alternative so the
      * preference checkbox renders.
      */
-    /** Switch the card's bottom pane to 「模型」. */
-const openModelsPane = async (): Promise<void> => {
-  const tab = view!.root.findAll(n =>
-    n.props.role === 'tab' && n.children.includes(en.paneModels),
-  )[0]
-  if (tab === undefined) throw new Error('no Models pane tab')
-  await act(async () => { tab.props.onClick() })
-}
+    /**
+     * The 模型 section is always mounted on the page now (the old 「模型」pane
+     * tab is gone), so this only confirms the section is on screen.
+     */
+    const openModelsPane = async (): Promise<void> => {
+      const titles = view!.root
+        .findAll(n => n.props.className === 'qdp-sectionTitle')
+        .map(node => node.children.join(''))
+      expect(titles).toContain(en.paneModels)
+    }
 
 async function mountGlobal(): Promise<void> {
       statusReply = { ok: true, body: doc({

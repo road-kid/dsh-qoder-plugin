@@ -22,6 +22,7 @@ import type { QoderWebStatus } from '../status-paths.ts'
 import type { QoderSettingsKey } from './locales.ts'
 import { clampPercent, mergeCreditAccounts, sortPackageRows, visibleQuotaGroups } from './quota-merge.ts'
 import { onQuotaSettingsChange, noteQuotaStatus, quotaPollMs, quotaSettingsRevision, quotaStatus, quotaStatusFetchedAt, quotaToggles, variantOfStatusPath } from './quota-settings-store.ts'
+import { QdpButton, QdpIconButton, QdpStateDot, QdpTag } from './controls.tsx'
 /** Everything the registration binds into the card. */
 export interface SidebarQuotaCardInjected {
   /** Translator bound to the quota namespace. */
@@ -342,7 +343,7 @@ export function SidebarQuotaCard(props: SidebarQuotaCardProps): React.ReactNode 
       <span className="qdp-footTop">
         <Ring percent={ringPercent} warn={ringWarn} size={16} />
         <span className="qdp-footName">{t(nameKey)}</span>
-        <span style={{ flex: 1 }} />
+        <span className="qdp-spacer" />
         {fetchedAt !== undefined ? <span className="qdp-updated">{t('quotaUpdated')} {timeText(fetchedAt)}</span> : null}
       </span>
 
@@ -483,6 +484,7 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
   const totalRemain = credits === undefined ? 0 : credits.accounts.reduce((sum, account) => sum + account.remain, 0)
   const totalSize = credits?.totalSize ?? credits?.accounts.reduce((sum, account) => sum + account.size, 0) ?? 0
   const totalPercent = clampPercent(totalRemain, totalSize)
+  const plan = status !== undefined && status.status === 'signed-in' ? status.plan : undefined
   return (
     <div className="qdp-main" role="region" aria-label={t('quotaDashboardTitle')}>
       <div className="qdp-mainInner">
@@ -493,12 +495,13 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
           </div>
           <span className="qdp-spacer" />
           {fetchedAt !== undefined ? <span className="qdp-meta">{t('quotaUpdated')} {timeText(fetchedAt)}</span> : null}
-          <button type="button" className="qdp-refresh" disabled={loading} onClick={() => refresh()}>
+          <QdpButton variant="outline" disabled={loading} onClick={() => refresh()}>
+            {loading ? <QdpStateDot state="ongoing" /> : null}
             {loading ? t('quotaRefreshing') : t('quotaRefresh')}
-          </button>
-          <button type="button" className="qdp-close" aria-label={t('quotaClose')} title={t('quotaClose')} onClick={() => close()}>
+          </QdpButton>
+          <QdpIconButton label={t('quotaClose')} onClick={() => close()}>
             <span aria-hidden="true">×</span>
-          </button>
+          </QdpIconButton>
         </header>
 
         {statusPaths.length > 1 ? (
@@ -528,14 +531,23 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
           </div>
         ) : null}
 
-        <section className="qdp-dashCard">
+        <section className="qdp-dashCard" aria-label={t(nameKey)}>
           <div className="qdp-dashCardHead">
-            <span className="qdp-avatar">{activeVariant === 'qoder-global' ? 'GL' : 'CN'}</span>
-            <span className="qdp-cardIdentity">
-              <span className="qdp-dashCardTitle">{t(nameKey)}</span>
-              <span className="qdp-cardOwner">{ownerText(status, t)}</span>
-            </span>
-            {credits?.unlimited === true ? <span className="qdp-badge">{t('quotaUnlimited')}</span> : null}
+            <div className="qdp-inline">
+              <span className="qdp-avatar">{activeVariant === 'qoder-global' ? 'GL' : 'CN'}</span>
+              <span className="qdp-cardIdentity">
+                <span className="qdp-dashCardTitle">{t(nameKey)}</span>
+                <span className="qdp-cardOwner">{ownerText(status, t)}</span>
+              </span>
+            </div>
+            {plan !== undefined || credits?.unlimited === true ? (
+              <div className="qdp-inline">
+                {plan !== undefined ? <QdpTag>{plan.planTierName}</QdpTag> : null}
+                {plan?.organizationName !== undefined ? <QdpTag>{plan.organizationName}</QdpTag> : null}
+                {plan?.endDate !== undefined ? <QdpTag>{`${t('quotaExpires')} ${plan.endDate}`}</QdpTag> : null}
+                {credits?.unlimited === true ? <QdpTag>{t('quotaUnlimited')}</QdpTag> : null}
+              </div>
+            ) : null}
           </div>
           {!signedIn ? (
             <div className="qdp-notice">
@@ -544,13 +556,20 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
           ) : credits === undefined ? (
             <div className="qdp-notice qdp-noticeError">
               <p className="qdp-noticeTitle">{t('quotaError')}</p>
+              {status !== undefined && status.status === 'signed-in' && status.creditsError !== undefined ? (
+                <p className="qdp-muted">{status.creditsError}</p>
+              ) : null}
+              <div className="qdp-actions">
+                <QdpButton variant="outline" disabled={loading} onClick={() => refresh()}>
+                  {t('quotaRefresh')}
+                </QdpButton>
+              </div>
             </div>
           ) : (
             <>
-              {/* Overall: 额度（剩余 / 总量）, its share of the granted total,
-                  the upstream's usage percentage, and the account-wide bar.
-                  totalSize 0 (nothing granted or an old host) renders
-                  indeterminate — never a false 100%. */}
+              {/* Overall total: remaining / granted, its share of the granted
+                  total, the account-wide bar, then this cycle's usage. A zero
+                  totalSize renders the bar indeterminate — never a false 100%. */}
               <p className="qdp-totalLine">
                 {t('quotaTotalRemain')} <strong className="qdp-totalValue">{totalRemain.toLocaleString()}</strong>
                 {' / '}
@@ -559,13 +578,8 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
               <p className="qdp-totalSub">
                 {t('quotaTotalShare', {
                   percent: totalPercent === undefined ? t('quotaUnknownTotal') : `${totalPercent.toFixed(2)}%`,
-                  remain: totalRemain.toLocaleString(),
-                  size: totalSize.toLocaleString(),
                 })}
               </p>
-              {Number.isFinite(credits.total) ? (
-                <p className="qdp-totalSub">{t('quotaCycleUsed', { percent: String(credits.total) })}</p>
-              ) : null}
               <div
                 className="qdp-bar"
                 role="progressbar"
@@ -574,50 +588,60 @@ export function QuotaDashboard(props: QuotaDashboardProps): React.ReactNode {
                   ? { 'aria-valuetext': t('quotaUnknownTotal') }
                   : { 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(totalPercent) }}
               >
-                <div
-                  className={totalPercent !== undefined && totalPercent < 20 ? 'qdp-barFill qdp-barFillWarn' : 'qdp-barFill'}
-                  style={{ width: totalPercent === undefined ? '100%' : `${Math.max(2, totalPercent)}%`, opacity: totalPercent === undefined ? 0.25 : 1 }}
-                />
+                {totalPercent === undefined ? (
+                  <div className="qdp-barFill qdp-barFillIndeterminate" />
+                ) : (
+                  <div
+                    className={totalPercent < 20 ? 'qdp-barFill qdp-barFillWarn' : 'qdp-barFill'}
+                    style={{ width: `${Math.max(2, totalPercent)}%` }}
+                  />
+                )}
               </div>
+              {Number.isFinite(credits.total) || credits.cycleResetTime !== undefined ? (
+                <p className="qdp-caption">
+                  {Number.isFinite(credits.total) ? t('quotaCycleUsed', { percent: String(credits.total) }) : null}
+                  {Number.isFinite(credits.total) && credits.cycleResetTime !== undefined ? ' · ' : null}
+                  {credits.cycleResetTime !== undefined ? `${t('quotaExpires')} ${credits.cycleResetTime}` : null}
+                </p>
+              ) : null}
 
               <h3 className="qdp-blockTitle">{t('quotaByPackage')}</h3>
-              <table className="qdp-table">
-                <thead>
-                  <tr>
-                    <th>{t('quotaColPackage')}</th>
-                    <th>{t('quotaColRemain')}</th>
-                    <th>{t('quotaColExpiry')}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row, index) => (
-                    <tr key={`${index}\u0000${row.name}\u0000${row.packageEndTime ?? ''}`}>
-                      <td>{row.name}</td>
-                      <td className="qdp-num">
-                        <span className="qdp-numText">{row.remain.toLocaleString()} / {row.size.toLocaleString()}</span>
-                        <span className="qdp-miniBar">
-                          <span
-                            className={row.warn ? 'qdp-footFill qdp-footFillWarn' : 'qdp-footFill'}
-                            style={{
-                              display: 'block',
-                              height: '100%',
-                              borderRadius: 999,
-                              width: row.percent === undefined ? '100%' : `${Math.max(2, row.percent)}%`,
-                              opacity: row.percent === undefined ? 0.25 : 1,
-                            }}
-                          />
-                        </span>
-                      </td>
-                      <td className="qdp-expiry" title={row.packageEndTime ?? t('quotaNoExpiry')}>
-                        {row.packageEndTime ?? '—'}
-                      </td>
+              {rows.length === 0 ? (
+                <div className="qdp-empty">{t('quotaUnknownTotal')}</div>
+              ) : (
+                <table className="qdp-table">
+                  <thead>
+                    <tr>
+                      <th>{t('quotaColPackage')}</th>
+                      <th>{t('quotaColRemain')}</th>
+                      <th>{t('quotaColExpiry')}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-              {credits.cycleResetTime !== undefined ? (
-                <p className="qdp-windowReset">{t('quotaExpires')} {credits.cycleResetTime}</p>
-              ) : null}
+                  </thead>
+                  <tbody>
+                    {rows.map((row, index) => (
+                      <tr key={`${index}\u0000${row.name}\u0000${row.packageEndTime ?? ''}`}>
+                        <td>{row.name}</td>
+                        <td className="qdp-num">
+                          <span className="qdp-numText">{row.remain.toLocaleString()} / {row.size.toLocaleString()}</span>
+                          <span className="qdp-miniBar">
+                            {row.percent === undefined ? (
+                              <span className="qdp-footFill qdp-barFillIndeterminate" />
+                            ) : (
+                              <span
+                                className={row.warn ? 'qdp-footFill qdp-footFillWarn' : 'qdp-footFill'}
+                                style={{ width: `${Math.max(2, row.percent)}%` }}
+                              />
+                            )}
+                          </span>
+                        </td>
+                        <td className="qdp-expiry" title={row.packageEndTime ?? t('quotaNoExpiry')}>
+                          {row.packageEndTime ?? '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </>
           )}
         </section>

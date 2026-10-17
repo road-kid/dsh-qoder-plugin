@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1
+
+### Changed — plugin UI rebuilt to the DSH 0.2.1 design language
+
+Every surface now draws from the official theme contract instead of hand-picked
+values, and the card structure follows the plugin-page slot contract:
+
+- **Body-only plugin page.** The card no longer paints its own icon, title,
+  description or collapse header — the plugin detail page already draws that
+  chrome. The page is five settings cards: 账号 / 可用额度 / 使用与签到 / 模型 /
+  高级设置.
+- **Design tokens throughout.** Colours, typography, radii, hairlines and
+  elevation come from `--dsw-*` tokens: 20px settings cards with a 0.5px stroke,
+  14/22 row titles and 12/18 descriptions, 0.5px separators, theme focus rings,
+  superellipse corners. Literal hex values, off-scale radii (10/14/16px) and
+  custom dark-theme selectors are gone.
+- **Dark theme fixed.** The sidebar progress bar was black-on-black, the selected
+  variant tab rendered as a near-black block, variant checkboxes were unreadable
+  and the disabled check-in button was invisible; all four are now token-driven.
+- **Typography and voice.** Section headings are localized (使用与签到 /
+  高级设置), numbers are tabular, and credit figures share one
+  剩余/总量 presentation across the footer card, the page and the dashboard.
+- **Interaction rebuilt.** Variant pills are a proper segmented control
+  (arrow-key navigation, disabled when that variant is off), the account actions
+  are grouped next to the status line, failed credits/catalogue/PAT reads offer an
+  in-place retry, and every control has a visible focus ring and aria label.
+- **Consistent controls.** Local switch/segmented/button/state-dot/input controls
+  reproduce the official geometry (switch 36×20, segmented track 12/4/8, buttons
+  H28/H36) without adding a runtime dependency on `ui-primitives`.
+
 All notable changes to this project are documented here. Entries describe
 user-visible behaviour; commit messages carry the mechanism.
 

@@ -17,8 +17,8 @@
  */
 
 import { useSyncExternalStore, useState, useEffect, useCallback } from 'react'
-import type { CSSProperties } from 'react'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+import { QdpInput, QdpSwitch } from './controls.tsx'
 import type { QoderSettingsKey } from './locales.ts'
 import { isQoderWebStatus } from './status-document.ts'
 import { noteQuotaSignIn, onQuotaSettingsChange, quotaSignInState, quotaStatus, variantOfStatusPath } from './quota-settings-store.ts'
@@ -221,7 +221,10 @@ function stableProject(scope: QuotaSettingsScope<QuotaSection> | undefined): Quo
   return cachedProjection
 }
 
-/** One toggle row: label, hint, and a switch drawn to the shell's proportions. */
+/**
+ * One toggle row: the official settings-row anatomy — label + description on
+ * the left, the control flush right — with the shell's own switch control.
+ */
 function ToggleRow({ label, hint, checked, disabled, disabledHint, onToggle }: {
   label: string
   hint: string
@@ -231,31 +234,19 @@ function ToggleRow({ label, hint, checked, disabled, disabledHint, onToggle }: {
   onToggle: (next: boolean) => void
 }): React.ReactNode {
   return (
-    <div style={rowStyle}>
-      <div style={rowTextStyle}>
-        <span style={labelStyle}>{label}</span>
-        <span style={hintStyle}>{disabled === true && disabledHint !== undefined ? disabledHint : hint}</span>
+    <div className="qdp-row">
+      <div className="qdp-rowText">
+        <span className="qdp-rowTitle">{label}</span>
+        <span className="qdp-rowDesc">{disabled === true && disabledHint !== undefined ? disabledHint : hint}</span>
       </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        disabled={disabled}
-        aria-label={label}
-        onClick={() => {
-          if (disabled) return
-          onToggle(!checked)
-        }}
-        style={{
-          ...switchStyle,
-          background: checked ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.2))',
-          justifyContent: checked ? 'flex-end' : 'flex-start',
-          opacity: disabled === true ? 0.45 : 1,
-          cursor: disabled === true ? 'not-allowed' : 'pointer',
-        }}
-      >
-        <span style={knobStyle} />
-      </button>
+      <div className="qdp-rowControl">
+        <QdpSwitch
+          checked={checked}
+          label={label}
+          disabled={disabled === true}
+          onChange={onToggle}
+        />
+      </div>
     </div>
   )
 }
@@ -313,41 +304,41 @@ function TimeRow({ label, hint, value, disabled, onPick }: {
   }
 
   return (
-    <div style={rowStyle}>
-      <div style={rowTextStyle}>
-        <span style={labelStyle}>{label}</span>
-        <span style={hintStyle}>{hint}</span>
+    <div className="qdp-row">
+      <div className="qdp-rowText">
+        <span className="qdp-rowTitle">{label}</span>
+        <span className="qdp-rowDesc">{hint}</span>
       </div>
-      <span style={pollFieldStyle}>
-        <input
+      <div className="qdp-rowControl">
+        <QdpInput
+          className="qdp-inputShort"
           type="number"
           min={0}
           max={23}
           value={hourDraft}
-          disabled={disabled}
+          disabled={disabled === true}
           aria-label={`${label} — hour`}
           data-checkin-part="hour"
           onChange={event => { setHourDraft(event.target.value) }}
           onBlur={commit}
           onKeyDown={onKeyDown}
-          style={{ ...timePartStyle, opacity: disabled === true ? 0.45 : 1 }}
         />
-        <span style={labelStyle}>:</span>
-        <input
+        <span className="qdp-muted" aria-hidden="true">:</span>
+        <QdpInput
+          className="qdp-inputShort"
           type="number"
           min={0}
           max={59}
           value={minuteDraft}
-          disabled={disabled}
+          disabled={disabled === true}
           aria-label={`${label} — minute`}
           data-checkin-part="minute"
           onChange={event => { setMinuteDraft(event.target.value) }}
           onBlur={commit}
           onKeyDown={onKeyDown}
-          style={{ ...timePartStyle, opacity: disabled === true ? 0.45 : 1 }}
         />
-        <span style={hintStyle}>UTC+8</span>
-      </span>
+        <span className="qdp-caption">UTC+8</span>
+      </div>
     </div>
   )
 }
@@ -443,7 +434,7 @@ export function QuotaSettingsContent({ t = key => key, scope, signedIn, variant 
   const showCN = variant === undefined || variant === 'cn'
   const showGlobal = variant === undefined || variant === 'global'
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <>
       {showCN ? (
         <ToggleRow
           label={t('quotaToggleCN')}
@@ -502,13 +493,14 @@ export function QuotaSettingsContent({ t = key => key, scope, signedIn, variant 
           onPick={next => write('checkInMinuteGlobal', next)}
         />
       ) : null}
-      <div style={{ ...rowStyle, borderBottom: 'none', paddingBottom: 0 }}>
-        <div style={rowTextStyle}>
-          <span style={labelStyle}>{t('quotaPollLabel')}</span>
-          <span style={hintStyle}>{t('quotaPollHint')}</span>
+      <div className="qdp-row">
+        <div className="qdp-rowText">
+          <span className="qdp-rowTitle">{t('quotaPollLabel')}</span>
+          <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
         </div>
-        <span style={pollFieldStyle}>
-          <input
+        <div className="qdp-rowControl">
+          <QdpInput
+            className="qdp-inputShort"
             type="number"
             min={POLL_MIN_MS / 60_000}
             step={1}
@@ -518,72 +510,11 @@ export function QuotaSettingsContent({ t = key => key, scope, signedIn, variant 
               const mins = Number.parseInt(event.target.value, 10)
               if (Number.isFinite(mins) && mins > 0) write('quotaPollMs', Math.max(POLL_MIN_MS, mins * 60_000))
             }}
-            style={inputStyle}
           />
-          <span style={hintStyle}>{t('quotaPollUnit')}</span>
-        </span>
+          <span className="qdp-caption">{t('quotaPollUnit')}</span>
+        </div>
       </div>
-      {projection.writable === false ? <span style={hintStyle}>{t('quotaSettingsSaveFailed')}</span> : null}
-    </div>
+      {projection.writable === false ? <p className="qdp-error">{t('quotaSettingsSaveFailed')}</p> : null}
+    </>
   )
-}
-
-/**
- * One settings row: NO box of its own (the bordered rows read as nested
- * cards, which the user ruled against) — rows are separated by a hairline
- * bottom rule like the settings shell's own preference lists.
- */
-const rowStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 12,
-  borderBottom: '.5px solid var(--dsw-alias-border-l2)',
-  paddingBottom: 10,
-}
-const rowTextStyle: CSSProperties = { display: 'flex', flex: 1, minWidth: 0, flexDirection: 'column', gap: 2 }
-const labelStyle: CSSProperties = { fontSize: 13, fontWeight: 500, lineHeight: 1.5, color: 'var(--dsw-alias-label-primary)' }
-const hintStyle: CSSProperties = { fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' }
-const switchStyle: CSSProperties = {
-  flex: 'none',
-  display: 'flex',
-  width: 36,
-  height: 20,
-  borderRadius: 10,
-  borderWidth: '1px',
-  borderStyle: 'solid',
-  borderColor: 'var(--dsw-alias-border-l2)',
-  padding: 1,
-  cursor: 'pointer',
-  alignItems: 'center',
-  transition: 'background .16s',
-}
-const knobStyle: CSSProperties = { display: 'block', width: 16, height: 16, borderRadius: '50%', background: 'var(--dsw-alias-bg-layer-1, #fff)', boxShadow: '0 1px 2px rgba(0,0,0,0.2)' }
-const pollFieldStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }
-const timePartStyle: CSSProperties = {
-  boxSizing: 'border-box',
-  width: 56,
-  padding: '5px 8px',
-  borderWidth: '1px',
-  borderStyle: 'solid',
-  borderColor: 'var(--dsw-alias-border-l2)',
-  borderRadius: 8,
-  background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-label-primary)',
-  font: 'inherit',
-  fontSize: 13,
-  textAlign: 'center',
-}
-const inputStyle: CSSProperties = {
-  boxSizing: 'border-box',
-  width: 55,
-  padding: '5px 8px',
-  borderWidth: '1px',
-  borderStyle: 'solid',
-  borderColor: 'var(--dsw-alias-border-l2)',
-  borderRadius: 8,
-  background: 'var(--dsw-alias-bg-layer-2)',
-  color: 'var(--dsw-alias-label-primary)',
-  font: 'inherit',
-  fontSize: 13,
-  textAlign: 'right',
 }

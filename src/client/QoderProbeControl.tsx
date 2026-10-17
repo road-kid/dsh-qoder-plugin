@@ -21,9 +21,9 @@
  */
 
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
-import type { CSSProperties } from 'react'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { QODER_CARD_VARIANTS, type QoderCardVariant, type QoderPluginCardInjected } from './QoderPluginCard.tsx'
+import { QdpButton } from './controls.tsx'
 import { isQoderWebStatus } from './status-document.ts'
 import type { QoderWebProbeModel, QoderWebStatus } from '../status-paths.ts'
 
@@ -47,149 +47,12 @@ export function cardVariantFor(provider: string): QoderCardVariant | undefined {
 const RECONCILE_MS = 60_000
 
 
-// The host slot's baseline sits a touch high and leaves a full inter-control gap
-// before the model picker. Nudge only this annotation down and inward so it
-// reads as part of the selected model rather than a separate toolbar item.
-const wrapperStyle: CSSProperties = {
-  display: 'inline-flex',
-  position: 'relative',
-  alignItems: 'center',
-  transform: 'translateY(2px)',
-  marginRight: -8,
-}
-const buttonStyle: CSSProperties = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  // Tight gap: the label is an annotation on the icon, not a peer of the model
-  // name it sits beside.
-  gap: 2,
-  height: 30,
-  padding: '0 6px',
-  border: 0,
-  borderRadius: 8,
-  background: 'transparent',
-  color: 'var(--dsw-alias-label-secondary)',
-  font: 'inherit',
-  whiteSpace: 'nowrap',
-  cursor: 'pointer',
-}
-
-/**
- * The inline label. Smaller and dimmer than the surrounding chrome on purpose:
- * it names the feature, so it should read as an annotation attached to the icon
- * rather than compete with the adjacent model selector.
+/*
+ * All surface styling lives in quota-styles.ts (`qdp-probe*`): the seat's job
+ * is the two-part shape — a compact pill button with a dim annotation label,
+ * and one popover anchored above it. No inline colours, radii or font sizes
+ * here; only the state-dependent `disabled` attribute and aria wiring.
  */
-const labelStyle: CSSProperties = {
-  fontSize: 11,
-  lineHeight: '16px',
-  color: 'var(--dsw-alias-label-tertiary)',
-}
-
-/** Tooltip bubble: the Fast Mode shape (nowrap, one line, above the control). */
-const tooltipStyle: CSSProperties = {
-  position: 'absolute',
-  left: '50%',
-  bottom: 'calc(100% + 8px)',
-  zIndex: 1000,
-  transform: 'translateX(-50%)',
-  padding: '4px 8px',
-  borderRadius: 6,
-  background: 'var(--dsw-specific-tip, #1f2329)',
-  boxShadow: 'var(--dsw-shadow-lv2)',
-  color: 'var(--dsw-alias-label-primary, #fff)',
-  fontSize: 12,
-  lineHeight: '18px',
-  whiteSpace: 'nowrap',
-  pointerEvents: 'none',
-}
-
-/** Confirmation bubble: same anchor, but interactive and allowed to wrap. */
-const confirmStyle: CSSProperties = {
-  position: 'absolute',
-  right: 0,
-  bottom: 'calc(100% + 8px)',
-  zIndex: 1001,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 8,
-  width: 260,
-  padding: '10px 12px',
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 8,
-  background: 'var(--dsw-alias-bg-layer-1, #fff)',
-  boxShadow: 'var(--dsw-shadow-lv2)',
-  color: 'var(--dsw-alias-label-primary)',
-  fontSize: 12,
-  lineHeight: '18px',
-}
-const confirmRowStyle: CSSProperties = { display: 'flex', justifyContent: 'flex-end', gap: 8 }
-const confirmButtonStyle: CSSProperties = {
-  padding: '3px 10px',
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 6,
-  background: 'transparent',
-  color: 'inherit',
-  font: 'inherit',
-  fontSize: 12,
-  cursor: 'pointer',
-}
-/**
- * Primary action inside the confirmation bubble.
- *
- * The fill and its text colour must come as a pair: `brand-primary` resolves to
- * a light accent in this theme, so hardcoding `color: #fff` on top of it renders
- * white-on-white. `button-primary-fill` + `label-primary-foreground` is the
- * theme's own pair for exactly this, and is what `dsh-codex-connect` uses for
- * the same job.
- */
-const primaryButtonStyle: CSSProperties = {
-  ...confirmButtonStyle,
-  border: '1px solid var(--dsw-alias-button-primary-fill)',
-  background: 'var(--dsw-alias-button-primary-fill)',
-  color: 'var(--dsw-alias-label-primary-foreground)',
-}
-
-/**
- * Result note: a single line + a dismiss button, anchored to the control's
- * right side. Smaller than the confirmation bubble because it carries an
- * *outcome*, not a *decision* — the work is done, the user only has to read
- * and dismiss.
- */
-const noteStyle: CSSProperties = {
-  position: 'absolute',
-  right: 0,
-  bottom: 'calc(100% + 8px)',
-  zIndex: 1001,
-  display: 'flex',
-  alignItems: 'center',
-  gap: 12,
-  padding: '6px 10px',
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 8,
-  background: 'var(--dsw-alias-bg-layer-1)',
-  boxShadow: 'var(--dsw-shadow-lv2)',
-  color: 'var(--dsw-alias-label-primary)',
-  fontSize: 12,
-  lineHeight: '18px',
-  whiteSpace: 'nowrap',
-}
-/**
- * The note's dismiss action. Outlined rather than bare text: inside an already
- * bordered bubble, an unbordered word does not read as something you can click.
- * Matches the outlined pill convention the plugin's other secondary actions use.
- */
-const noteDismissStyle: CSSProperties = {
-  padding: '2px 8px',
-  border: '1px solid var(--dsw-alias-border-l2)',
-  borderRadius: 6,
-  background: 'transparent',
-  color: 'var(--dsw-alias-label-secondary)',
-  font: 'inherit',
-  fontSize: 12,
-  lineHeight: '18px',
-  cursor: 'pointer',
-}
 
 /**
  * The feature's static inline label. Deliberately not a state readout — see the
@@ -380,7 +243,7 @@ function ModelProbe({ model, card, label, t }: {
 
   return (
     <span
-      style={wrapperStyle}
+      className="qdp-probeWrap"
       onMouseEnter={() => { setTooltipVisible(true) }}
       onMouseLeave={() => { setTooltipVisible(false) }}
     >
@@ -394,7 +257,7 @@ function ModelProbe({ model, card, label, t }: {
         onClick={() => { setConfirming(true) }}
         onFocus={() => { setTooltipVisible(true) }}
         onBlur={() => { setTooltipVisible(false) }}
-        style={{ ...buttonStyle, opacity: disabled && !confirming ? 0.6 : 1, cursor: disabled ? 'default' : 'pointer' }}
+        className="qdp-probe"
       >
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           strokeWidth="1.6" aria-hidden="true" focusable="false">
@@ -403,39 +266,37 @@ function ModelProbe({ model, card, label, t }: {
           <path d="M12 12 20 4" />
           <circle cx="12" cy="12" r="1" />
         </svg>
-        <span style={labelStyle}>{label}</span>
+        <span className="qdp-probeLabel">{label}</span>
       </button>
 
       {showTooltip && (
-        <span id={tooltipId} role="tooltip" style={tooltipStyle}>{text}</span>
+        <span id={tooltipId} role="tooltip" className="qdp-probeTip">{text}</span>
       )}
 
       {confirming && (
-        <span style={confirmStyle}>
+        <span className="qdp-probeBubble">
           <span>{t('probeBubbleBody')}</span>
-          <span style={confirmRowStyle}>
-            <button type="button" style={confirmButtonStyle} onClick={() => { setConfirming(false) }}>
+          <span className="qdp-probeBubbleRow">
+            <QdpButton onClick={() => { setConfirming(false) }}>
               {t('cancel')}
-            </button>
-            <button type="button" style={primaryButtonStyle} onClick={() => { void detect() }}>
+            </QdpButton>
+            <QdpButton variant="primary" onClick={() => { void detect() }}>
               {t('probeConfirmAction')}
-            </button>
+            </QdpButton>
           </span>
         </span>
       )}
 
       {note === undefined ? null : (
-        <span role="status" aria-live="polite" style={noteStyle}>
+        <span role="status" aria-live="polite" className="qdp-probeNote">
           <span>{noteText(t, note)}</span>
-          <button
-            type="button"
-            style={noteDismissStyle}
+          <QdpButton
             onClick={() => {
               setNote(undefined)
             }}
           >
             {t('probeNoteDismiss')}
-          </button>
+          </QdpButton>
         </span>
       )}
     </span>
