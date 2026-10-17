@@ -70,11 +70,11 @@ The quota readout in the composer toolbar (only while the session uses a Qoder m
 
 DSH 0.1.7 gathers every plugin's configuration into the **Plugins page** (0.2.x keeps the same seats — verified). Once installed, the plugin appears under **Installed** on that page:
 
-![dsh-qoder-plugin on the Plugins page](assets/plugin-list.png)
+![The installed-plugins group on the Plugins page](assets/plugin-list.png)
 
 Click it to open the package page; the settings body renders **inline** under the package description — that is this plugin's settings UI:
 
-![Package page: description and the inline settings card](assets/plugin-page.png)
+![Settings cards: four compact cards stacked in the page body](assets/plugin-page.png)
 
 The card draws no disclosure shell of its own (the page supplies the title, the icon and the breadcrumb). Two panes carry everything: **Auto check-in** (account, available credit, the claims ledger, and the claim action) and **Models** (model visibility and context windows). The row's own *Configure* control opens the very same card.
 
@@ -121,6 +121,21 @@ Swap the `--profile` value for the profile you use (`web` / `desktop` / `tui`) �
 > Remove the old package from the profile (the plugin manager's Remove action,
 > or `dsh plugin --profile web remove dsh-connect-qoder-x`).
 
+
+
+### Distribution and market listings
+
+- **Install from GitHub** (above, recommended): the repository ships the built
+  `lib/`, so the sources are usable as-is with no build-script permission.
+- **Install from npm**: the package is not on npm yet; once published,
+  `dsh plugin add dsh-qoder-plugin` installs prebuilt code and needs no build
+  permission (see DSH's [publish guide](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)).
+- **Why doesn't the market find it by name?** DSH's plugin market searches the
+  configured **market indexes** (`index.json`), not the npm registry directly, so
+  an npm package that no index lists is still invisible there. To make it
+  searchable, publish to npm and generate an index with DSH's
+  `plugin-market-generator`, or add your own index URL under "Custom plugin
+  markets".
 
 ---
 

@@ -52,7 +52,7 @@
 
 设置页是四张紧凑设置卡：**账号**（登录状态、套餐、凭证来源、变体切换、更换/清除 PAT）、**签到**（今日领取、最近领取台账、清空日志）、**模型**（目录来源与刷新、逐模型开关、上下文窗口滑块、统一保存）、**高级设置**（每日自动签到与签到时刻、刷新间隔、额度读数开关）。额度展示已移到输入框读数，页面不再堆叠空卡片。所有数值来自 Qoder 接口，未声明的条目不凭空出现。
 
-![插件详情页：账号与可用额度](assets/plugin-page.png)
+![设置卡片：账号与签到](assets/plugin-page.png)
 
 「签到」把今日领取、实际到手的领取台账与清空日志放在一起：
 
@@ -74,11 +74,11 @@
 
 DSH 0.1.7 起把插件配置统一收进**「插件」页**（0.2.x 沿用同一套槽位）。装好后它出现在「插件」页的**「已安装」**分组里：
 
-![插件页中的 dsh-qoder-plugin](assets/plugin-list.png)
+![「插件」页的已安装插件分组](assets/plugin-list.png)
 
 点它进入包详情页，设置正文**直接内联**在包描述下方——这就是本插件的设置界面：
 
-![插件详情页：描述与内联的设置卡片](assets/plugin-page.png)
+![设置卡片：四张紧凑卡自上而下排列](assets/plugin-page.png)
 
 卡片本身不自绘外壳（标题、图标、面包屑、版本与开关都由「插件」页绘制），只渲染配置正文：四张设置卡自上而下排列，没有折叠、没有二级页签，任何一次点击都不会把内容藏起来。深色主题、紧凑侧栏与键盘焦点均由 DSH 主题令牌接管，插件不自带配色。
 
@@ -121,6 +121,13 @@ dsh plugin --profile web add github:road-kid/dsh-qoder-plugin
 > 旧包请从 profile 移除（插件管理器里的「卸载」，或
 > `dsh plugin --profile web remove dsh-connect-qoder-x`）。
 
+
+
+### 分发与市场收录
+
+- **从 GitHub 安装**（见上，推荐）：仓库里带着构建好的 `lib/`，直接取源码即可用，不需要额外的构建脚本许可。
+- **从 npm 安装**：本包尚未发布到 npm；发布后 `dsh plugin add dsh-qoder-plugin` 会拿到预构建产物，同样不需要构建许可（参见 DSH 的[插件发布指南](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)）。
+- **在「发现」里搜不到名字？** DSH 的插件市场按配置的**市场索引**（`index.json`）检索，并不直接搜索 npm：只发布 npm、但包未被任何索引收录时，市场里仍然搜不到。想让它可被搜索，需要发布到 npm 后用 DSH 自带的 `plugin-market-generator` 生成索引，或把自建索引的 URL 添加进「自定义插件市场」。
 
 ---
 
