@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FALLBACK_QODER_MODELS } from '../src/catalog.ts'
 import { QoderPluginCard } from '../src/client/QoderPluginCard.tsx'
 import { QoderProbeControl } from '../src/client/QoderProbeControl.tsx'
+import { ModelsPane } from '../src/client/ModelsPane.tsx'
 import { en } from '../src/client/locales.ts'
 import { QODER_CN_CARD, QODER_GLOBAL_CARD } from '../src/client/QoderPluginCard.tsx'
 
@@ -110,7 +111,7 @@ function doc(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     pat: { source: 'card', savedAtMs: 1_700_000_000_000, patTail: 'wxyz' },
     probeKey: 'probe-key',
     authKey: 'auth-key',
-    credits: { total: 10, totalSize: 100, accounts: [{ packageName: '个人额度', remain: 90, size: 100 }] },
+    credits: { total: 10, totalSize: 100, accounts: [] },
     probe: { consent: true, running: false, candidates: ['hy3'], results: [] },
     ...overrides,
   }
@@ -127,7 +128,10 @@ async function mountCard(): Promise<void> {
 }
 
 const pressCard = async (label: string, nth = 0): Promise<void> => {
-  const matches = view!.root.findAllByType('button').filter(entry => entry.children.join('') === label)
+  // The account head's refresh is an icon button: its accessible name, not its
+  // glyph, is stable.
+  const matches = view!.root.findAllByType('button')
+    .filter(entry => entry.children.join('') === label || entry.props['aria-label'] === label)
   const node = matches[nth]
   if (node === undefined) throw new Error(`no button "${label}"`)
   await act(async () => { node.props.onClick() })
@@ -152,40 +156,40 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+const rendered = (): string => JSON.stringify(view!.toJSON())
+
 describe('QoderPluginCard', () => {
   describe('#1 unreadable status bodies', () => {
     it('renders an error state for a 200 whose body is literal null, without throwing', async () => {
       statusReply = { ok: true, body: null }
       await mountCard()
-      const tree = JSON.stringify(view!.toJSON())
-      expect(tree).toContain(en.statusResponseInvalid)
-      expect(tree).toContain(en.requestFailed)
+      expect(rendered()).toContain(en.statusResponseInvalid)
+      expect(rendered()).toContain(en.requestFailed)
     })
 
     it('renders an error state for a 200 whose body is not JSON, without throwing', async () => {
       statusReply = { ok: true, invalidJson: true }
       await mountCard()
-      expect(JSON.stringify(view!.toJSON())).toContain(en.statusResponseInvalid)
+      expect(rendered()).toContain(en.statusResponseInvalid)
     })
 
     it('never stores an unreadable body over a document already on screen', async () => {
       await mountCard()
       statusReply = { ok: true, body: null }
       await pressCard(en.refresh)
-      const tree = JSON.stringify(view!.toJSON())
-      expect(tree).toContain(en.signedIn)
-      expect(tree).toContain(NOTICE)
-      expect(tree).toContain(en.statusResponseInvalid)
+      expect(rendered()).toContain(en.signedIn)
+      expect(rendered()).toContain(NOTICE)
+      expect(rendered()).toContain(en.statusResponseInvalid)
     })
   })
 
   describe('#3 a failed read must not discard the document', () => {
     it('keeps every rendered value and adds the notice after a failed tick', async () => {
       await mountCard()
-      const before = JSON.stringify(view!.toJSON())
+      const before = rendered()
       statusReply = { reject: true }
       await act(async () => { [...intervals.values()][0]!() }) // the 60s poll fires
-      const after = JSON.stringify(view!.toJSON())
+      const after = rendered()
       expect(after).toContain(NOTICE)
       expect(after).toContain(en.signedIn)
       expect(before).toContain('wxyz') // the PAT tail was on screen before…
@@ -196,10 +200,10 @@ describe('QoderPluginCard', () => {
       await mountCard()
       statusReply = { reject: true }
       await act(async () => { [...intervals.values()][0]!() })
-      expect(JSON.stringify(view!.toJSON())).toContain(NOTICE)
+      expect(rendered()).toContain(NOTICE)
       statusReply = { ok: true, body: doc() }
       await act(async () => { [...intervals.values()][0]!() })
-      expect(JSON.stringify(view!.toJSON())).not.toContain(NOTICE)
+      expect(rendered()).not.toContain(NOTICE)
     })
 
     it('keeps the poll armed after a failed tick and recovers without a manual click', async () => {
@@ -208,9 +212,10 @@ describe('QoderPluginCard', () => {
       statusReply = { reject: true }
       await act(async () => { intervals.get(handle)!() })
       expect(clearedHandles).not.toContain(handle) // the interval survived the failure
-      statusReply = { ok: true, body: doc({ credits: { total: 99, accounts: [] } }) }
+      statusReply = { ok: true, body: doc({ pat: { source: 'card', savedAtMs: 1_700_000_000_000, patTail: 'zzzz' } }) }
       await act(async () => { intervals.get(handle)!() })
-      expect(JSON.stringify(view!.toJSON())).toContain(t('creditsUsed', { percent: '99' }))
+      // The account row re-rendered from the recovered document.
+      expect(rendered()).toContain(t('patTail', { tail: '****zzzz' }))
     })
 
     it('still stops the poll when the upstream answers signed-out', async () => {
@@ -222,46 +227,19 @@ describe('QoderPluginCard', () => {
     })
   })
 
-  describe('#4 unknown package size', () => {
-    it('states the remaining share as unknown instead of a fabricated 100%', async () => {
-      statusReply = { ok: true, body: doc({
-        credits: { total: 0, accounts: [{ packageName: 'Mystery', remain: 12, size: 0 }] },
-      }) }
-      await mountCard()
-      const tree = JSON.stringify(view!.toJSON())
-      expect(tree).toContain(en.percentUnknown)
-      expect(tree).toContain(t('creditPackageUnknownSize', { remain: '12' }))
-    })
-
-    it('draws no fill and announces no numeric value when the size is unknown', async () => {
-      statusReply = { ok: true, body: doc({
-        credits: { total: 0, accounts: [{ packageName: 'Mystery', remain: 12, size: 0 }] },
-      }) }
-      await mountCard()
-      const bar = view!.root.findAll(node => (node.props as { role?: string }).role === 'progressbar')[0]
-      expect(bar).toBeDefined()
-      expect(bar!.props['aria-valuenow']).toBeUndefined()
-      expect(bar!.props['aria-valuemin']).toBeUndefined()
-      expect(bar!.props['aria-valuetext']).toBe(t('creditPackageUnknownSize', { remain: '12' }))
-      expect(bar!.children).toHaveLength(0) // no fill element
-    })
-  })
-
   describe('#5 before the first response', () => {
     it('shows the loading label, a pending live region and no signed-out claim', async () => {
       statusReply = { hang: true }
       await mountCard()
-      const tree = JSON.stringify(view!.toJSON())
-      expect(tree).toContain(en.loading)
-      expect(tree).not.toContain(en.signedOut)
+      expect(rendered()).toContain(en.loading)
+      expect(rendered()).not.toContain(en.signedOut)
       const live = view!.root.findAll(node => (node.props as { role?: string }).role === 'status')[0]
       expect(live!.props['aria-busy']).toBe(true)
-      // Child effects (the settings probe) start before the card's own read,
-      // so the status read is not necessarily index 0. Resolve EVERY held
-      // read with the same document: the sequence guard keeps the card's own
-      // (latest) read in charge.
+      // Child effects may start before the card's own read, so resolve EVERY
+      // held read with the same document: the sequence guard keeps the card's
+      // own (latest) read in charge.
       for (const index of [...hung.keys()]) await release(index, { ok: true, body: doc() })
-      expect(JSON.stringify(view!.toJSON())).toContain(en.signedIn)
+      expect(rendered()).toContain(en.signedIn)
     })
   })
 
@@ -270,18 +248,23 @@ describe('QoderPluginCard', () => {
       // Read #1 (mount) settles; read #2 (manual refresh) is held; read #3
       // (poll) settles first with a newer answer; releasing #2 must not roll
       // the card back to its older document.
-      // Reads start: 0 = the settings probe (child effect), 1 = the card's
-      // mount read, 2 = the manual refresh, 3 = the poll. The refresh is the
-      // read the sequence guard must keep superseded.
-      plan = (_url, init, index) => (index === 2 && init?.method === undefined) ? { hang: true } : { ok: true, body: doc({
-        credits: { total: index === 3 ? 7 : 77, accounts: [] },
-      }) }
+      plan = (_url, init, index) => (index === 1 && init?.method === undefined)
+        ? { hang: true }
+        : { ok: true, body: doc({
+            pat: {
+              source: 'card',
+              savedAtMs: 1_700_000_000_000,
+              patTail: index === 2 ? 'newer' : 'older',
+            },
+          }) }
       await mountCard()
       await pressCard(en.refresh) // refresh read, held
       await act(async () => { [...intervals.values()][0]!() }) // poll lands first
-      expect(JSON.stringify(view!.toJSON())).toContain(t('creditsUsed', { percent: '7' }))
-      await release(2, { ok: true, body: doc({ credits: { total: 77, accounts: [] } }) })
-      expect(JSON.stringify(view!.toJSON())).toContain(t('creditsUsed', { percent: '7' }))
+      expect(rendered()).toContain(t('patTail', { tail: '****newer' }))
+      await release(1, { ok: true, body: doc({
+        pat: { source: 'card', savedAtMs: 1_700_000_000_000, patTail: 'older' },
+      }) })
+      expect(rendered()).toContain(t('patTail', { tail: '****newer' }))
     })
 
     it('drops a superseded failure silently instead of blanking the card', async () => {
@@ -292,60 +275,62 @@ describe('QoderPluginCard', () => {
       // The late answer is a failure (an unreadable body); the sequence guard
       // must swallow it without a notice and without touching the document.
       await release(1, { ok: true, body: null })
-      expect(JSON.stringify(view!.toJSON())).not.toContain(NOTICE)
-      expect(JSON.stringify(view!.toJSON())).toContain(en.signedIn)
+      expect(rendered()).not.toContain(NOTICE)
+      expect(rendered()).toContain(en.signedIn)
     })
   })
 
   describe('#11 a failed write reports beside the document', () => {
-    /**
-     * Mount with the Global variant so the context-window preference write
-     * exists, and with a model that declares a larger alternative so the
-     * preference checkbox renders.
-     */
-    /**
-     * The 模型 section is always mounted on the page now (the old 「模型」pane
-     * tab is gone), so this only confirms the section is on screen.
-     */
-    const openModelsPane = async (): Promise<void> => {
+    const MODELS = [{
+      id: 'm1',
+      name: 'M1',
+      contextWindow: 200_000,
+      defaultContextWindow: 200_000,
+      supportedContextWindows: [200_000, 1_000_000],
+    }]
+
+    async function mountGlobal(): Promise<void> {
+      statusReply = { ok: true, body: doc({ models: MODELS, disabledModels: [] }) }
+      const props = { t, view: 'page', variant: QODER_GLOBAL_CARD } as unknown as Parameters<typeof QoderPluginCard>[0]
+      await act(async () => { view = create(createElement(QoderPluginCard, props)) })
       const titles = view!.root
-        .findAll(n => n.props.className === 'qdp-sectionTitle')
+        .findAll(node => node.props.className === 'qdp-sectionTitle')
         .map(node => node.children.join(''))
       expect(titles).toContain(en.paneModels)
     }
 
-async function mountGlobal(): Promise<void> {
-      statusReply = { ok: true, body: doc({
-        models: [{ id: 'm1', name: 'M1', contextWindow: 200_000, supportedContextWindows: [200_000, 1_000_000] }],
-      }) }
-      const props = { t, variant: QODER_GLOBAL_CARD } as unknown as Parameters<typeof QoderPluginCard>[0]
-      await act(async () => { view = create(createElement(QoderPluginCard, props)) })
-      await openModelsPane()
-    }
-    /** Fire the preference checkbox, the smallest write the card offers. */
-    async function firePreferenceWrite(): Promise<void> {
-      const checkbox = view!.root.findAllByType('input').find(node => node.props.type === 'checkbox')!
-      await act(async () => { checkbox.props.onChange({ currentTarget: { checked: true } }) })
+    /** Fire the pane's batched save, the write path the card now owns. */
+    async function fireModelSave(): Promise<void> {
+      const pane = view!.root.findByType(ModelsPane)
+      await act(async () => {
+        pane.props.onSave({ disabled: ['m1'], windows: { m1: 1_000_000 } })
+      })
     }
 
-    it('keeps the account and credits on screen when the write is rejected', async () => {
+    it('keeps the account readable and shows the failure in the pane when the write is rejected', async () => {
       await mountGlobal()
       writeReply = { ok: false, status: 403, body: { error: 'invalid-auth-key' } }
-      await firePreferenceWrite()
-      const tree = JSON.stringify(view!.toJSON())
-      expect(tree).toContain(NOTICE)
-      expect(tree).toContain(en.signedIn)
-      expect(tree).toContain('invalid-auth-key') // the reason survives the round trip
+      await fireModelSave()
+      // The account document is untouched by a failed preference write…
+      expect(rendered()).toContain(en.signedIn)
+      // …and the reason survives the round trip into the pane's save bar.
+      expect(rendered()).toContain('invalid-auth-key')
+      expect(view!.root.findByType(ModelsPane).props.saveError).toBe('invalid-auth-key')
+      // A refused write must NOT trigger a re-read: the page would repaint from
+      // a catalog that still disagrees.
+      expect(calls.filter(call => call.init?.method === undefined)).toHaveLength(1)
     })
 
-    it('clears the notice after a good read follows the failed write', async () => {
+    it('clears the failure after a successful save', async () => {
       await mountGlobal()
       writeReply = { ok: false, status: 403, body: { error: 'invalid-auth-key' } }
-      await firePreferenceWrite()
-      expect(JSON.stringify(view!.toJSON())).toContain(NOTICE)
+      await fireModelSave()
+      expect(view!.root.findByType(ModelsPane).props.saveError).toBe('invalid-auth-key')
+      // A good save replaces the notice and re-reads once.
       writeReply = { ok: true, body: { state: 'updated' } }
-      await pressCard(en.refresh)
-      expect(JSON.stringify(view!.toJSON())).not.toContain(NOTICE)
+      await fireModelSave()
+      expect(view!.root.findByType(ModelsPane).props.saveError).toBeUndefined()
+      expect(calls.filter(call => call.init?.method === undefined).length).toBeGreaterThan(1)
     })
   })
 })
@@ -386,10 +371,8 @@ describe('QoderProbeControl', () => {
     await mountControl()
     // The seat stays alive; with no document the control simply has no result
     // to show, and the candidate list never said anything either.
-    expect(JSON.stringify(view!.toJSON())).not.toContain('crash')
     const tree = JSON.stringify(view!.toJSON())
-    // hy3 is not advertised as a candidate by any document, so nothing renders
-    // — and crucially, nothing threw on the way here.
+    expect(tree).not.toContain('crash')
     expect(tree === 'null' || tree.includes(en.probeLabel)).toBe(true)
   })
 

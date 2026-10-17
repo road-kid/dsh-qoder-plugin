@@ -1,6 +1,7 @@
 /** Qoder status card contributed to Harness Plugin configuration. */
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import {
@@ -12,25 +13,33 @@ import {
   QODER_STATUS_PATH,
 } from '../status-paths.ts'
 import type {
-  QoderCatalogModelSnapshot,
   QoderCredentialSource,
-  QoderWebCatalog,
-  QoderWebCredits,
   QoderProbeAction,
   QoderVariantId,
+  QoderWebCatalog,
   QoderWebStatus,
 } from '../status-paths.ts'
 import { isQoderWebStatus } from './status-document.ts'
-import { QdpButton, QdpInput, QdpSegmented, QdpStateDot, QdpSwitch, QdpTag } from './controls.tsx'
+import {
+  QdpButton,
+  QdpIconButton,
+  QdpInput,
+  QdpSegmented,
+  QdpStateDot,
+  QdpSwitch,
+  QdpTag,
+} from './controls.tsx'
 import type { QdpDotState } from './controls.tsx'
-import { mergeCreditAccounts, visibleQuotaGroups } from './quota-merge.ts'
+import { ModelsPane, type ModelsDraft } from './ModelsPane.tsx'
 import type { QoderSettingsKey } from './locales.ts'
-import { QuotaSettingsContent, type QuotaSection, type QuotaSettingsScope } from './QuotaSettingsCard.tsx'
+import type { QuotaSection, QuotaSettingsScope } from './QuotaSettingsCard.tsx'
 import {
   noteQuotaSignIn,
   noteQuotaStatus,
   onQuotaSettingsChange,
+  quotaReadout,
   quotaSignInState,
+  setQuotaReadout,
 } from './quota-settings-store.ts'
 
 /** Localized copy injected by the browser-plugin registration. */
@@ -45,7 +54,8 @@ export interface QoderPluginCardInjected {
    */
   variant?: QoderCardVariant
   /**
-   * Whether to render as the unified Qoder card (merging quota settings + CN + Global with tabs).
+   * Whether to render as the unified Qoder card (both variants behind one
+   * segmented switcher) — the Plugins-page seats always pass `true`.
    */
   unified?: boolean
 }
@@ -67,7 +77,6 @@ export interface QoderCardVariant {
   probePath: string
   authPath: string
 }
-
 
 /** China Qoder; the plugin's primary card and default. */
 export const QODER_CN_CARD: QoderCardVariant = {
@@ -97,6 +106,7 @@ export const QODER_GLOBAL_CARD: QoderCardVariant = {
 
 /** Both cards, in display order (China first). */
 export const QODER_CARD_VARIANTS: readonly QoderCardVariant[] = [QODER_CN_CARD, QODER_GLOBAL_CARD]
+
 /**
  * Props delivered by the Plugins page's configuration seats.
  *
@@ -113,7 +123,19 @@ export type QoderPluginCardProps =
   PropsRuntime<'plugins.row.config'>
   & Partial<QoderPluginCardInjected>
 
+/** Page-level poll period, in milliseconds. */
 const POLL_INTERVAL_MS = 60_000
+/**
+ * Manual grants carry no upstream expiry; the campaign's own rule is 30 days
+ * from the claim. Kept as one constant so a campaign-rule change is one edit.
+ */
+const MANUAL_GRANT_VALIDITY_MS = 30 * 24 * 60 * 60 * 1000
+/** 10:00 UTC+8, the upstream campaign's reset moment (mirrors QuotaSettingsCard). */
+const CHECK_IN_MINUTE_DEFAULT = 600
+/** Default billing-endpoint poll period, in milliseconds (mirrors the settings face). */
+const POLL_DEFAULT_MS = 300_000
+/** The face clamps the poll interval at one minute. */
+const POLL_MIN_MS = 60_000
 
 /**
  * Map the status document's state onto the local state-dot vocabulary.
@@ -128,14 +150,6 @@ function dotStateOf(status: 'loading' | QoderWebStatus['status']): QdpDotState {
   if (status === 'error') return 'error'
   if (status === 'loading') return 'ongoing'
   return 'idle'
-}
-
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat(undefined).format(value)
-}
-
-function formatPercent(value: number): string {
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value)
 }
 
 /** Date-only formatting for expiries: the day is what a validity window means. */
@@ -160,719 +174,221 @@ function patSourceText(source: QoderCredentialSource, t: QoderPluginCardInjected
 }
 
 /**
- * One billing package as a labeled progress bar.
- *
- * A package whose allowance the upstream never reported (`size` not positive)
- * has no percentage to state. It must not fall back to 100%: the plugin would be
- * claiming a full quota it knows nothing about, which is the opposite of the
- * honest "remaining N" line printed below it. Unknown size therefore renders the
- * percent slot as unknown copy and an unfilled, indeterminate track.
+ * The section head's catalogue provenance line: where the visible model roster
+ * came from and when. `live` and `saved` name the last successful fetch; the
+ * built-in fallback says so explicitly instead of pretending to be current.
  */
-function CreditBar({ label, remain, size, unlimited, packageEndTime, t }: {
-  label: string
-  remain: number
-  size: number
-  unlimited?: boolean | undefined
-  packageEndTime?: string | undefined
-  t: QoderPluginCardInjected['t']
-}): React.ReactNode {
-  const expiry = packageEndTime === undefined
-    ? null
-    : <p className="qdp-rate">{t('quotaExpires')} {formatCycleReset(packageEndTime)}</p>
-  if (unlimited === true) {
-    const quotaText = t('unlimitedQuota')
-    return (
-      <div className="qdp-group">
-        <div className="qdp-label">
-          <span>{label}</span>
-          <span>{quotaText}</span>
-        </div>
-        <div
-          className="qdp-track"
-          role="progressbar"
-          aria-label={label}
-          /*
-           * "Uncapped" is not "100% remaining", so the range attributes are
-           * omitted and no fill is drawn: an uncapped quota has no proportion
-           * to state, and a full bar would assert one.
-           */
-          aria-valuetext={quotaText}
-        />
-        <p className="qdp-body">{quotaText}</p>
-        {expiry}
-      </div>
-    )
+function catalogCaptionOf(catalog: QoderWebCatalog | undefined, t: QoderPluginCardInjected['t']): string | undefined {
+  if (catalog === undefined) return undefined
+  if (catalog.source === 'live') {
+    return catalog.fetchedAt === undefined ? t('catalogFallback') : t('catalogLive', { time: formatTime(catalog.fetchedAt) })
   }
-  const sizeKnown = size > 0
-  const detail = sizeKnown
-    ? t('exactRemaining', { remain: formatNumber(remain), size: formatNumber(size) })
-    : t('creditPackageUnknownSize', { remain: formatNumber(remain) })
-  const percent = sizeKnown ? (remain / size) * 100 : undefined
-  const display = percent === undefined
-    ? t('percentUnknown')
-    : t('percentRemaining', { percent: formatPercent(percent) })
-  return (
-    <div className="qdp-group">
-      <div className="qdp-label">
-        <span>{label}</span>
-        <span>{display}</span>
-      </div>
-      <div
-        className="qdp-track"
-        role="progressbar"
-        aria-label={label}
-        /*
-         * No numeric value when the size is unknown: the range attributes are
-         * omitted so assistive technology reports an indeterminate bar rather
-         * than a second, louder repeat of the false 100%.
-         */
-        {...percent === undefined
-          ? { 'aria-valuetext': detail }
-          : { 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent }}
-      >
-        {/* Fill width is the only dynamic value; colour/radius come from the
-            qdp-barFill class (never a literal token fallback). */}
-        {percent === undefined
-          ? null
-          : <div className="qdp-barFill" style={{ width: `${String(Math.max(0, Math.min(100, percent)))}%` }} />}
-      </div>
-      <p className="qdp-body">{detail}</p>
-      {expiry}
-    </div>
-  )
+  if (catalog.source === 'saved') {
+    return catalog.fetchedAt === undefined ? t('catalogFallback') : t('catalogSaved', { time: formatTime(catalog.fetchedAt) })
+  }
+  return t('catalogFallback')
 }
 
+/** Minutes past midnight (UTC+8), split for the two number fields. */
+function splitMinutes(minutes: number): { hours: number; minutes: number } {
+  const safe = Number.isFinite(minutes) ? Math.trunc(minutes) : CHECK_IN_MINUTE_DEFAULT
+  const clamped = safe < 0 || safe > 1439 ? CHECK_IN_MINUTE_DEFAULT : safe
+  return { hours: Math.floor(clamped / 60), minutes: clamped % 60 }
+}
 
 /**
- * The 额度 section body: account-wide remaining/total headline, the cycle reset
- * time, then ONE progress row per merged credit group.
+ * The automatic check-in time: the moment a variant checks in, as two typeable
+ * number fields.
  *
- * The accounts are merged first (`mergeCreditAccounts`) so a package bought
- * several times reads as one bar with summed figures instead of near-duplicate
- * rows, and filtered through `visibleQuotaGroups` so spent rows stay out of the
- * overview while anything still has credit. A credit read failure renders as an
- * alert with an in-place retry instead of a silent blank: the message travels on
- * the status document's `creditsError`.
+ * Deliberately NOT `<input type="time">`: that control's segments are spinners,
+ * and with an IME active (every Chinese/Japanese keyboard) the segments refuse
+ * typed digits, leaving only the tiny stepper arrows — unusable for the one
+ * thing this control exists to do. Two plain number fields accept typing under
+ * any input method; the value is committed on blur or Enter, so a half-typed
+ * field never writes a wrong moment to the settings file.
  */
-function QuotaSummary({ credits, creditsError, t, busy, onRetry }: {
-  credits?: QoderWebCredits | undefined
-  creditsError?: string | undefined
-  t: QoderPluginCardInjected['t']
-  busy: boolean
-  onRetry: () => void
-}): React.ReactNode {
-  if (creditsError !== undefined) {
-    /* A failed credit read is visible and retryable in place: a silent blank
-       would read as "no allowance" instead of "not read yet". */
-    return (
-      <div className="qdp-alert qdp-alertError" role="alert">
-        <span>{t('creditsError', { message: creditsError })}</span>
-        <div className="qdp-actions">
-          <QdpButton disabled={busy} onClick={onRetry}>
-            {busy ? t('refreshing') : t('refresh')}
-          </QdpButton>
-        </div>
-      </div>
-    )
+function CheckInTimeRow({ label, value, disabled, onPick }: {
+  label: string
+  value: number
+  disabled?: boolean
+  onPick: (minutes: number) => void
+}): ReactNode {
+  const split = splitMinutes(value)
+  const [hourDraft, setHourDraft] = useState(String(split.hours))
+  const [minuteDraft, setMinuteDraft] = useState(String(split.minutes).padStart(2, '0'))
+
+  // Re-seed the fields whenever the stored value changes underneath us (a
+  // save landing, another surface editing it). Editing itself does not write
+  // until commit, so this cannot fight the typist.
+  useEffect(() => {
+    const next = splitMinutes(value)
+    setHourDraft(String(next.hours))
+    setMinuteDraft(String(next.minutes).padStart(2, '0'))
+  }, [value])
+
+  const commit = (): void => {
+    const parsedHours = Number.parseInt(hourDraft, 10)
+    const parsedMinutes = Number.parseInt(minuteDraft, 10)
+    const hours = Number.isFinite(parsedHours) ? Math.min(23, Math.max(0, parsedHours)) : split.hours
+    const minutes = Number.isFinite(parsedMinutes) ? Math.min(59, Math.max(0, parsedMinutes)) : split.minutes
+    const next = hours * 60 + minutes
+    if (next === value) {
+      // Nothing to write, but normalize what is on screen ("9" -> "09").
+      setHourDraft(String(hours))
+      setMinuteDraft(String(minutes).padStart(2, '0'))
+      return
+    }
+    onPick(next)
   }
-  if (credits === undefined) return <p className="qdp-empty">{t('creditsNoData')}</p>
-  const groups = visibleQuotaGroups(mergeCreditAccounts(credits.accounts))
-  const totalRemain = groups.reduce((sum, group) => sum + group.remain, 0)
-  const declaredSize = groups.reduce((sum, group) => sum + group.size, 0)
-  const totalSize = credits.totalSize ?? declaredSize
-  const unlimited = credits.unlimited === true
-  const usage = Number.isFinite(credits.total)
-    ? t('creditsUsed', { percent: formatPercent(credits.total) })
-    : unlimited ? t('creditsUsedUnlimited') : t('creditsNoData')
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>): void => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commit()
+    }
+  }
+
   return (
     <>
-      <p className="qdp-totalLine">
-        {t('quotaTotalRemain')}{' '}
-        <strong className="qdp-totalValue">{unlimited ? t('quotaUnlimited') : formatNumber(totalRemain)}</strong>
-        {unlimited ? null : <>{' / '}{totalSize > 0 ? formatNumber(totalSize) : t('quotaUnknownTotal')}</>}
-      </p>
-      <p className="qdp-totalSub">{usage}</p>
-      {credits.cycleResetTime === undefined
-        ? null
-        : <p className="qdp-windowReset">{t('cycleResetAt', { time: formatCycleReset(credits.cycleResetTime) })}</p>}
-      {groups.length === 0
-        ? <p className="qdp-empty">{t('creditsNoData')}</p>
-        : groups.map((group, index) => (
-          <CreditBar
-            key={`${group.packageName}-${String(index)}`}
-            label={group.packageName}
-            remain={group.remain}
-            size={group.size}
-            unlimited={group.unlimited}
-            packageEndTime={group.packageEndTime}
-            t={t}
-          />
-        ))}
+      <QdpInput
+        className="qdp-inputShort"
+        type="number"
+        min={0}
+        max={23}
+        value={hourDraft}
+        disabled={disabled === true}
+        aria-label={`${label} — hour`}
+        data-checkin-part="hour"
+        onChange={event => { setHourDraft(event.target.value) }}
+        onBlur={commit}
+        onKeyDown={onKeyDown}
+      />
+      <span className="qdp-muted" aria-hidden="true">:</span>
+      <QdpInput
+        className="qdp-inputShort"
+        type="number"
+        min={0}
+        max={59}
+        value={minuteDraft}
+        disabled={disabled === true}
+        aria-label={`${label} — minute`}
+        data-checkin-part="minute"
+        onChange={event => { setMinuteDraft(event.target.value) }}
+        onBlur={commit}
+        onKeyDown={onKeyDown}
+      />
+      <span className="qdp-caption">UTC+8</span>
     </>
   )
 }
 
+/** One variant's automatic check-in settings, projected from the settings face. */
+interface CheckInSettings {
+  autoCN: boolean
+  autoGlobal: boolean
+  minuteCN: number
+  minuteGlobal: number
+  pollMs: number
+  status: 'loading' | 'ready' | 'unavailable'
+  writable: boolean
+}
 
-/**
- * Context capacity, listed in full.
- *
- * Every model the upstream reports a capacity for, largest first. A one-line
- * summary with the exceptions on hover was tried and rejected: capacity is
- * reference data you scan by model, and hiding most of it behind a hover made
- * the common case (a model you already have in mind) the hard one to look up.
- *
- * Purely a report of the upstream's own numbers — the middle alternatives the
- * upstream lists between the default and the maximum are display-only (the
- * upstream honours the default and the maximum, nothing between), so the only
- * control is the maximum-window preference below, which flips every eligible
- * model between its default and its largest declared window.
- */
-function formatTokens(tokens: number): string {
-  if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`
-  if (tokens >= 1_000 && tokens % 1_000 === 0) return `${tokens / 1_000}K`
-  return String(tokens)
+const UNAVAILABLE_SETTINGS: CheckInSettings = {
+  autoCN: false,
+  autoGlobal: false,
+  minuteCN: CHECK_IN_MINUTE_DEFAULT,
+  minuteGlobal: CHECK_IN_MINUTE_DEFAULT,
+  pollMs: POLL_DEFAULT_MS,
+  status: 'unavailable',
+  writable: false,
 }
 
 /**
- * A credit multiplier, spelled the way Qoder spells it: the number first, then
- * `x` — `0.0x` for a free model, `0.1x`, `0.5x`, `1.4x`.
+ * Read the check-in half of the settings face as a STABLE STRING.
  *
- * The upstream's own label is `x<n>` (see `normalizeCredits`), but the user
- * reads the rate as a price multiplier ("half price"), and every Qoder surface
- * they compared against prints it after the number. Two decimals are ALWAYS
- * shown, so the free tier reads `0.0x` rather than `0x`: the column then has
- * one decimal width throughout, and `0.0x` says "a rate that happens to be
- * zero" where a bare `0x` reads like a different kind of value.
+ * `useSyncExternalStore`'s getSnapshot must return the same reference between
+ * renders unless the store changed. The face's value is a fresh object per
+ * accepted document, so projecting it directly would re-render forever
+ * (React #185); the JSON string below is stable by construction, and is parsed
+ * back into the fields the card actually renders.
+ *
+ * The readout switches are deliberately NOT projected here: they are a
+ * client-side preference (the shipped host's settings face rejects the field),
+ * so they live in the shared store and are read directly by the advanced card.
  */
-function formatRate(factor: number): string {
-  return `${factor.toFixed(1)}x`
+function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): string {
+  if (scope === undefined) return 'unavailable'
+  const snapshot = scope.getSnapshot()
+  const value = snapshot.value ?? {}
+  return JSON.stringify([
+    value.autoCheckInCN === true,
+    value.autoCheckInGlobal === true,
+    typeof value.checkInMinuteCN === 'number' ? value.checkInMinuteCN : CHECK_IN_MINUTE_DEFAULT,
+    typeof value.checkInMinuteGlobal === 'number' ? value.checkInMinuteGlobal : CHECK_IN_MINUTE_DEFAULT,
+    snapshot.status,
+    snapshot.writable,
+    typeof value.quotaPollMs === 'number' ? value.quotaPollMs : POLL_DEFAULT_MS,
+  ])
 }
 
-/**
- * 「使用与签到」section body: the claim ledger beside the claim action.
- *
- * The credit breakdown moved out of this panel into its own 额度 section — one
- * surface answers one question. What remains is the check-in half: the ledger
- * of claimed grants on the left and today's claim CTA (with the next automatic
- * run) on the right. `qdp-twoUp` falls back to one column on narrow pages.
- */
-function UsageCheckInPanel({ checkIn, t, busy, checkingIn, checkInNotice, autoCheckIn, onCheckIn, clearingLogs, logsDisabled, onClearLogs }: {
-  checkIn?: Extract<QoderWebStatus, { status: 'signed-in' }>['checkIn'] | undefined
-  t: QoderPluginCardInjected['t']
-  busy?: boolean
-  checkingIn?: boolean
-  checkInNotice?: string | undefined
-  /**
-   * Whether this variant's AUTOMATIC check-in toggle is on. The scheduler
-   * arms a timer for every variant (so a toggle flipped on later still
-   * fires), which means `nextRunAt` exists even while the feature is off —
-   * showing it then is what made the card promise a run that would not
-   * happen. The line is gated on this flag.
-   */
-  autoCheckIn?: boolean
-  onCheckIn: () => void
-  /** A clear-logs request is in flight. */
-  clearingLogs?: boolean | undefined
-  /** No usable credential, so the ledger's clear action cannot run. */
-  logsDisabled?: boolean | undefined
-  onClearLogs?: (() => void) | undefined
-}): React.ReactNode {
-  /**
-   * Today's benefit is already in — whether this process granted it or merely
-   * found the upstream reporting it as claimed.
-   *
-   * `already-claimed` must count: the upstream answers that way for every later
-   * request on a claimed day, so treating only `claimed` as "done" re-armed the
-   * button and invited the repeat click that used to append a phantom ledger
-   * row (see the ledger's filter below).
-   *
-   * The DATE must count too, and this is the part that was missing. `checkIn`
-   * is the persisted record, not a live reading: a `claimed` row from three
-   * days ago satisfies the status test forever, so the button stayed greyed
-   * out reading 「今日已签到」 on days the user had not checked in at all —
-   * the record's own `lastDate` was never consulted. Comparing against
-   * `today` (stamped host-side in UTC+8, the day the scheduler itself uses)
-   * returns the button to 「立即领取」 once the record stops describing today.
-   *
-   * Both tests are required, and neither is redundant: `status` alone pins the
-   * button forever, while a date alone would treat a failed or no-campaign
-   * attempt earlier today as a completed claim.
-   */
-  const claimedToday = checkIn !== undefined
-    && checkIn.lastDate === checkIn.today
-    && (checkIn.status === 'claimed' || checkIn.status === 'already-claimed')
-  return (
-    /*
-     * One row of two panels: the claim ledger on the left, today's claim CTA on
-     * the right. `qdp-twoUp` falls back to one column on narrow pages. The CTA
-     * is the one action in this section worth the md size; it stays disabled
-     * while a claim is pending and once today's claim is in.
-     */
-    <div className="qdp-twoUp">
-      <CheckInLedger
-        logs={checkIn?.logs}
-        t={t}
-        {...clearingLogs === undefined ? {} : { clearing: clearingLogs }}
-        {...logsDisabled === undefined ? {} : { disabled: logsDisabled }}
-        {...onClearLogs === undefined ? {} : { onClear: onClearLogs }}
-      />
-      <div className="qdp-panel">
-        <div className="qdp-panelHead">
-          <h3 className="qdp-panelTitle">{t('paneUsage')}</h3>
-        </div>
-        {/*
-         * Only 「下次自动领取」 is stated here. The old 「今日：{state}」 line
-         * described the plugin's own state machine and called a manual claim an
-         * automatic one; the CTA's disabled state already says whether today's
-         * claim is in.
-         */}
-        {autoCheckIn !== true || checkIn?.nextRunAt === undefined ? null : (
-          <p className="qdp-panelMeta">{t('checkInNextRun', { time: formatTime(checkIn.nextRunAt) })}</p>
-        )}
-        {/*
-         * 「立即领取」 is an ACTION: once today's claim is in, re-offering it
-         * invites a request the upstream will only refuse. The claimed state
-         * keeps the same button in a quiet variant and disables it.
-         */}
-        <QdpButton
-          variant={claimedToday ? 'outline' : 'primary'}
-          size="md"
-          className="qdp-claimBtn"
-          disabled={busy === true || checkingIn === true || claimedToday}
-          onClick={onCheckIn}
-        >
-          {checkingIn === true ? t('checkInChecking') : claimedToday ? t('checkInClaimedToday') : t('checkInNow')}
-        </QdpButton>
-        {checkInNotice === undefined ? null : <p className="qdp-body">{checkInNotice}</p>}
-      </div>
-    </div>
-  )
-}
-
-/**
- * 「3 天内到期」的统计窗口。30 天有效期的包还剩 20 天才到期,不该出现在
- * 「3 天内到期」里 —— 这里统计的是窗口内真的会作废的笔,不是「所有还没过期的」。
- * workbuddy 的「最近 3 天到期」就是这个读法。
- */
-const SOON_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
-
-/**
- * 最近的签到记录(BOX):插件内每次签到领取到的资源包、数量与到期时间。
- *
- * 这是原来「签到日志」表格的替代:表格只能证明「点过按钮」,而这里回答的是
- * 用户真正关心的问题 —— 我手上有哪些还没过期的资源包,各自什么时候作废。
- * 因此按「领取时间」倒序列出,并在每行右侧给出该笔的到期日;上游没给有效期
- * 的笔(手动签到)按领取后 30 天补算,不再显示「有效期未知」。
- */
-function CheckInLedger({ logs, t, clearing, disabled, onClear }: {
-  logs: readonly {
-    id: string
-    date: string
-    timestamp: number
-    status: string
-    amount?: number | undefined
-    expiresAtMs?: number | undefined
-  }[] | undefined
-  t: QoderPluginCardInjected['t']
-  /** A clear request is in flight; the button reads 「正在清空…」. */
-  clearing?: boolean | undefined
-  /** No usable credential, so the action cannot run. */
-  disabled?: boolean | undefined
-  onClear?: (() => void) | undefined
-}): React.ReactNode {
-  const now = Date.now()
-  /*
-   * 手动在插件里签到的 +100 Credits,上游不回带有效期;活动的口径是领取后
-   * 30 天有效,所以按领取时间补算。活动口径变化时改这一个常数即可 —— 不写
-   * 进存储,存储里的字段仍然忠实于上游给没给。
-   */
-  const MANUAL_GRANT_VALIDITY_MS = 30 * 24 * 60 * 60 * 1000
-  const effectiveExpiry = (entry: { timestamp: number; expiresAtMs?: number | undefined }): number =>
-    entry.expiresAtMs ?? entry.timestamp + MANUAL_GRANT_VALIDITY_MS
-  /*
-   * 界面能显示几条就显示几条:不再有 7/30 天切换,也不再按时间窗过滤。
-   * 台账回答的是「我手上有哪些资源包」,把窗口做成按钮只是把同一个列表切成
-   * 两半,用户还得猜哪一半是对的。条数由 CSS 的行高上限决定(见
-   * .qdp-ledgerList 的 max-height),多了就滚动 —— 而不是悄悄丢掉。
-   */
-  const claimed = (logs ?? [])
-    /*
-     * 只有真的领到的那一笔才入账。
-     *
-     * `already-claimed` 是「上游今天已经领过」的观察,不是一次领取 —— 它的
-     * timestamp 是那次请求的时钟,不是发放时刻(上游根本不回传发放时刻),
-     * 所以把它当成一笔资源包会在台账上写出一个从未发生过的时间。这份台账要
-     * 回答的是「我手上有哪些资源包、各自的到期日」,所以只统计 claimed;
-     * no-campaign / error 同样不是资源包。
-     */
-    .filter(entry => entry.status === 'claimed')
-    .sort((a, b) => b.timestamp - a.timestamp)
-  /*
-   * 「3 天内到期」只统计在这个窗口内真的会作废的笔 —— 不是「所有还没过期的」。
-   * workbuddy 的「最近 3 天到期」就是这个读法:30 天有效期的包还剩 20 天才
-   * 到期,它不该出现在「3 天内到期」里。有效期按补算后的口径算(见上),
-   * 所以手动签到的包也参与统计。
-   */
-  const expiringSoon = claimed.filter(entry => {
-    const expiry = effectiveExpiry(entry)
-    return expiry > now && expiry <= now + SOON_WINDOW_MS
-  })
-  const expiringSoonTotal = expiringSoon.reduce((sum, entry) => sum + (entry.amount ?? 0), 0)
-  return (
-    <div className="qdp-panel">
-      <div className="qdp-panelHead">
-        <h3 className="qdp-panelTitle">{t('ledgerHeading')}</h3>
-        {onClear === undefined ? null : (
-          /* 清空日志 lives on its own panel head: the ledger rewrite dropped the
-             control that used to sit beside the log table, leaving the
-             clear-checkin-logs action with no way to reach it. */
-          <QdpButton
-            variant="dangerQuiet"
-            disabled={disabled === true || clearing === true}
-            onClick={onClear}
-          >
-            {clearing === true ? t('checkInClearing') : t('checkInClear')}
-          </QdpButton>
-        )}
-      </div>
-      {claimed.length === 0 ? (
-        <p className="qdp-empty">{t('ledgerEmpty')}</p>
-      ) : (
-        <div className="qdp-logList qdp-ledgerList">
-          {claimed.map(entry => {
-            const expiry = effectiveExpiry(entry)
-            const expired = expiry <= now
-            return (
-              <div key={entry.id} className="qdp-ledgerRow">
-                <span className="qdp-ledgerDate">{formatTime(entry.timestamp)}</span>
-                <span className="qdp-ledgerAmount">{entry.amount === undefined ? '—' : `+${entry.amount}`}</span>
-                <span className={expired ? 'qdp-ledgerExpiry qdp-ledgerExpired' : 'qdp-ledgerExpiry'}>
-                  {expired ? t('ledgerExpired') : t('ledgerExpiresAt', { date: formatDate(expiry) })}
-                </span>
-              </div>
-            )
-          })}
-        </div>
-      )}
-      {/* 底部到期小结:与上面的记录行用一条分隔线断开,只占 3 行的空间,
-          剩下的高度留给上面的记录列表。 */}
-      <div className="qdp-ledgerFoot">
-        <span className="qdp-panelMeta">{t('ledgerExpiringHeading', { days: 3 })}</span>
-        <span className="qdp-ledgerFootValue">{String(expiringSoonTotal)}</span>
-      </div>
-    </div>
-  )
-}
-
-/**
- * 「模型」面板:可见性开关与每个模型的上下文容量合并到同一行(原先一个只有
- * 一个复选框的「上下文」tab + 一个纯开关列表),刷新模型按钮挪进本栏头部
- * (原先孤悬在账号行上)。max-window 偏好置于列表上方。
- */
-function ModelsPane({ models, disabledModels = [], catalog, t, busy, onSetModelContextWindow, onSetModelsEnabled, onRefreshModels }: {
-  models: readonly QoderCatalogModelSnapshot[] | undefined
-  disabledModels?: readonly string[] | undefined
-  catalog?: QoderWebCatalog | undefined
-  t: QoderPluginCardInjected['t']
-  busy?: boolean
-  onSetModelContextWindow: (model: string, window: number) => void
-  onSetModelsEnabled: (models: readonly string[], enabled: boolean) => void
-  onRefreshModels: () => void
-}): React.ReactNode {
-  /*
-   * Display order, NOT upstream order.
-   *
-   * The discovery answer arrives in whatever order the upstream lists it,
-   * which put 「Qoder Auto」 second-to-last — an arbitrary place for the
-   * default/auto entry a user looks for first. Rather than trusting it, the
-   * roster is sorted by a deliberate tier: the auto/default entry first, then
-   * the strongest tiers, then the cheap ones, and finally anything the
-   * upstream added that this list does not know about (kept, at the end, in
-   * upstream order — an unknown entry is still better than a hidden one).
-   */
-  const MODEL_TIER: readonly string[] = ['auto', 'ultimate', 'performance', 'cmodel', 'efficient', 'lite']
-  const tierOf = (id: string): number => {
-    const index = MODEL_TIER.indexOf(id)
-    return index === -1 ? MODEL_TIER.length : index
+function parseSettingsKey(raw: string): CheckInSettings {
+  if (raw === 'unavailable') return UNAVAILABLE_SETTINGS
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length < 6) return UNAVAILABLE_SETTINGS
+    const autoCN = parsed[0] === true
+    const autoGlobal = parsed[1] === true
+    const minuteCN = typeof parsed[2] === 'number' ? parsed[2] : CHECK_IN_MINUTE_DEFAULT
+    const minuteGlobal = typeof parsed[3] === 'number' ? parsed[3] : CHECK_IN_MINUTE_DEFAULT
+    const status = parsed[4] === 'ready' || parsed[4] === 'loading' ? parsed[4] : 'unavailable'
+    const pollMs = typeof parsed[6] === 'number' ? parsed[6] : POLL_DEFAULT_MS
+    return {
+      autoCN,
+      autoGlobal,
+      minuteCN,
+      minuteGlobal,
+      pollMs,
+      status,
+      writable: parsed[5] === true,
+    }
+  } catch {
+    return UNAVAILABLE_SETTINGS
   }
-  /*
-   * The sort key is the model's DEFAULT window, never the effective one.
-   *
-   * `contextWindow` carries whatever override the user just picked (catalog.ts
-   * all(): an override replaces contextWindow outright), so sorting by it moved
-   * a row the moment its own chooser changed — the list "乱动" under the cursor
-   * the user was aiming at. `defaultContextWindow` is the upstream's own value
-   * and is untouched by the override, so the order holds still while windows
-   * are edited. Within a tier the wider default leads.
-   */
-  const capabilityOf = (model: QoderCatalogModelSnapshot): number =>
-    model.defaultContextWindow ?? model.contextWindow ?? 0
-  const list = [...(models ?? [])].sort((a, b) => {
-    const byTier = tierOf(a.id) - tierOf(b.id)
-    if (byTier !== 0) return byTier
-    const byCapability = capabilityOf(b) - capabilityOf(a)
-    // Last resort: the id, so two models with the same tier and window keep a
-    // fixed order across renders instead of swapping by array position.
-    return byCapability !== 0 ? byCapability : a.id.localeCompare(b.id)
-  })
-  /*
-   * 滑块的横轴是整张列表共用的,不是每行各画一条。
-   *
-   * 之前 stops 从本行自己的声明档位算出来,于是「只有 200K 一档」的模型
-   * 把 200K 铺在自己的轨道上(把手顶到最右),而 [200K,400K,1M] 的行把
-   * 同样三档摊开 —— 两行长度一样、刻度却对不齐,同一个 200K 落在不同的
-   * 列上,用户没法横向比较。现在按 token 的绝对值取一个全局端点:每行
-   * 用同样的像素宽度,刻度出现在 value/axisMax 的比例位置,200K 在所有
-   * 行里都停在同一列。
-   */
-  const axisMax = list.reduce((best, model) => {
-    const declaredMax = (model.supportedContextWindows ?? []).reduce((top, value) => (value > top ? value : top), 0)
-    const fallback = model.defaultContextWindow ?? model.contextWindow ?? 0
-    const rowMax = declaredMax > 0 ? declaredMax : fallback
-    return rowMax > best ? rowMax : best
-  }, 0)
-  /*
-   * 每一行画哪些刻度:优先用上游声明过的档位,再补上全局端点 —— 只画本行
-   * 档位的话,一档的模型刻度会散落在别处,又多出对不齐的问题;端点补进去
-   * 后所有行的关键刻度都落在同一列。最后加上 0 起点,0 是起点不是档位
-   * (见下面 stops 的注释),它负责把轨道铺满,拖上去不写任何东西。
-   */
-  const axisTicks = (declared: readonly number[]): number[] =>
-    [...new Set([0, ...declared, axisMax])]
-      .filter(value => Number.isFinite(value) && value >= 0 && value <= axisMax)
-      .sort((a, b) => a - b)
-  return (
-    <div className="qdp-list">
-      {/* No pane title: the section head above already names this pane. The row
-          keeps only the catalogue provenance and its refresh control. */}
-      <div className="qdp-modelHead">
-        <span />
-        <div className="qdp-inline">
-          {catalog === undefined ? null : (
-            <span className="qdp-modelMeta">
-              {catalog.source === 'live' && catalog.fetchedAt !== undefined
-                ? t('catalogLive', { time: formatTime(catalog.fetchedAt) })
-                : catalog.source === 'saved' && catalog.fetchedAt !== undefined
-                  ? t('catalogSaved', { time: formatTime(catalog.fetchedAt) })
-                  : t('catalogFallback')}
-            </span>
-          )}
-          <QdpButton disabled={busy === true} onClick={onRefreshModels}>
-            {busy === true ? t('refreshingModels') : t('refreshModels')}
-          </QdpButton>
-        </div>
-      </div>
-      {catalog?.error === undefined ? null : (
-        /* A stale/failed catalogue read is visible where the models are, with the
-           same refresh control as the head row serving as its retry. */
-        <div className="qdp-alert qdp-alertError" role="alert">
-          <span>{t('catalogError', { message: catalog.error })}</span>
-          <div className="qdp-actions">
-            <QdpButton disabled={busy === true} onClick={onRefreshModels}>
-              {busy === true ? t('refreshingModels') : t('refreshModels')}
-            </QdpButton>
-          </div>
-        </div>
-      )}
-      {list.length === 0 ? (
-        <p className="qdp-empty">{t('modelsNoModels')}</p>
-      ) : (
-        <>
-          {/*
-           * 列头(需求 3):横线把工具行与列表分开,线下列出两列的标题 ——
-           * 左边是被勾选的模型名,右边是这一行的上下文窗口滑块。没有列头时
-           * 右侧那排滑块看不出是什么,只能靠猜。
-           */}
-          <div className="qdp-modelColumns">
-            <span>{t('modelNameColumn')}</span>
-            <span>{t('contextHeading')}</span>
-          </div>
-          <div className="qdp-modelList">
-          {list.map(model => {
-            const isModelEnabled = !disabledModels.includes(model.id)
-            const capacity = model.contextWindow
-            /*
-             * 滑块只走上游声明过的档位,Qoder 没报过的值一个都不发。
-             *
-             * stops 升序,而且第 0 位是「起点」而不是档位 —— 起点标 0,
-             * 只用来把轨道铺满(否则模型只剩一档时连条都画不出来),
-             * 拖到它上面不写任何东西。真实档位从下标 1 起,所以顺序即
-             * 档位高低;原先给 select 用的是降序(大的在前),滑块必须
-             * 反过来,否则往右拖反而变小。
-             */
-            /*
-             * 刻度按全局横轴取,而不是只取本行的档位。行为上的两处要点:
-             *
-             * (a) 把手/刻度的位置一律用 value/axisMax 的比例,所以「只有
-             *     200K 一档」的模型,把手停在 200K 处而不是顶到最右 ——
-             *     最右是 axisMax(1M),它根本没这个档位。
-             * (b) 下标仍然保留 0 号起点,但它只用来铺满轨道;起点不可写,
-             *     真实档位是 axisTicks 里 >0 的那些。
-             *
-             * 用户可选的档位仍是「本行声明过的」:轴上多出来的中间刻度只是
-             * 让人对齐,不能因为别的行支持 1M 就允许这一行写 1M —— 发出去
-             * 的值必须在上游声明列表里,否则等于替上游发明档位。
-             */
-            const declared = [...new Set(model.supportedContextWindows ?? (capacity !== undefined ? [capacity] : []))].sort((a, b) => a - b)
-            const stops = axisTicks(declared)
-            const axisSpan = axisMax > 0 ? axisMax : 1
-            const ratioOf = (value: number): number => (value / axisSpan) * 100
-            const effective = capacity ?? model.defaultContextWindow
-            /*
-             * 把手停在哪:先看当前值是否正好落在某个刻度上;不在时(上游
-             * 改了口径、或旧配置留下裸值)退回最近的一档,只影响「把手画
-             * 在哪」,不会因为渲染而回写任何东西 —— 写回只发生在用户真的
-             * 拖动之后。
-             */
-            const nearest = effective === undefined || effective <= 0
-              ? 0
-              : stops.reduce((best, choice, index) =>
-                  Math.abs(choice - effective) < Math.abs(stops[best]! - effective) ? index : best, 0)
-            const currentValue = effective === undefined || effective <= 0 ? 0 : stops[nearest] ?? 0
-            const currentIndex = stops.indexOf(currentValue)
-            // 可写档位:本行声明过的那些,按轴上的下标排列。
-            const writable = new Set(declared)
-            return (
-              <div
-                key={model.id}
-                className="qdp-modelRow"
-                style={{ opacity: isModelEnabled ? 1 : 0.65 }}
-              >
-                <label className="qdp-modelEnable">
-                  <input
-                    type="checkbox"
-                    checked={isModelEnabled}
-                    disabled={busy}
-                    onChange={event => { onSetModelsEnabled([model.id], event.currentTarget.checked) }}
-                  />
-                  <span className="qdp-modelCopy">
-                    <span className="qdp-modelName">
-                      {model.name}
-                      {/*
-                       * 积分消耗倍率(需求 2):直接用上游给的数字,格式化成
-                       * 「0.5x」这种写法。上游没说倍率时留空 —— 不猜一个
-                       * x1,那会把「不知道」说成「基准价」。
-                       */}
-                      {model.priceFactor === undefined ? null : (
-                        <span className="qdp-modelRate">{formatRate(model.priceFactor)}</span>
-                      )}
-                    </span>
-                    <span className="qdp-modelMeta">{model.id}</span>
-                  </span>
-                </label>
-                <span className="qdp-contextPicker">
-                  {declared.length > 0 ? (
-                    /*
-                     * 每个有档位的模型都画轨道 —— 只有一个档位的模型也有条
-                     * (把手停在那一档,拖到起点 0 不写任何东西,所以事实上
-                     * 不可滑动),不能因为「没得拖」就退化成一行文字:用户
-                     * 要的是轨道始终可见,起点把轨道铺满正是为了这个。
-                     */
-                    <span className="qdp-windowSlider">
-                        {/*
-                         * 视觉层:轨道 + 已选填充 + 把手。真正的输入是下面那层
-                         * 透明的 range input,拖拽、点击定位、方向键都由它接,
-                         * 所以键盘可达性和原生行为都保持不变。
-                         *
-                         * 位置一律按 token 的绝对值占全轴的比例来算(不是按
-                         * 下标),这是「所有行的条一样长、同一档在同一列」的
-                         * 关键:轨道宽度是每行同样的像素,值决定刻度落在哪。
-                         */}
-                        <span className="qdp-windowTrack" aria-hidden="true">
-                          <span
-                            className="qdp-windowFill"
-                            style={{ width: `${String(ratioOf(currentValue))}%` }}
-                          />
-                          <span
-                            className="qdp-windowKnob"
-                            style={{ left: `${String(ratioOf(currentValue))}%` }}
-                          />
-                          <input
-                            className="qdp-windowInput"
-                            type="range"
-                            min={0}
-                            max={stops.length - 1}
-                            step={1}
-                            value={currentIndex}
-                            disabled={busy}
-                            aria-label={`${model.name} ${t('contextHeading')}`}
-                            aria-valuetext={currentValue <= 0 ? t('contextHeading') : formatTokens(currentValue)}
-                            onChange={event => {
-                              // 滑块的取值是轴上下标,但发出去的永远是那一档
-                              // 的真实 token 数 —— 上游字段的语义没有变。轴上
-                              // 的 0 号是起点、别的行贡献的中间刻度也不是本行
-                              // 声明过的档位,这两类都不写任何东西。
-                              const index = Number(event.currentTarget.value)
-                              const choice = stops[index]
-                              if (choice !== undefined && writable.has(choice)) onSetModelContextWindow(model.id, choice)
-                            }}
-                          />
-                        </span>
-                        <span className="qdp-windowTicks" aria-hidden="true">
-                          {/*
-                           * 首尾必定标出,中间最多再标一档,标满会糊成一片。
-                           * 0 号是起点,只画刻度线不印数字(需求:从 0 档开始
-                           * 显示条,但不显示 0 这个数字)。
-                           */}
-                          {(() => {
-                            /*
-                             * 标签只印本行声明过的档位,而且不超过 3 个就全部
-                             * 印出来(200K/400K/1M 一档不落 —— 上一版把起点
-                             * 也算进「最多三档」,400K 的标签就是这样丢的);
-                             * 更多档时才收敛到首、中、尾。轴上由别的行贡献的
-                             * 中间刻度不印数字 —— 那不是这一行能选的档位,
-                             * 印出来就是在暗示可以选。起点 0 只画刻度线。
-                             */
-                            const labelled = declared.length <= 3
-                              ? new Set(declared)
-                              : new Set([declared[0], declared[Math.floor((declared.length - 1) / 2)], declared[declared.length - 1]])
-                            return stops.map((choice, index) => (
-                              <span
-                                key={index}
-                                className="qdp-windowTick"
-                                style={{ left: `${String(ratioOf(choice))}%` }}
-                              >
-                                {choice === 0 ? (
-                                  <span className="qdp-windowTickMark" />
-                                ) : labelled.has(choice) ? (
-                                  formatTokens(choice)
-                                ) : null}
-                              </span>
-                            ))
-                          })()}
-                        </span>
-                    </span>
-                  ) : capacity !== undefined ? (
-                    <span className="qdp-modelMeta">{formatTokens(capacity)}</span>
-                  ) : null}
-                </span>
-              </div>
-            )
-          })}
-          </div>
-        </>
-      )}
-    </div>
-  )
 }
 
 /**
- * Render Qoder PAT state, quota, catalog, and context capacities as the Plugins
- * page's configuration page (or its one-liner, when the owner asks for
- * `summary`).
+ * Render the Qoder account, check-in, model and advanced-settings sections as
+ * the Plugins page's configuration page (or its one-liner, when the owner asks
+ * for `summary`).
  *
- * On `page` this component renders the configuration BODY only: the Plugins page
- * draws the breadcrumb, icon, title, version and description, so no shell chrome
- * or second title lives here. The unified card's variant switcher stays as
- * in-page navigation. Sections, top to bottom:
+ * On `page` this component renders the configuration BODY only: the Plugins
+ * page draws the breadcrumb, icon, title, version and description, so no shell
+ * chrome or second title lives here. The page is a grid of four cards:
  *
- * 1. 账户 — variant switcher, status dot + account name + plan tag + expiry,
- *    refresh / replace-PAT / sign-out actions, credential provenance and entry
- * 2. 额度 — remaining/total headline, cycle reset, one merged-group bar each
- * 3. 使用与签到 — claim ledger beside today's claim CTA
- * 4. 模型 — per-model visibility toggles and context-window sliders
- * 5. 高级设置 — the variant-scoped quota settings rows
+ * 1. 账号 — variant switcher, one compact status row, credential row, PAT entry
+ * 2. 签到 — today's claim row + recent-grants row + a capped ledger list
+ * 3. 模型 — catalogue provenance + refresh, then the models pane body
+ * 4. 高级设置 — auto check-in, its UTC+8 time, quota-readout switches, poll interval
+ *
+ * A signed-out account renders 账号 (with the PAT entry) and 高级设置 only:
+ * check-in and model preferences for an account nobody is signed into would be
+ * settings the user cannot exercise yet.
  */
+/** 14px stroke refresh glyph, so the icon-button matches the host's icon set. */
+function RefreshGlyph(): ReactNode {
+  return (
+    <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none">
+      <path
+        d="M13.2 6.4A5.4 5.4 0 1 0 13 10.6M13.2 2.6v3.8H9.4"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 export function QoderPluginCard(props: QoderPluginCardProps) {
   const { t, scope, signedIn, variant, unified, view } = props
   if (t === undefined) throw new Error('Qoder plugin card requires its translation function')
@@ -880,27 +396,20 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const isUnified = unified === true
   const liveSignIn = useSyncExternalStore(onQuotaSettingsChange, quotaSignInState)
   /**
-   * The automatic check-in toggles, read from the same settings face the
-   * settings rows write. The scheduler arms a timer for EVERY variant (so a
-   * toggle flipped on later still fires), so `nextRunAt` alone cannot tell
-   * 「已安排」 from 「功能没开」 — this flag is what the card gates the
-   * 「下次自动领取」 line on.
-   *
-   * getSnapshot MUST return the same reference between renders unless the
-   * store changed: returning `scope.getSnapshot().value` (a fresh object each
-   * call) re-renders forever and trips React's maximum-update-depth guard —
-   * the exact hazard `stableProject` documents in QuotaSettingsCard. The
-   * projection here is a STRING, so identity is stable by construction.
+   * The composer-readout switches are a CLIENT preference, not part of the host
+   * settings document: the shipped settings face rejects the field with HTTP
+   * 400 `unknown field`, so the shared store owns (and persists) it. The store
+   * returns a stable cached snapshot, which is what `useSyncExternalStore`
+   * requires.
    */
+  const readout = useSyncExternalStore(onQuotaSettingsChange, quotaReadout)
+  /** The check-in half of the settings face, as a stable projection string. */
   const settingsSubscribe = useCallback((onStoreChange: () => void) => {
     return scope?.subscribe(onStoreChange) ?? (() => {})
   }, [scope])
-  const autoCheckInKey = useSyncExternalStore(settingsSubscribe, () => {
-    const value = scope?.getSnapshot().value
-    return `${value?.autoCheckInCN === true ? '1' : '0'}${value?.autoCheckInGlobal === true ? '1' : '0'}`
-  })
-  const autoCheckInCN = autoCheckInKey.startsWith('1')
-  const autoCheckInGlobal = autoCheckInKey.endsWith('1')
+  const settingsRaw = useSyncExternalStore(settingsSubscribe, () => settingsKeyOf(scope))
+  const settings = parseSettingsKey(settingsRaw)
+
   const [activeVariantId, setActiveVariantId] = useState<QoderVariantId>('qoder')
   const currentVariant = isUnified
     ? (activeVariantId === 'qoder' ? QODER_CN_CARD : QODER_GLOBAL_CARD)
@@ -918,16 +427,11 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const [checkingIn, setCheckingIn] = useState(false)
   const [clearingLogs, setClearingLogs] = useState(false)
   const [checkInNotice, setCheckInNotice] = useState<string>()
-  /** 「清除 PAT」的内联确认：点一次进入确认，再点一次才真正清除。 */
+  /** 「删除 PAT」的内联确认：点一次进入确认，再点一次才真正清除。 */
   const [confirmingClear, setConfirmingClear] = useState(false)
-  /**
-   * 每个 variant 的启用勾选(workbuddy 的 tab-switch)。这是客户端意图层:
-   * 关掉的 variant 不再轮询/显示其内容;模型通道的开关仍由 disabledModels
-   * 决定,这里不写宿主配置。
-   */
-  const [variantEnabled, setVariantEnabled] = useState<{ cn: boolean; global: boolean }>({ cn: true, global: true })
-  const cnEnabled = variantEnabled.cn
-  const globalEnabled = variantEnabled.global
+  /** The model pane's batched save: its own busy flag, separate from a refresh. */
+  const [savingModels, setSavingModels] = useState(false)
+  const [modelsSaveError, setModelsSaveError] = useState<string>()
   const mounted = useRef(true)
   const readSeq = useRef(0)
   const manualControllers = useRef(new Set<AbortController>())
@@ -993,6 +497,9 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     setReplacing(false)
     setPatError(undefined)
     setPatNotice(undefined)
+    setConfirmingClear(false)
+    setCheckInNotice(undefined)
+    setCheckInNotice(undefined)
     const controller = new AbortController()
     void refresh(controller.signal)
     return () => { controller.abort() }
@@ -1038,15 +545,10 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
      * A failed refresh must say WHY, and the reason travels in the BODY.
      *
      * The route answers HTTP 200 for a failed refresh and puts the failure in
-     * `{state:'failed', reason}` — so checking `response.ok` alone (what this
-     * used to do) treated every failure as a success: no throw, no message,
-     * just the old model list still on screen. That is exactly the reported
-     * "refresh does not work and shows a failure notice with no reason":
-     * whatever the user saw came from somewhere else, because this path could
-     * not report anything at all.
-     *
-     * The body is parsed the same way `manualCheckIn` below parses it, so both
-     * manual actions report their outcome consistently.
+     * `{state:'failed', reason}` — checking `response.ok` alone would treat
+     * every failure as a success: no throw, no message, just the old model list
+     * still on screen. The body is parsed the same way `manualCheckIn` parses
+     * it, so both manual actions report their outcome consistently.
      */
     let result: { state?: string; reason?: string } | undefined
     const controller = trackController()
@@ -1168,16 +670,20 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   }, [currentVariant.probePath, refresh, status, t, trackController])
 
   /**
-   * Run one probe-route control action and refresh the card's state afterwards.
+   * One probe-route write, WITHOUT a status re-read.
+   *
+   * The batch save below issues several writes (two enable/disable batches and
+   * one window write per changed model) and re-reads the status exactly once
+   * afterwards. Refreshing per write would repaint the page between every
+   * round trip, reset the pane's draft mid-save, and multiply the reads.
    *
    * The key travels in a header, not the body: it authorizes the write, and
    * the host never accepts a prompt, a sentinel, or a model outside its own
    * catalog from here.
    */
-  const control = useCallback(async (action: QoderProbeAction): Promise<void> => {
+  const probeWrite = useCallback(async (action: QoderProbeAction): Promise<void> => {
     const key = status?.status === 'signed-in' ? status.probeKey : undefined
-    if (key === undefined) return
-    setBusy(true)
+    if (key === undefined) throw new Error(t('requestFailed'))
     const controller = trackController()
     try {
       const response = await fetch(currentVariant.probePath, {
@@ -1194,23 +700,62 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
           : `HTTP ${response.status}`
         throw new Error(message)
       }
-      if ((action.action === 'set-maximum-context-window' || action.action === 'set-models-enabled')
-        && (typeof value !== 'object' || value === null || (value as Record<string, unknown>)['state'] !== 'updated')) {
-        const reason = typeof value === 'object' && value !== null && 'reason' in value
-          ? String((value as Record<string, unknown>)['reason'])
-          : t('requestFailed')
-        throw new Error(reason)
-      }
-      await refresh(controller.signal)
-    } catch (error: unknown) {
-      if (mounted.current && controller.signal.aborted !== true) {
-        setReadFailure(error instanceof Error ? error.message : t('requestFailed'))
+      if (
+        action.action === 'set-maximum-context-window'
+        || action.action === 'set-models-enabled'
+        || action.action === 'set-model-context-window'
+      ) {
+        if (typeof value !== 'object' || value === null || (value as Record<string, unknown>)['state'] !== 'updated') {
+          const reason = typeof value === 'object' && value !== null && 'reason' in value
+            ? String((value as Record<string, unknown>)['reason'])
+            : t('requestFailed')
+          throw new Error(reason)
+        }
       }
     } finally {
       manualControllers.current.delete(controller)
-      if (mounted.current) setBusy(false)
     }
-  }, [currentVariant.probePath, refresh, status, t, trackController])
+  }, [currentVariant.probePath, status, t, trackController])
+
+  /**
+   * Apply one draft from the models pane as a batch: the enable/disable delta,
+   * then one write per changed context window, then ONE status re-read.
+   *
+   * The draft is a diff against the catalogue (the pane only stages models that
+   * differ), so empty deltas are skipped rather than posted: the host rejects an
+   * empty `models` list, and a pointless write is a failed save in waiting.
+   */
+  const saveModelDraft = useCallback(async (draft: ModelsDraft): Promise<void> => {
+    const document = status?.status === 'signed-in' ? status : undefined
+    if (document?.probeKey === undefined) return
+    setSavingModels(true)
+    setModelsSaveError(undefined)
+    try {
+      const baseDisabled = document.disabledModels ?? []
+      const toDisable = draft.disabled.filter(id => !baseDisabled.includes(id))
+      const toEnable = baseDisabled.filter(id => !draft.disabled.includes(id))
+      if (toDisable.length > 0) {
+        await probeWrite({ action: 'set-models-enabled', models: toDisable, enabled: false })
+      }
+      if (toEnable.length > 0) {
+        await probeWrite({ action: 'set-models-enabled', models: toEnable, enabled: true })
+      }
+      const models = document.models ?? []
+      for (const [model, window] of Object.entries(draft.windows)) {
+        const baseline = models.find(entry => entry.id === model)
+        const baselineWindow = baseline?.contextWindow ?? baseline?.defaultContextWindow
+        if (baselineWindow === window) continue
+        await probeWrite({ action: 'set-model-context-window', model, window })
+      }
+      // Exactly one re-read for the whole batch: the pane re-bases its draft
+      // from the refreshed document, which is what makes the save feel applied.
+      await refresh()
+    } catch (error: unknown) {
+      if (mounted.current) setModelsSaveError(error instanceof Error ? error.message : t('requestFailed'))
+    } finally {
+      if (mounted.current) setSavingModels(false)
+    }
+  }, [probeWrite, refresh, status, t])
 
   /**
    * Validate and store the pasted PAT (or overwrite the stored one).
@@ -1323,17 +868,16 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   }, [authKey, currentVariant.authPath, patBusy, refresh, t, trackController])
 
   /**
-   * 更换 PAT: open the entry over the signed-in document, pre-cleared and
-   * focused. Unlike the removed device-flow switch this needs no sign-out
-   * first — saving validates the new token and overwrites the stored one
-   * only on success, so a mistyped paste can never strand the working
-   * credential.
+   * The inline PAT entry: a password field plus save (and cancel while
+   * replacing). The save control beside the field is the retry: an invalid PAT
+   * is a value problem, not a transport one.
    */
-  const patEntry = (): React.ReactNode => (
+  const patEntry = (): ReactNode => (
     <div className="qdp-stack">
-      <p className="qdp-body">{t(currentVariant.patGuideKey)}</p>
-      <div className="qdp-patRow">
+      <p className="qdp-caption">{t(currentVariant.patGuideKey)}</p>
+      <div className="qdp-row">
         <QdpInput
+          className="qdp-patInput"
           type="password"
           value={patDraft}
           placeholder={t(currentVariant.patPlaceholderKey)}
@@ -1368,8 +912,6 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
         ) : null}
       </div>
       {patError === undefined ? null : (
-        /* The save control beside the field is the retry: an invalid PAT is a
-           value problem, not a transport one. */
         <div className="qdp-alert qdp-alertError" role="alert">{patError}</div>
       )}
       {patNotice === undefined ? null : <p className="qdp-body">{patNotice}</p>}
@@ -1390,7 +932,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
         ? t('requestFailed')
         : t('signedOut')
 
-  /* The account box's state line: with a known subscriber name it reads
+  /* The account row's state line: with a known subscriber name it reads
      「已登录：name」; without one it is the plain signed-in copy. */
   const signedInLabel = status?.status === 'signed-in' && status.pat?.accountName !== undefined
     ? t('accountSignedInAs', { name: status.pat.accountName })
@@ -1424,271 +966,447 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
 
   // The settings face always follows the variant on screen: the unified card's
   // switcher, or the standalone card's fixed variant.
-  const settingsVariant = isUnified
+  const settingsVariant: 'cn' | 'global' = isUnified
     ? (activeVariantId === 'qoder' ? 'cn' : 'global')
     : (currentVariant.id === 'qoder' ? 'cn' : 'global')
   const signedInDoc = status?.status === 'signed-in' ? status : undefined
-
-  /*
-   * Body-only configuration page.
-   *
-   * The OWNER draws the breadcrumb, icon, title, version and description for
-   * `plugins.row.config` (`PluginConfigViewProps`), so this tree starts at the
-   * configuration body: no shell card, no disclosure header, no second title.
-   * `qdp-card`/`qdp-cardOpen`/`qdp-cardBody` stay as the body wrapper pair (they
-   * carry no chrome) so the existing render assertions keep finding the same
-   * root.
-   *
-   * Sections follow the page anatomy in order: 账户 → 额度 → 使用与签到 → 模型 →
-   * 高级设置. The variant switcher opens the 账户 section; each variant's enable
-   * intent is preserved as a switch in 账户 (the old per-tab switch).
+  const settingsSignedIn = reported !== undefined
+    ? Boolean(reported[settingsVariant])
+    : Boolean(liveSignIn[settingsVariant])
+  const autoCheckInOn = settingsVariant === 'cn' ? settings.autoCN : settings.autoGlobal
+  const checkInMinute = settingsVariant === 'cn' ? settings.minuteCN : settings.minuteGlobal
+  const readoutEnabled = readout.enabled
+  const readoutCN = readout.cn
+  const readoutGlobal = readout.global
+  const pollMinutes = Math.max(1, Math.round(settings.pollMs / 60_000))
+  /**
+   * One write path for every advanced-card control: the local settings face is
+   * immediate (there is no save button), and a face the host does not serve —
+   * or one that refuses writes — is skipped instead of pretending to store.
    */
+  const writeSetting = (field: keyof QuotaSection, value: boolean | number): void => {
+    if (settings.status === 'unavailable' || scope === undefined) return
+    void scope.set(field, value)
+  }
+  /**
+   * The automatic check-in controls write the same fields the advanced card
+   * always wrote; a variant with no PAT cannot arm a timer it could never fire,
+   * so the switch stays disabled until that variant signs in.
+   */
+  const writeAutoCheckIn = (next: boolean): void => {
+    if (!settingsSignedIn) return
+    writeSetting(settingsVariant === 'cn' ? 'autoCheckInCN' : 'autoCheckInGlobal', next)
+  }
+  const writeCheckInMinute = (minutes: number): void => {
+    if (!settingsSignedIn) return
+    writeSetting(settingsVariant === 'cn' ? 'checkInMinuteCN' : 'checkInMinuteGlobal', minutes)
+  }
+  /**
+   * The three readout switches are NOT gated on sign-in: they describe what the
+   * composer chip should show, and a user configuring the plugin before signing
+   * in must still be able to hide a variant they never signed into. Only the
+   * master switch gates the two variant switches.
+   *
+   * They write the shared STORE, not the settings scope: the shipped host's
+   * settings face rejects `quotaReadoutEnabled` (HTTP 400 unknown field), and a
+   * host restart is not available. `setQuotaReadout` bumps the store's revision
+   * synchronously, so the card re-renders from the store; the master toggle
+   * carries the two per-variant values through unchanged.
+   */
+  const writeReadoutEnabled = (next: boolean): void => {
+    setQuotaReadout(next, readout.cn, readout.global)
+  }
+  const writeReadoutCN = (next: boolean): void => {
+    // The switch carries `disabled` while the master is off; this guard makes a
+    // programmatic click (tests, assistive tech) obey the same rule.
+    if (!readout.enabled) return
+    setQuotaReadout(readout.enabled, next, readout.global)
+  }
+  const writeReadoutGlobal = (next: boolean): void => {
+    if (!readout.enabled) return
+    setQuotaReadout(readout.enabled, readout.cn, next)
+  }
+  const writePollMinutes = (minutes: number): void => {
+    writeSetting('quotaPollMs', Math.max(POLL_MIN_MS, minutes * 60_000))
+  }
+
+  // ── check-in card data ────────────────────────────────────────────────
+  const checkIn = signedInDoc?.checkIn
+  const now = Date.now()
+  /**
+   * Today's benefit is already in — whether this process granted it or merely
+   * found the upstream reporting it as claimed.
+   *
+   * `already-claimed` must count: the upstream answers that way for every later
+   * request on a claimed day, so treating only `claimed` as "done" re-armed the
+   * button and invited the repeat click that appended a phantom ledger row. The
+   * DATE must count too — `checkIn` is the persisted record, not a live reading,
+   * and `today` is stamped host-side in UTC+8 (the day the scheduler uses), so a
+   * `claimed` row from three days ago no longer disables today's button.
+   */
+  const claimedToday = checkIn !== undefined
+    && checkIn.lastDate === checkIn.today
+    && (checkIn.status === 'claimed' || checkIn.status === 'already-claimed')
+  const effectiveExpiryOf = (entry: { timestamp: number; expiresAtMs?: number | undefined }): number =>
+    entry.expiresAtMs ?? entry.timestamp + MANUAL_GRANT_VALIDITY_MS
+  /*
+   * Only grants that actually landed are listed. `already-claimed` is an
+   * observation that the upstream had already granted today, not a grant: its
+   * timestamp is that request's clock, not a payout moment (the upstream does
+   * not report one), so counting it would invent a grant that never happened.
+   */
+  const claimedLogs = (checkIn?.logs ?? [])
+    .filter(entry => entry.status === 'claimed')
+    .sort((a, b) => b.timestamp - a.timestamp)
+  const latestLog = claimedLogs[0]
+  const latestExpiry = latestLog === undefined ? undefined : effectiveExpiryOf(latestLog)
+  const ledgerExpiryText = latestLog === undefined
+    ? t('ledgerEmpty')
+    : latestExpiry === undefined
+      ? ''
+      : latestExpiry <= now
+        ? t('ledgerExpired')
+        : t('ledgerExpiresAt', { date: formatDate(latestExpiry) })
+  const ledgerSummary = claimedLogs.length === 0
+    ? t('ledgerEmpty')
+    : `${t('ledgerCount', { count: claimedLogs.length })} · ${ledgerExpiryText}`
+  const nextRunCaption = autoCheckInOn && checkIn?.nextRunAt !== undefined
+    ? t('checkInNextRun', { time: formatTime(checkIn.nextRunAt) })
+    : undefined
+  const catalogCaption = signedInDoc === undefined ? undefined : catalogCaptionOf(signedInDoc.catalog, t)
+
+  // ── account card data ─────────────────────────────────────────────────
+  const credentialMeta = signedInDoc?.pat === undefined
+    ? undefined
+    : [
+      patSourceText(signedInDoc.pat.source, t),
+      signedInDoc.pat.savedAtMs === undefined ? null : t('patSavedAt', { time: formatTime(signedInDoc.pat.savedAtMs) }),
+      signedInDoc.pat.patTail === undefined ? null : t('patTail', { tail: `****${signedInDoc.pat.patTail}` }),
+    ].filter(part => part !== null).join(' · ')
+  const signedOutStatus = status?.status === 'signed-out' ? status : undefined
+  const patEntryOpen = replacing || signedOutStatus !== undefined
+
   return (
-    <div className="qdp-card qdp-cardOpen">
-      <div className="qdp-cardBody">
-        {/* ── 1. 账户: state dot + name + plan tag + expiry + actions ── */}
-        <section className="qdp-section">
-          <div className="qdp-sectionHead">
-            <h2 className="qdp-sectionTitle">{t('accountHeading')}</h2>
-            {isUnified ? (
-              <QdpSegmented
-                label="Qoder Version Selection"
-                value={activeVariantId}
-                options={[
-                  {
-                    value: 'qoder',
-                    /* An off side still shows its tab (it explains why the side
-                       is quiet) but reads disabled, exactly like the old per-tab
-                       switch. The switch itself re-enables it. */
-                    disabled: !cnEnabled,
-                    label: (
-                      <>
-                        <QdpStateDot state={cnDotState} />
-                        <span>{t('variantTabCN')}</span>
-                      </>
-                    ),
-                  },
-                  {
-                    value: 'qoder-global',
-                    disabled: !globalEnabled,
-                    label: (
-                      <>
-                        <QdpStateDot state={globalDotState} />
-                        <span>{t('variantTabGlobal')}</span>
-                      </>
-                    ),
-                  },
-                ]}
-                onChange={setActiveVariantId}
-              />
-            ) : null}
+    <div className="qdp-page">
+      {/* ── 1. 账号: switcher + one status row + credential row + PAT entry ── */}
+      <section className="qdp-card">
+        <div className="qdp-sectionHead">
+          <h2 className="qdp-sectionTitle">{t('accountHeading')}</h2>
+          {isUnified ? (
+            <QdpSegmented
+              label={t('variantSwitcherAria')}
+              value={activeVariantId}
+              options={[
+                {
+                  value: 'qoder',
+                  label: (
+                    <>
+                      <QdpStateDot state={cnDotState} />
+                      <span>{t('variantTabCN')}</span>
+                    </>
+                  ),
+                },
+                {
+                  value: 'qoder-global',
+                  label: (
+                    <>
+                      <QdpStateDot state={globalDotState} />
+                      <span>{t('variantTabGlobal')}</span>
+                    </>
+                  ),
+                },
+              ]}
+              onChange={setActiveVariantId}
+            />
+          ) : null}
+          <QdpIconButton
+            label={t('refresh')}
+            disabled={busy}
+            onClick={() => { void manualRefresh() }}
+          >
+            <RefreshGlyph />
+          </QdpIconButton>
+        </div>
+        <div className="qdp-sectionBody">
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle" role="status" aria-busy={status === undefined}>
+                <QdpStateDot state={dotStateOf(status === undefined ? 'loading' : status.status)} />
+                <span>{signedInLabel}</span>
+                {planTag === undefined ? null : <QdpTag>{planTag}</QdpTag>}
+              </span>
+              {planMeta === undefined || planMeta === '' ? null : <span className="qdp-rowDesc">{planMeta}</span>}
+            </div>
           </div>
-          <div className="qdp-sectionBody">
-            <div className="qdp-accountBox">
-              <div className="qdp-accountMain">
-                <div className="qdp-accountState" role="status" aria-busy={status === undefined}>
-                  <QdpStateDot state={dotStateOf(status === undefined ? 'loading' : status.status)} />
-                  <span>{signedInLabel}</span>
-                  {planTag === undefined ? null : <QdpTag>{planTag}</QdpTag>}
-                </div>
-                {status?.status !== 'signed-in' || status.pat === undefined ? null : (
-                  <span className="qdp-accountExpiry">
-                    {[patSourceText(status.pat.source, t),
-                      status.pat.savedAtMs === undefined ? null : t('patSavedAt', { time: formatTime(status.pat.savedAtMs) }),
-                      status.pat.patTail === undefined ? null : t('patTail', { tail: `****${status.pat.patTail}` })].filter(Boolean).join(' · ')}
-                  </span>
-                )}
-                {planMeta === undefined || planMeta === '' ? null : (
-                  <span className="qdp-accountExpiry">{planMeta}</span>
-                )}
+          {signedInDoc?.pat === undefined || replacing ? null : (
+            <div className="qdp-row">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">{t('patHeading')}</span>
+                {credentialMeta === undefined ? null : <span className="qdp-rowDesc">{credentialMeta}</span>}
               </div>
+              <div className="qdp-rowControl">
+                <QdpButton variant="ghost" size="sm" disabled={busy || patBusy} onClick={() => { setReplacing(true) }}>
+                  {t('patReplace')}
+                </QdpButton>
+                <QdpButton
+                  variant="dangerQuiet"
+                  size="sm"
+                  disabled={busy || patBusy}
+                  onClick={() => { setConfirmingClear(true) }}
+                >
+                  {t('patRemove')}
+                </QdpButton>
+              </div>
+            </div>
+          )}
+          {confirmingClear && signedInDoc?.pat !== undefined ? (
+            <div className="qdp-alert" role="alert">
+              <span>{t('patClearConfirm')}</span>
+              <div className="qdp-actions">
+                <QdpButton variant="danger" disabled={busy || patBusy} onClick={() => { void clearPat() }}>
+                  {patBusy ? t('patClearing') : t('patClearConfirmYes')}
+                </QdpButton>
+                <QdpButton disabled={patBusy} onClick={() => { setConfirmingClear(false) }}>
+                  {t('cancel')}
+                </QdpButton>
+              </div>
+            </div>
+          ) : null}
+          {signedOutStatus !== undefined ? (
+            <p className={signedOutStatus.reason === undefined ? 'qdp-body' : 'qdp-error'}>
+              {signedOutStatus.reason ?? t(currentVariant.signedOutKey)}
+            </p>
+          ) : null}
+          {patEntryOpen && authKey !== undefined ? patEntry() : null}
+          {signedInDoc !== undefined && signedInDoc.jobTokenRefreshedAt !== undefined ? (
+            <p className="qdp-caption">{t('jobTokenRefreshed', { time: formatTime(signedInDoc.jobTokenRefreshedAt) })}</p>
+          ) : null}
+          {readFailure === undefined || signedInState === undefined ? null : (
+            <div className="qdp-alert qdp-alertError" role="alert">
+              <span>{t('statusRefreshFailed', { message: readFailure })}</span>
               <div className="qdp-actions">
                 <QdpButton disabled={busy} onClick={() => { void manualRefresh() }}>
                   {busy ? t('refreshing') : t('refresh')}
                 </QdpButton>
-                {signedInDoc === undefined ? null : (
-                  <>
-                    <QdpButton disabled={busy || patBusy} onClick={() => { setReplacing(open => !open) }}>
-                      {t('patReplace')}
-                    </QdpButton>
-                    <QdpButton variant="dangerQuiet" disabled={busy || patBusy} onClick={() => { setConfirmingClear(true) }}>
-                      {t('patRemove')}
-                    </QdpButton>
-                  </>
+              </div>
+            </div>
+          )}
+          {status?.status === 'error' ? (
+            <div className="qdp-alert qdp-alertError" role="alert">{status.message}</div>
+          ) : null}
+        </div>
+      </section>
+
+      {/* ── 2. 签到: today's claim, recent grants, capped ledger list ── */}
+      {signedInDoc === undefined ? null : (
+        <section className="qdp-card">
+          <div className="qdp-sectionHead">
+            <h2 className="qdp-sectionTitle">{t('quotaSectionUsage')}</h2>
+          </div>
+          <div className="qdp-sectionBody">
+            <div className="qdp-row">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">
+                  <QdpStateDot state={claimedToday ? 'done' : 'idle'} />
+                  <span>{t('checkInTodayTitle')}</span>
+                </span>
+                {nextRunCaption === undefined ? null : <span className="qdp-rowDesc">{nextRunCaption}</span>}
+              </div>
+              <div className="qdp-rowControl">
+                {claimedToday ? (
+                  <QdpTag tone="success">{t('checkInClaimedToday')}</QdpTag>
+                ) : (
+                  <QdpButton
+                    variant="primary"
+                    disabled={busy || checkingIn}
+                    onClick={() => { void manualCheckIn() }}
+                  >
+                    {checkingIn ? t('checkInChecking') : t('checkInNow')}
+                  </QdpButton>
                 )}
               </div>
             </div>
-            {/* The variant enable intent (formerly a switch inside each tab):
-                kept as plain settings rows so an off side still reads "off". */}
-            {isUnified ? (
-              <>
-                <div className="qdp-row">
-                  <div className="qdp-rowText">
-                    <span className="qdp-rowTitle">{t('variantTabCN')}</span>
-                    <p className="qdp-rowDesc">{t('variantEnable')}</p>
-                  </div>
-                  <div className="qdp-rowControl">
-                    <QdpSwitch
-                      checked={cnEnabled}
-                      onChange={next => { setVariantEnabled(prev => ({ ...prev, cn: next })) }}
-                      label={`${t('variantTabCN')} · ${t('variantEnable')}`}
-                    />
-                  </div>
-                </div>
-                <div className="qdp-row">
-                  <div className="qdp-rowText">
-                    <span className="qdp-rowTitle">{t('variantTabGlobal')}</span>
-                    <p className="qdp-rowDesc">{t('variantEnable')}</p>
-                  </div>
-                  <div className="qdp-rowControl">
-                    <QdpSwitch
-                      checked={globalEnabled}
-                      onChange={next => { setVariantEnabled(prev => ({ ...prev, global: next })) }}
-                      label={`${t('variantTabGlobal')} · ${t('variantEnable')}`}
-                    />
-                  </div>
-                </div>
-              </>
-            ) : null}
-            {confirmingClear && signedInDoc !== undefined && signedInDoc.pat !== undefined ? (
-              <div className="qdp-alert" role="alert">
-                <span>{t('patClearConfirm')}</span>
-                <div className="qdp-actions">
-                  <QdpButton variant="danger" disabled={busy || patBusy} onClick={() => { void clearPat() }}>
-                    {patBusy ? t('patClearing') : t('patClearConfirmYes')}
-                  </QdpButton>
-                  <QdpButton disabled={patBusy} onClick={() => { setConfirmingClear(false) }}>
-                    {t('cancel')}
-                  </QdpButton>
-                </div>
+            <div className="qdp-row">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">{t('ledgerHeading')}</span>
+                <span className="qdp-rowDesc">{ledgerSummary}</span>
               </div>
-            ) : null}
-            {/* The credential's identity stays visible (a labelled field, not a
-                caption): source · saved time · tail, plus the account name. */}
-            {signedInDoc === undefined || signedInDoc.pat === undefined ? null : (
-              <div className="qdp-patBox">
-                <div className="qdp-patBoxCopy">
-                  <span className="qdp-accountState">{t('patBoxLabel')}</span>
-                  <span className="qdp-patBoxMeta">
-                    {[signedInDoc.pat.accountName,
-                      signedInDoc.pat.patTail === undefined ? null : t('patTail', { tail: `****${signedInDoc.pat.patTail}` })].filter(Boolean).join(' · ')}
-                  </span>
-                </div>
+              <div className="qdp-rowControl">
+                <QdpButton
+                  variant="ghost"
+                  size="sm"
+                  disabled={clearingLogs || claimedLogs.length === 0}
+                  onClick={() => { void clearCheckInLogs() }}
+                >
+                  {clearingLogs ? t('checkInClearing') : t('checkInClear')}
+                </QdpButton>
+              </div>
+            </div>
+            {claimedLogs.length === 0 ? null : (
+              <div className="qdp-logList">
+                {claimedLogs.map(entry => {
+                  const expiry = effectiveExpiryOf(entry)
+                  const expired = expiry <= now
+                  return (
+                    <div key={entry.id} className="qdp-logRow">
+                      <span className="qdp-muted">{formatTime(entry.timestamp)}</span>
+                      <span className="qdp-num">{entry.amount === undefined ? '—' : `+${String(entry.amount)}`}</span>
+                      <span className={expired ? 'qdp-error' : 'qdp-caption'}>
+                        {expired ? t('ledgerExpired') : t('ledgerExpiresAt', { date: formatDate(expiry) })}
+                      </span>
+                    </div>
+                  )
+                })}
               </div>
             )}
-            {replacing ? patEntry() : null}
-            {signedInDoc !== undefined && signedInDoc.jobTokenRefreshedAt !== undefined ? (
-              <p className="qdp-meta">{t('jobTokenRefreshed', { time: formatTime(signedInDoc.jobTokenRefreshedAt) })}</p>
-            ) : null}
-            {readFailure === undefined || signedInState === undefined ? null : (
-              <div className="qdp-alert qdp-alertError" role="alert">
-                <span>{t('statusRefreshFailed', { message: readFailure })}</span>
-                <div className="qdp-actions">
-                  <QdpButton disabled={busy} onClick={() => { void manualRefresh() }}>
-                    {busy ? t('refreshing') : t('refresh')}
-                  </QdpButton>
-                </div>
-              </div>
+            {checkInNotice === undefined ? null : <p className="qdp-body">{checkInNotice}</p>}
+          </div>
+        </section>
+      )}
+
+      {/* ── 3. 模型: provenance + refresh in the head, the pane body below ── */}
+      {signedInDoc === undefined ? null : (
+        <section className="qdp-card">
+          <div className="qdp-sectionHead">
+            <h2 className="qdp-sectionTitle">{t('paneModels')}</h2>
+            {catalogCaption === undefined ? null : <span className="qdp-caption">{catalogCaption}</span>}
+            <QdpButton
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => { void refreshModels() }}
+            >
+              {busy ? t('refreshingModels') : t('refreshModels')}
+            </QdpButton>
+          </div>
+          <div className="qdp-sectionBody">
+            {signedInDoc.catalog?.error === undefined ? null : (
+              <p className="qdp-error">{t('catalogError', { message: signedInDoc.catalog.error })}</p>
             )}
-            {signedInDoc === undefined && status?.status === 'signed-out' ? (
-              <>
-                <p className={status.reason === undefined ? 'qdp-body' : 'qdp-error'}>
-                  {status.reason ?? t(currentVariant.signedOutKey)}
-                </p>
-                {authKey === undefined ? null : patEntry()}
-              </>
-            ) : null}
-            {status?.status === 'error' ? (
-              <div className="qdp-alert qdp-alertError" role="alert">{status.message}</div>
-            ) : null}
-          </div>
-        </section>
-
-        {/* ── 2. 额度: headline, reset, one bar per merged credit group ── */}
-        <section className="qdp-section">
-          <div className="qdp-sectionHead">
-            <h2 className="qdp-sectionTitle">{t('creditsHeading')}</h2>
-          </div>
-          <div className="qdp-sectionBody">
-            {signedInDoc === undefined
-              ? <p className="qdp-empty">{status === undefined ? t('loading') : t('quotaNotSignedIn')}</p>
-              : (
-                <QuotaSummary
-                  credits={signedInDoc.credits}
-                  creditsError={signedInDoc.creditsError}
-                  t={t}
-                  busy={busy}
-                  onRetry={() => { void manualRefresh() }}
-                />
-              )}
-          </div>
-        </section>
-
-        {/* ── 3. 使用与签到: the claim ledger + today's claim CTA ── */}
-        {signedInDoc === undefined ? null : (
-          <section className="qdp-section">
-            <div className="qdp-sectionHead">
-              <h2 className="qdp-sectionTitle">{t('quotaSectionUsage')}</h2>
-            </div>
-            <div className="qdp-sectionBody">
-              <UsageCheckInPanel
-                checkIn={signedInDoc.checkIn}
-                autoCheckIn={isUnified
-                  ? (activeVariantId === 'qoder' ? autoCheckInCN : autoCheckInGlobal)
-                  : (currentVariant.id === 'qoder' ? autoCheckInCN : autoCheckInGlobal)}
-                t={t}
-                busy={busy}
-                checkingIn={checkingIn}
-                checkInNotice={checkInNotice}
-                onCheckIn={() => { void manualCheckIn() }}
-                clearingLogs={clearingLogs}
-                logsDisabled={false}
-                onClearLogs={() => { void clearCheckInLogs() }}
-              />
-            </div>
-          </section>
-        )}
-
-        {/* ── 4. 模型: visibility toggles + per-model context window ── */}
-        {signedInDoc === undefined ? null : (
-          <section className="qdp-section">
-            <div className="qdp-sectionHead">
-              <h2 className="qdp-sectionTitle">{t('paneModels')}</h2>
-            </div>
-            <div className="qdp-sectionBody">
-              <ModelsPane
-                models={signedInDoc.models}
-                disabledModels={signedInDoc.disabledModels}
-                catalog={signedInDoc.catalog}
-                t={t}
-                busy={busy}
-                onSetModelContextWindow={(model, window) => {
-                  void control({ action: 'set-model-context-window', model, window })
-                }}
-                onSetModelsEnabled={(models, enabled) => {
-                  void control({ action: 'set-models-enabled', models, enabled })
-                }}
-                onRefreshModels={() => { void refreshModels() }}
-              />
-            </div>
-          </section>
-        )}
-
-        {/* ── 5. 高级设置: sidebar/check-in settings, flat rows in one section ── */}
-        <section className="qdp-section">
-          <div className="qdp-sectionHead">
-            <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
-          </div>
-          <div className="qdp-sectionBody">
-            <QuotaSettingsContent
+            <ModelsPane
+              models={signedInDoc.models}
+              disabledModels={signedInDoc.disabledModels}
+              catalog={signedInDoc.catalog}
               t={t}
-              scope={scope}
-              signedIn={signedIn}
-              variant={settingsVariant}
+              busy={busy === true}
+              saving={savingModels}
+              saveError={modelsSaveError}
+              onSave={draft => { void saveModelDraft(draft) }}
+              onRefreshModels={() => { void refreshModels() }}
             />
           </div>
         </section>
-      </div>
+      )}
+
+      {/* ── 4. 高级设置: auto check-in + time, readout switches, poll interval ── */}
+      <section className="qdp-card">
+        <div className="qdp-sectionHead">
+          <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
+        </div>
+        <div className="qdp-sectionBody">
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">{t('paneUsage')}</span>
+              <span className="qdp-rowDesc">
+                {settingsSignedIn
+                  ? (settingsVariant === 'cn' ? t('autoCheckInHintCN') : t('autoCheckInHintGlobal'))
+                  : t('quotaSignInRequired')}
+              </span>
+            </div>
+            <div className="qdp-rowControl">
+              <QdpSwitch
+                checked={autoCheckInOn}
+                disabled={!settingsSignedIn}
+                label={t('paneUsage')}
+                onChange={writeAutoCheckIn}
+              />
+            </div>
+          </div>
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">
+                {settingsVariant === 'cn' ? t('checkInTimeCN') : t('checkInTimeGlobal')}
+              </span>
+              <span className="qdp-rowDesc">{t('checkInTimeHint')}</span>
+            </div>
+            <div className="qdp-rowControl">
+              <CheckInTimeRow
+                label={settingsVariant === 'cn' ? t('checkInTimeCN') : t('checkInTimeGlobal')}
+                value={checkInMinute}
+                disabled={!settingsSignedIn || !autoCheckInOn}
+                onPick={writeCheckInMinute}
+              />
+            </div>
+          </div>
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">{t('quotaReadoutEnabledLabel')}</span>
+              <span className="qdp-rowDesc">{t('quotaReadoutEnabledDesc')}</span>
+            </div>
+            <div className="qdp-rowControl">
+              <QdpSwitch
+                checked={readoutEnabled}
+                label={t('quotaReadoutEnabledLabel')}
+                onChange={writeReadoutEnabled}
+              />
+            </div>
+          </div>
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">{t('quotaReadoutCNLabel')}</span>
+              <span className="qdp-rowDesc">{t('quotaReadoutCNDesc')}</span>
+            </div>
+            <div className="qdp-rowControl">
+              <QdpSwitch
+                checked={readoutCN}
+                disabled={!readoutEnabled}
+                label={t('quotaReadoutCNLabel')}
+                onChange={writeReadoutCN}
+              />
+            </div>
+          </div>
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">{t('quotaReadoutGlobalLabel')}</span>
+              <span className="qdp-rowDesc">{t('quotaReadoutGlobalDesc')}</span>
+            </div>
+            <div className="qdp-rowControl">
+              <QdpSwitch
+                checked={readoutGlobal}
+                disabled={!readoutEnabled}
+                label={t('quotaReadoutGlobalLabel')}
+                onChange={writeReadoutGlobal}
+              />
+            </div>
+          </div>
+          {settings.status === 'unavailable' ? null : (
+            <div className="qdp-row">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">{t('quotaPollLabel')}</span>
+                <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
+              </div>
+              <div className="qdp-rowControl">
+                <QdpInput
+                  className="qdp-inputShort"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={pollMinutes}
+                  aria-label={t('quotaPollLabel')}
+                  onChange={event => {
+                    const minutes = Number.parseInt(event.target.value, 10)
+                    if (Number.isFinite(minutes) && minutes >= 1) writePollMinutes(minutes)
+                  }}
+                />
+                <span className="qdp-caption">{t('quotaPollUnit')}</span>
+              </div>
+            </div>
+          )}
+          {settings.status === 'ready' && !settings.writable ? (
+            <p className="qdp-error">{t('quotaSettingsSaveFailed')}</p>
+          ) : null}
+        </div>
+      </section>
     </div>
   )
 }

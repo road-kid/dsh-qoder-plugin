@@ -13,6 +13,11 @@
  * saw through {@link noteQuotaSignIn}. The settings card polls on its own
  * because it must gate its toggles even while both sidebar cards are OFF —
  * the sidebar cards' polls do not run then.
+ *
+ * The composer-readout switches are different in kind: they are a BROWSER
+ * preference persisted in localStorage (see {@link READOUT_STORAGE_KEY}), not
+ * state mirrored from the settings file, because they must work against any
+ * loaded host version. {@link setQuotaReadout} is the only write path.
  */
 
 import type { QoderVariantId, QoderWebStatus } from '../status-paths.ts'
@@ -24,6 +29,82 @@ export interface QuotaSignInState {
 }
 
 let pollIntervalMs = 300_000
+/** Composer-readout switches: master + one per variant (all on by default). */
+export interface QuotaReadoutState {
+  enabled: boolean
+  cn: boolean
+  global: boolean
+}
+
+/**
+ * localStorage key holding the readout switches.
+ *
+ * These three preferences do NOT live in the settings file: the switches must
+ * work against ANY loaded host, including one whose settings schema predates
+ * them (a fresh host rejects unknown fields with HTTP 400). A browser
+ * preference needs no host round trip, survives reloads, and keeps both halves
+ * honest about where the value lives.
+ */
+const READOUT_STORAGE_KEY = 'dsh-connect-qoder-x:readout'
+
+/** The all-on state used when nothing (or nothing valid) was stored. */
+function defaultQuotaReadout(): QuotaReadoutState {
+  return { enabled: true, cn: true, global: true }
+}
+
+/** A stored flag counts as on unless it was explicitly `false`. */
+function readoutFlag(stored: unknown): boolean {
+  return stored !== false
+}
+
+/**
+ * The browser storage, or undefined when there is none or access is blocked
+ * (non-browser runtime, private mode, disabled site data). Every access is
+ * wrapped: `window.localStorage` itself can throw when storage is disabled.
+ */
+function readoutStorage(): Storage | undefined {
+  try {
+    if (typeof window === 'undefined' || window.localStorage === undefined) return undefined
+    return window.localStorage
+  } catch {
+    return undefined
+  }
+}
+
+/** Read the persisted switches once; missing/invalid storage means all-on. */
+function loadQuotaReadout(): QuotaReadoutState {
+  const storage = readoutStorage()
+  if (storage === undefined) return defaultQuotaReadout()
+  try {
+    const raw = storage.getItem(READOUT_STORAGE_KEY)
+    if (raw === null) return defaultQuotaReadout()
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return defaultQuotaReadout()
+    const stored = parsed as { enabled?: unknown; cn?: unknown; global?: unknown }
+    return {
+      enabled: readoutFlag(stored.enabled),
+      cn: readoutFlag(stored.cn),
+      global: readoutFlag(stored.global),
+    }
+  } catch {
+    // Corrupt JSON is not a reason to hide the chip: fall back to all-on.
+    return defaultQuotaReadout()
+  }
+}
+
+/** Persist the switches; a blocked/full store only costs the preference. */
+function persistQuotaReadout(state: QuotaReadoutState): void {
+  const storage = readoutStorage()
+  if (storage === undefined) return
+  try {
+    storage.setItem(READOUT_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Quota/blocked-storage errors are ignored: memory still carries the state.
+  }
+}
+
+let readout: QuotaReadoutState = loadQuotaReadout()
+let readoutSnapshot: QuotaReadoutState = { ...readout }
 const toggles = { cn: false, global: false }
 let togglesSnapshot: QuotaSignInState = { cn: false, global: false }
 const signIn: QuotaSignInState = { cn: false, global: false }
@@ -62,6 +143,27 @@ export function setQuotaToggles(cn: boolean, global: boolean): void {
 /** Read the current toggles. */
 export function quotaToggles(): QuotaSignInState {
   return togglesSnapshot
+}
+
+/**
+ * Update the composer-readout switches.
+ *
+ * This is a CLIENT-SIDE preference (see {@link READOUT_STORAGE_KEY}), not a
+ * settings-file write: it persists to localStorage, bumps the revision so
+ * every composer chip re-renders, and never touches the host document.
+ */
+export function setQuotaReadout(enabled: boolean, cn: boolean, global: boolean): void {
+  if (readout.enabled !== enabled || readout.cn !== cn || readout.global !== global) {
+    readout = { enabled, cn, global }
+    readoutSnapshot = { ...readout }
+    persistQuotaReadout(readout)
+    bump()
+  }
+}
+
+/** Read the composer-readout switches. */
+export function quotaReadout(): QuotaReadoutState {
+  return readoutSnapshot
 }
 
 /** Record a variant's sign-in state from any successful status poll. */

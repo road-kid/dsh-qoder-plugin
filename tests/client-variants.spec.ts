@@ -201,7 +201,10 @@ describe('plugin card per variant', () => {
 
   const buttonLabels = (): string[] => view!.root.findAllByType('button').map(node => node.children.join(''))
   const press = async (label: string, nth = 0): Promise<void> => {
-    const matches = view!.root.findAllByType('button').filter(node => node.children.join('') === label)
+    // The page's refresh control is an icon button: its accessible name (not
+    // its glyph) is the stable label, so match that too.
+    const matches = view!.root.findAllByType('button')
+      .filter(node => node.children.join('') === label || node.props['aria-label'] === label)
     const node = matches[nth]
     if (node === undefined) throw new Error(`no button #${nth} labelled ${label}; have: ${buttonLabels().join(' | ')}`)
     await act(async () => { node.props.onClick() })

@@ -1,11 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
-import {
-  QODER_GLOBAL_STATUS_PATH,
-  QODER_PROBE_PATH,
-  QODER_STATUS_PATH,
-} from '../src/status-paths.ts'
+import { QODER_PROBE_PATH } from '../src/status-paths.ts'
 
 /**
  * The client entry degrades a slot-API breaking change (the rc.6→rc.7
@@ -13,55 +9,51 @@ import {
  * to a console.error, so the host provider keeps working without a banner.
  *
  * We cannot import the real client entry (it pulls browser-only DSH client
- * packages, and its dashboard internals need the DOM); instead we replicate the
+ * packages, and its components need the DOM); instead we replicate the
  * try/catch shape from `src/client/index.tsx` and assert it swallows a
  * simulated throw at each guarded boundary.
  *
  * DRIFT WARNING: the `apply()` below is a manual mirror of the real `apply()`
  * in `src/client/index.tsx` (see the NOTE on that function). It is NOT the
  * product code, so these tests prove the fallback boundaries work — they cannot
- * by themselves detect a regression in the real entry. The final case closes
- * that gap mechanically: it reads the entry off disk and requires every
- * `console.error` message, every `ctx.effect` label, and the locale namespace
- * it registers to appear VERBATIM in this file's own source. Change the real
- * entry's guarded body or one of those literals without updating the mirror,
- * and that case fails.
+ * by themselves detect a regression in the real entry. The final describe
+ * block closes that gap mechanically: it reads the entry off disk and requires
+ * every `console.error` message, every `ctx.effect` label, and the locale
+ * namespace it registers to appear VERBATIM in this file's own source. Change
+ * the real entry's guarded body or one of those literals without updating the
+ * mirror, and that case fails.
  */
-
-/** The variant ids, mirroring `QODER_CARD_VARIANTS` in QoderPluginCard.tsx. */
-const CARD_VARIANT_IDS = ['qoder', 'qoder-global'] as const
-
-/** The status routes per variant id, mirroring VARIANT_STATUS in the entry. */
-const VARIANT_STATUS: Record<string, string> = {
-  qoder: QODER_STATUS_PATH,
-  'qoder-global': QODER_GLOBAL_STATUS_PATH,
-}
 
 /**
  * The configuration-face constants, mirroring src/client/index.tsx.
  *
- * `QUOTA_SETTINGS_NAMESPACE` is the 0.1.5 namespace the Host serves this
- * plugin's quota section under (nothing on the 0.1.7 line reads it any more).
  * `ENTRY_ID` is the PROFILE ROW ID this bundle's patch inserts — the right half
  * of the `plugins.row.config` key, not a `configForms` namespace.
  */
-const QUOTA_SETTINGS_NAMESPACE = 'qoder-quota'
 const ENTRY_ID = 'llm-qoder-x'
 const ROW_CONFIG_SLOT = 'plugins.row.config'
 const BUNDLE_CONFIG_SLOT = 'plugins.bundle.config'
 const PACKAGE_NAME = 'dsh-connect-qoder-x'
 const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ENTRY_ID}`
 
+/** The composer seats: the quota readout chip, and the context-window probe. */
+const COMPOSER_READOUT_SLOT = 'conversation.input.left'
+const COMPOSER_PROBE_SLOT = 'conversation.input.right'
+const READOUT_ID = 'qoder-quota-readout'
+const PROBE_ID = 'qoder-probe'
+
 /** Minimal component stand-in: the mirror never renders anything. */
 const Component = (): null => null
+
+/** Stand-in for the stylesheet effect (the real one touches `document`). */
+const injectQuotaCssStandIn = (): (() => void) => () => {}
 
 /**
  * Mirror of src/client/index.tsx apply() body.
  *
- * Not mirrored: the dashboard's mount-time internals (its cached snapshot, its
- * polling, `fetchStatusDocument`, and the mount wrapper's JSX) — they need the
- * DOM and only run once the panel is open. They are replaced by no-op
- * stand-ins so the guarded registration sequence above them stays verbatim.
+ * Not mirrored: `new OwnQuotaSettingsScope()` (it does network I/O) — replaced
+ * by a stand-in scope object fed through the same `adoptQuotaScope` boundary,
+ * so the registration sequence around it stays verbatim.
  */
 function apply(ctx: any): void {
   try {
@@ -74,19 +66,25 @@ function apply(ctx: any): void {
       quotaScope = scope
       const applySnapshot = (): void => {
         const value = scope.getSnapshot().value
-        void value
+        if (typeof value?.quotaPollMs === 'number') {
+          // The real entry mirrors the interval into the shared store; the
+          // mirror only proves the snapshot boundary runs.
+          void value.quotaPollMs
+        }
       }
       applySnapshot()
       scope.subscribe(applySnapshot)
     }
-    // The unified Qoder card's inject face: one face for both seats, because the
-    // card is the same component either way and reads `view` from its props.
-    const cardFace = () => ({
+
+    // One inject face for both plugin-configuration seats: the card is the same
+    // component either way and reads `view` from its PROPS (the owner contract).
+    const cardFace = (): any => ({
       t,
       scope: quotaScope,
       signedIn: () => ({ cn: false, global: false }),
       unified: true,
     })
+
     const registerCard = (slot: string, key: string): void => {
       try {
         ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, key, inject: cardFace }, Component))
@@ -97,107 +95,46 @@ function apply(ctx: any): void {
     registerCard(ROW_CONFIG_SLOT, ROW_CONFIG_KEY)
     registerCard(BUNDLE_CONFIG_SLOT, PACKAGE_NAME)
 
-    // Plugin-owned configuration, read from this plugin's own settings face.
-    // Mirrored as `adopt` over a stand-in rather than the real
-    // `new OwnQuotaSettingsScope()` (that class does network I/O), but the
-    // try/catch boundary and its position are the real entry's: a settings face
-    // that fails to bind must not take the cards registered above with it. The
-    // `scopeBind` fault injects that failure the way a broken scope object would.
-    try {
-      const face = ctx.settingsScope.bind({ namespace: QUOTA_SETTINGS_NAMESPACE })
-      adoptQuotaScope(face)
-    } catch (error: unknown) {
-      console.error('[dsh-connect-qoder-x] quota settings scope unavailable (sidebar cards stay hidden):', error)
-    }
-
-    // Dashboard internals stand-ins (see the note above).
-    const QUOTA_PANEL_ID = 'qoder-quota-panel'
-    const CONVERSATION_PANEL_ID = 'conversation'
-    let dashboardRequestedPath: string = QODER_STATUS_PATH
-    /** Whether the dashboard is the CURRENT center panel (its mount owns this). */
-    let quotaPanelOpen = false
-    const notifyDashboard = (): void => {}
-    const refreshDashboard = async (_options: { force?: boolean } = {}): Promise<void> => {}
-
-    ctx.effect(() => Component(), 'dsh-connect-qoder-x: quota styles')
-
-    const panelFace = (): any => ({
-      t,
-      statusPaths: [QODER_STATUS_PATH, QODER_GLOBAL_STATUS_PATH],
-      refresh: () => { void refreshDashboard({ force: true }) },
-      onVariantPicked: (path: string) => {
-        dashboardRequestedPath = path
-        notifyDashboard()
-        void refreshDashboard()
-      },
-      close: () => {
-        const layout = ctx.get('layout') as { selectPanel: (id: string | null) => void } | undefined
-        if (typeof layout?.selectPanel !== 'function') return
-        try {
-          layout.selectPanel(null)
-        } catch {
-          try {
-            layout.selectPanel(CONVERSATION_PANEL_ID)
-          } catch (error: unknown) {
-            console.error('[dsh-connect-qoder-x] could not close the quota panel:', error)
-          }
-        }
-      },
+    adoptQuotaScope({
+      getSnapshot: () => ({ value: { quotaPollMs: 300_000 } }),
+      subscribe: () => () => {},
     })
-    void panelFace
 
-    try {
-      ctx.slots.inject('main', () => ctx.slots.register(
-        { name: 'main', key: QUOTA_PANEL_ID, locale: 'panel.qoder-quota', inject: panelFace },
-        Component,
-      ))
-    } catch (error: unknown) {
-      console.error('[dsh-connect-qoder-x] could not register the quota dashboard:', error)
-    }
+    ctx.effect(() => injectQuotaCssStandIn(), 'dsh-connect-qoder-x: quota styles')
 
-    ctx.inject(['layout'], (layoutCtx: any) => {
-      const layout = layoutCtx.get('layout') as { selectPanel: (id: string | null) => void } | undefined
-      if (typeof layout?.selectPanel !== 'function') return
+    // The composer quota readout (session-scoped list; renders only while the
+    // session's selected model belongs to this plugin).
+    ctx.inject(['modelDirectories'], (scope: any) => {
       try {
-        for (const variantId of CARD_VARIANT_IDS) {
-          const statusPath = VARIANT_STATUS[variantId]
-          if (statusPath === undefined) continue
-          const injected = {
+        scope.slots.inject(COMPOSER_READOUT_SLOT, () => scope.slots.register({
+          name: COMPOSER_READOUT_SLOT,
+          id: READOUT_ID,
+          order: 5,
+          inject: (sessionId: string) => ({
+            directory: scope.modelDirectories.directoryFor(sessionId).store,
             t,
-            statusPath,
-            // Toggle semantics: the card of the variant ALREADY showing closes
-            // the panel; the other card switches to it and keeps it open.
-            open: () => {
-              if (quotaPanelOpen && dashboardRequestedPath === statusPath) {
-                layout.selectPanel(null)
-                return
-              }
-              dashboardRequestedPath = statusPath
-              notifyDashboard()
-              void refreshDashboard()
-              layout.selectPanel(QUOTA_PANEL_ID)
-            },
-          }
-          layoutCtx.slots.inject('sidebar.footer.action', () => layoutCtx.slots.register({
-            name: 'sidebar.footer.action',
-            id: variantId === 'qoder' ? 'qoder-quota' : 'qoder-global-quota',
-            order: variantId === 'qoder' ? 20 : 21,
-            locale: 'panel.qoder-quota',
-            inject: () => injected,
-          }, Component))
-        }
+          }),
+        }, Component))
       } catch (error: unknown) {
-        console.error('[dsh-connect-qoder-x] could not register the sidebar footer card:', error)
+        console.error('[dsh-connect-qoder-x] could not register the composer quota readout:', error)
       }
     })
 
+    // The context-window probe, sharing the same session/model-directory face.
     ctx.inject(['modelDirectories'], (scope: any) => {
-      scope.slots.inject('conversation.input.right', () => scope.slots.register({
-        name: 'conversation.input.right',
-        id: 'qoder-probe',
-        order: 10,
-        inject: () => ({ t }),
-      }, Component))
+      try {
+        scope.slots.inject(COMPOSER_PROBE_SLOT, () => scope.slots.register({
+          name: COMPOSER_PROBE_SLOT,
+          id: PROBE_ID,
+          order: 10,
+          inject: (sessionId: string) => ({
+            directory: scope.modelDirectories.directoryFor(sessionId).store,
+            t,
+          }),
+        }, Component))
+      } catch (error: unknown) {
+        console.error('[dsh-connect-qoder-x] could not register the context probe:', error)
+      }
     })
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
@@ -212,17 +149,11 @@ interface FakeContext {
 }
 
 /**
- * A stand-in for the DSH client context. `throwOn` names the service call that
- * must fail, which is how each test moves a different guarded boundary.
- *
- * There is no `host` switch any more: the port dropped both configuration
- * services (`settingsScope` for 0.1.5, `configForms` for 0.1.7) in favour of the
- * plugin's OWN settings file, so the entry behaves identically on either line.
- * The stand-in keeps both services present to prove they are simply unused.
+ * A stand-in for the DSH client context. `throwOn.slot` names the slot whose
+ * injection must fail, which is how each test moves a different guarded
+ * boundary.
  */
-function fakeContext(
-  throwOn: { slot?: string; scopeBind?: boolean } = {},
-): FakeContext {
+function fakeContext(throwOn: { slot?: string } = {}): FakeContext {
   const injections: string[] = []
   const registerCalls: Record<string, unknown>[] = []
   const slots = {
@@ -231,8 +162,6 @@ function fakeContext(
         throw new Error(`keyed slot "${name}" requires options.key`)
       }
       injections.push(name)
-      // The mirror's factories only run when the Plugins page renders; the
-      // register call is recorded here so a test can assert the contribution.
       const contribution = factory()
       if (typeof contribution === 'function') return contribution
       return () => {}
@@ -245,24 +174,15 @@ function fakeContext(
       .filter(call => call['name'] === name)
       .map(call => ({ options: { id: call['id'] } })),
   }
-  const layout = { selectPanel: () => {} }
   const ctx: any = {
     effect: (fn: () => unknown) => { fn() },
     locale: { register: () => () => {}, bind: () => (key: string) => key },
     slots,
-    get: (name: string) => (name === 'layout' ? layout : undefined),
-    settingsScope: {
-      bind: () => {
-        if (throwOn.scopeBind === true) throw new TypeError('settingsScope.bind is not a function')
-        return { getSnapshot: () => ({ value: undefined }), subscribe: () => {} }
-      },
-    },
-    configForms: {
-      get: () => ({ getSnapshot: () => ({ value: undefined }), subscribe: () => {} }),
-    },
+    get: () => undefined,
+    modelDirectories: { directoryFor: () => ({ store: {} }) },
     inject: (deps: string[], cb: (scope: any) => void) => {
-      if (throwOn.slot !== undefined && deps.includes(throwOn.slot)) return
-      cb({ get: ctx.get, slots, settingsScope: ctx.settingsScope, configForms: ctx.configForms })
+      if(!deps.includes('modelDirectories')) return
+      cb({ slots, modelDirectories: ctx.modelDirectories })
     },
   }
   return { ctx, injections, registerCalls }
@@ -276,16 +196,15 @@ function useErrorSpy(): { errors: string[]; restore: () => void } {
 }
 
 describe('client card fallback', () => {
-  it('swallows a slot registration failure instead of throwing', () => {
+  it('swallows a card seat registration failure instead of throwing', () => {
     const { errors, restore } = useErrorSpy()
     const { ctx } = fakeContext({ slot: ROW_CONFIG_SLOT })
 
     // Must not throw — the whole point of the fallback.
     expect(() => apply(ctx)).not.toThrow()
 
-    // The error is reported by the CARD's own catch (a keyed slot needs a key),
-    // not by the outer boundary: one seat failing must not take the other with
-    // it, so the per-seat catch is what has to hold here.
+    // Reported by the CARD's own catch (a keyed slot needs a key), not by the
+    // outer boundary: one seat failing must not take the other with it.
     expect(errors).toHaveLength(1)
     expect(errors[0]).toContain(`card slot "${ROW_CONFIG_SLOT}" failed to register`)
     expect(errors[0]).toContain('requires options.key')
@@ -293,74 +212,85 @@ describe('client card fallback', () => {
     restore()
   })
 
-  it('keeps both cards registered when the quota settings scope is missing', () => {
+  it('still registers the composer seats when a card seat breaks', () => {
     const { errors, restore } = useErrorSpy()
-    const { ctx, registerCalls } = fakeContext({ scopeBind: true })
+    const { ctx, injections } = fakeContext({ slot: BUNDLE_CONFIG_SLOT })
 
     expect(() => apply(ctx)).not.toThrow()
-    // One inner catch, not the outer boundary: the cards still contribute.
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('quota settings scope unavailable')
-
-    // BOTH seats are claimed even though the settings face never bound — the
-    // card is what carries the PAT entry, so losing it would strand the user.
-    const seats = registerCalls.filter(call => call['name'] === ROW_CONFIG_SLOT || call['name'] === BUNDLE_CONFIG_SLOT)
-    expect(seats).toHaveLength(2)
-    // The scope is handed over as undefined, so the settings card renders its
-    // toggles read-only rather than crashing on a missing service.
-    const card = registerCalls.find(call => call['name'] === ROW_CONFIG_SLOT) as unknown as { inject: () => { scope: unknown } }
-    expect(card.inject().scope).toBeUndefined()
+    expect(errors[0]).toContain('card slot')
+    // The composer readout is the user's only quota surface now: a broken
+    // Plugins-page seat must never suppress it.
+    expect(injections).toContain(COMPOSER_READOUT_SLOT)
+    expect(injections).toContain(COMPOSER_PROBE_SLOT)
 
     restore()
   })
 
-  it('still registers the sidebar cards and the composer entry when the panel slot breaks', () => {
+  it('degrades a broken readout seat to its own console.error', () => {
     const { errors, restore } = useErrorSpy()
-    const { ctx, injections } = fakeContext({ slot: 'main' })
+    const { ctx, injections } = fakeContext({ slot: COMPOSER_READOUT_SLOT })
 
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('could not register the quota dashboard')
-    // A dead dashboard cell must not take the rest of the plugin with it.
-    expect(injections).toContain('sidebar.footer.action')
-    expect(injections).toContain('conversation.input.right')
+    expect(errors[0]).toContain('could not register the composer quota readout')
+    // The probe is independent of the readout.
+    expect(injections).toContain(COMPOSER_PROBE_SLOT)
 
     restore()
   })
 
-  it('still registers the composer entry when the sidebar footer seat breaks', () => {
+  it('degrades a broken probe seat to its own console.error', () => {
     const { errors, restore } = useErrorSpy()
-    const { ctx, injections } = fakeContext({ slot: 'sidebar.footer.action' })
+    const { ctx, injections } = fakeContext({ slot: COMPOSER_PROBE_SLOT })
 
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('could not register the sidebar footer card')
-    expect(injections).toContain('conversation.input.right')
+    expect(errors[0]).toContain('could not register the context probe')
+    expect(injections).toContain(COMPOSER_READOUT_SLOT)
 
     restore()
   })
 
-  it('contributes both plugin-config seats, the panel seat, and the probe seat', () => {
+  it('contributes both plugin-config seats, the readout, and the probe', () => {
     const { errors, restore } = useErrorSpy()
     const { ctx, injections, registerCalls } = fakeContext()
 
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toEqual([])
-    // The two 0.1.7 plugin-configuration seats, claimed by their derived keys.
     expect(injections.filter(name => name === ROW_CONFIG_SLOT)).toHaveLength(1)
     expect(injections.filter(name => name === BUNDLE_CONFIG_SLOT)).toHaveLength(1)
-    expect(injections).toContain('main')
-    expect(injections).toContain('sidebar.footer.action')
-    expect(injections).toContain('conversation.input.right')
+    expect(injections).toContain(COMPOSER_READOUT_SLOT)
+    expect(injections).toContain(COMPOSER_PROBE_SLOT)
 
-    // The seats this plugin claims, by their Qoder keys and ids.
+    // The plugin-config seats, by their derived keys.
     const pluginKeys = registerCalls.flatMap(call => typeof call['key'] === 'string' ? [call['key']] : [])
-    expect(pluginKeys.sort()).toEqual([BUNDLE_CONFIG_SLOT && PACKAGE_NAME, ROW_CONFIG_KEY, 'qoder-quota-panel'].sort())
+    expect(pluginKeys.sort()).toEqual([PACKAGE_NAME, ROW_CONFIG_KEY].sort())
+    // The composer seats, by their ids.
     const seatIds = registerCalls.flatMap(call => typeof call['id'] === 'string' ? [call['id']] : [])
-    expect(seatIds.sort()).toEqual(['qoder-global-quota', 'qoder-probe', 'qoder-quota'])
-    // The probe seat belongs to the international-or-not composer chrome this
-    // plugin owns; its route pair is what the control reads.
+    expect(seatIds.sort()).toEqual([PROBE_ID, READOUT_ID].sort())
     expect(QODER_PROBE_PATH).toBe('/plugins/dsh-connect-qoder-x/probe')
+
+    restore()
+  })
+
+  it('injects the session model directory into both composer seats', () => {
+    const { errors, restore } = useErrorSpy()
+    const { ctx, registerCalls } = fakeContext()
+
+    expect(() => apply(ctx)).not.toThrow()
+    expect(errors).toEqual([])
+
+    // Both seats are session-scoped lists: their inject factory is called with
+    // the owning session id and must hand the component that session's model
+    // directory store (how the chip/probe learn the selected model).
+    for (const id of [READOUT_ID, PROBE_ID]) {
+      const call = registerCalls.find(entry => entry['id'] === id) as unknown as {
+        inject: (sessionId: string) => { directory: unknown }
+      }
+      const face = call.inject('session-1')
+      expect(face.directory).toBeDefined()
+    }
 
     restore()
   })
@@ -372,29 +302,30 @@ describe('client card fallback', () => {
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toEqual([])
 
-    // The owner dispatches this key from the package name it lists and the row
-    // id the bundle's patch declares. A wrong half is a silent no-show (a keyed
-    // slot nobody dispatches renders nothing), so assert both halves directly
-    // rather than trusting the template literal.
     const row = registerCalls.find(call => call['name'] === ROW_CONFIG_SLOT)
     expect(row?.['key']).toBe('dsh-connect-qoder-x#llm-qoder-x')
 
     restore()
   })
 
-  it('never claims a settings-section seat, on either host line', () => {
+  it('never claims a retired seat (sidebar card, quota panel, settings section)', () => {
     const { errors, restore } = useErrorSpy()
     const { ctx, injections, registerCalls } = fakeContext()
 
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toEqual([])
-    // The retired path: the removed Plugins-tab card list, and the shared
-    // container three plugins used to rendezvous in. Claiming either again
-    // re-creates the orphaned「插件设置」nav entry this port removes.
+    // The 0.3.2 redesign replaced the sidebar footer cards and the quota
+    // dashboard panel with the composer readout; re-claiming either would
+    // re-create surfaces the user asked to remove.
+    expect(injections).not.toContain('sidebar.footer.action')
+    expect(injections).not.toContain('main')
+    expect(registerCalls.some(call => call['key'] === 'qoder-quota-panel')).toBe(false)
+    expect(registerCalls.some(call => call['id'] === 'qoder-quota')).toBe(false)
+    expect(registerCalls.some(call => call['id'] === 'qoder-global-quota')).toBe(false)
+    // The retired settings-section path must stay retired too.
     expect(injections).not.toContain('settings.plugin.item')
     expect(injections).not.toContain('settings.section')
     expect(injections).not.toContain('plugin-settings.item')
-    expect(registerCalls.some(call => call['id'] === 'plugin-settings')).toBe(false)
 
     restore()
   })
@@ -407,31 +338,25 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
   it('every console.error message in the entry is mirrored word for word', () => {
     // Both quote styles: the entry uses a template literal for the per-seat card
     // failure (the slot name is interpolated into it) and plain strings for the
-    // rest. Matching only one style would silently stop guarding the other. The
-    // template pattern stops at the `${` interpolation, so the mirrored fragment
-    // is the literal prefix — which is what the mirror repeats.
+    // rest. The template pattern stops at the `${` interpolation, so the
+    // mirrored fragment is the literal prefix — which is what the mirror repeats.
     const messages = [
       ...entrySource.matchAll(/console\.error\(\s*'([^']+)'/g),
       ...entrySource.matchAll(/console\.error\(`([^`]*?)\$\{/g),
     ].map(match => match[1]!)
-    // Guard the guard: the real entry must actually carry the five boundaries
-    // this spec mirrors (outer catch + four inner catches: the per-seat card
-    // registration, the dashboard, the sidebar footer, and the panel close).
-    expect(messages).toHaveLength(5)
+    // Guard the guard: outer catch + per-seat card catch + readout + probe.
+    expect(messages).toHaveLength(4)
     for (const message of messages) {
       expect(mirrorSource).toContain(message)
     }
   })
 
-  it('every effect label and locale namespace in the entry is mirrored', () => {
+  it('every effect label and the locale namespace in the entry are mirrored', () => {
     const labels = [...entrySource.matchAll(/,\s*'(dsh-connect-qoder-x: [^']+)'/g)].map(match => match[1]!)
     expect(labels).toEqual(['dsh-connect-qoder-x: settings copy', 'dsh-connect-qoder-x: quota styles'])
     for (const label of labels) expect(mirrorSource).toContain(label)
-    // The two locale namespaces and the settings namespace the scope binds.
     expect(entrySource).toContain("'settings.qoder'")
-    expect(entrySource).toContain("'panel.qoder-quota'")
     expect(mirrorSource).toContain("'settings.qoder'")
-    expect(mirrorSource).toContain("'panel.qoder-quota'")
   })
 
   it('the entry has no legacy brand literal left anywhere', () => {
@@ -442,12 +367,8 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
   })
 
   it('every seat this plugin claims in the entry is claimed by the mirror too', () => {
-    // The registration identity of the plugin: slot names plus the keys/ids it
-    // contributes. A rename on one side and not the other is exactly the drift
-    // the mirror obligation warns about.
     const seats = [
-      'conversation.input.right', 'sidebar.footer.action',
-      'qoder-global-quota', 'qoder-quota-panel', 'qoder-probe',
+      COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT, READOUT_ID, PROBE_ID,
       // The 0.1.7 plugin-configuration seats.
       'plugins.row.config', 'plugins.bundle.config',
     ]
@@ -456,23 +377,16 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
       expect(mirrorSource).toContain(seat)
     }
     // The row key is COMPOSED in the entry (`${PACKAGE_NAME}#${ENTRY_ID}`), not
-    // written as one literal, so assert the two halves and their concatenation
-    // rather than a single string. This is the pair the owner's dispatch depends
-    // on: the package name it lists, and the row id `cordis.patch.yml` declares.
+    // written as one literal, so assert the two halves and their concatenation.
     expect(entrySource).toContain(`const ROW_CONFIG_KEY = \`\${PACKAGE_NAME}#\${ENTRY_ID}\``)
     expect(entrySource).toContain("const PACKAGE_NAME = 'dsh-connect-qoder-x'")
     expect(entrySource).toContain("const ENTRY_ID = 'llm-qoder-x'")
     expect(mirrorSource).toContain('dsh-connect-qoder-x#llm-qoder-x')
 
-    // The seats the plugin must NOT CLAIM any more: the removed Plugins-tab card
-    // list, and the community-private container the connect plugins used to
-    // rendezvous in. Reintroducing either re-creates the orphaned「插件设置」nav
-    // entry this port exists to remove.
-    //
-    // Read from the CALL SITES, not the whole file: the entry's comments name the
-    // retired slots on purpose (to explain what replaced them), so a whole-file
-    // substring check would flag the documentation rather than a regression.
+    // Seats the plugin must NOT claim any more. Read from the CALL SITES, not
+    // the whole file: the entry's comments name the retired slots on purpose.
     const claims = [...entrySource.matchAll(/slots\.inject\(\s*'([^']+)'/g)].map(match => match[1]!)
+    expect(claims).not.toContain('sidebar.footer.action')
     expect(claims).not.toContain('settings.plugin.item')
     expect(claims).not.toContain('settings.section')
     expect(claims).not.toContain('plugin-settings.item')

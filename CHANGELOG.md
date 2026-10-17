@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0
+
+### Changed — quota moved into the composer, settings page compacted, models save in one step
+
+Follow-up to 0.3.1, driven by three user complaints: the quota surfaces were in
+the wrong places, the settings page was big and empty, and every model toggle
+stuttered because it wrote to the host on each click.
+
+- **Composer quota readout replaces the sidebar cards and the dashboard.** A
+  `Qoder · remaining` chip lives in `conversation.input.left` and renders only
+  while the session's selected model belongs to this plugin (a non-Qoder model
+  leaves the shared toolbar untouched). Clicking it opens a compact panel
+  anchored above the chip — the variant that owns the selected model, plan tag,
+  remaining/total, solid bar, percent and expiry, manual refresh, auto-refresh
+  note — placed with viewport-clamped fixed positioning and dismissed by
+  outside click or Escape. The `sidebar.footer.action` widgets, the `main` quota
+  panel and their settings toggles are removed; the quota readout keeps one
+  shared refresh interval. 高级设置 carries the switches that come back with it:
+  one master switch plus one per variant, stored as a per-browser preference
+  (a readout is a view, so it does not write to the plugin settings file).
+- **Settings page rebuilt as four compact cards.** 账号 (variant switch, status,
+  credential row, PAT replace/clear), 签到 (claim today, recent-claims ledger,
+  clear log), 模型 (catalog provenance + refresh, model switches, window sliders,
+  unified save) and 高级设置 (daily auto check-in + time, refresh interval,
+  readout switches). The 可用额度 card, the sidebar toggles and the duplicate
+  status block are gone; rows are 36px with 0.5px separators inside 20px cards.
+- **Model settings stage locally and save once.** Toggle and window edits build a
+  draft and a sticky “N unsaved change(s)” bar; `保存设置` commits the enable /
+  disable deltas, one write per changed window, then exactly one status refresh —
+  a click never stutters the card, `取消` restores the saved state.
+- **Context-window slider rebuilt.** The old invisible range input is replaced by
+  a 12px solid fill bar with a rounded handle, tick labels under the track, and
+  snapping to the windows the model declares (200K / 400K / 1M): a drag lands on
+  a preset, Arrow/PageUp/PageDown walk presets, Home/End pick the ends, and the
+  handle follows the pointer through pointer capture with `role="slider"` and
+  `aria-valuetext`.
+- **Credit figures count what the account really holds.** The live billing
+  documents flag `credits.unlimited` while still reporting per-package sizes, so
+  trusting the flag alone showed 不限量 next to thousands of remaining credits;
+  only `Σ size <= 0` counts as unlimited now, and the panel shows the summed
+  remaining / summed size otherwise.
+- **Design-system fixes from the visual review.** Refresh becomes a stroke icon
+  button, the variant switcher's accessible name is localized, disabled buttons
+  and the model/advanced rows no longer drop below readable contrast in dark
+  theme, and the plugin page keeps using only `--dsw-*` tokens, role radii,
+  0.5px hairlines and the theme focus ring.
+
 ## 0.3.1
 
 ### Changed — plugin UI rebuilt to the DSH 0.2.1 design language

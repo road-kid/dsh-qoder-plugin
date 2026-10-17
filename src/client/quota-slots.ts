@@ -1,10 +1,8 @@
 /**
- * SlotMap merge for the quota panel's two seats — a structural re-statement of
- * commandcode's `panel-slots.ts`, which does the same for its own panel: the
- * layout's keyed `main` seat and the sidebar's footer-action list are declared
- * by packages this plugin does not depend on, so the slots are re-declared
+ * SlotMap merge for the seats this plugin contributes to. The seats are
+ * declared by packages this plugin does not depend on, so they are re-stated
  * here to make them type-check. Import this module (for its side effect) in
- * any file that registers or renders into either seat.
+ * any file that registers into them.
  *
  * The declarations must stay STRUCTURALLY IDENTICAL to upstream's: when a peer
  * package ships its own merge, a duplicate conflicting member would fail
@@ -15,29 +13,26 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface SlotMap {
     /**
-     * The layout's center-column panel registry. Declared by
-     * `@deepseek-ai/dsh-client-ui-layout` (not a dependency of this bundle);
-     * the sidebar footer card's `open()` selects a key from this registry.
+     * Compact controls BEFORE the composer's submit action. Declared by
+     * `@deepseek-ai/dsh-client-ui-conversation` as `{ kind: 'list'; scope:
+     * 'session' }`; the owner renders each entry inline in the composer
+     * toolbar and passes the owning session id to the inject factory.
+     *
+     * This is where the quota readout chip lives.
      */
-    'main': { kind: 'keyed'; scope: 'root' }
+    'conversation.input.left': { kind: 'list'; scope: 'session' }
     /**
-     * The sidebar-foot action list, rendered inside the foot area directly
-     * ABOVE the Settings seat (`footArea` renders `footerActions` then
-     * `settingsArea`). Declared by `@deepseek-ai/dsh-client-ui-sidebar`; the
-     * owner passes only the column state.
+     * Compact controls BEFORE the composer submit action. Declared by
+     * `@deepseek-ai/dsh-client-ui-conversation` as `{ kind: 'list'; scope:
+     * 'session' }`. Carries the Qoder probe button.
      */
-    'sidebar.footer.action': { kind: 'list'; scope: 'root'; owner: SidebarFooterActionOwnerProps }
+    'conversation.input.right': { kind: 'list'; scope: 'session' }
     /**
      * The Plugins page's row-configuration seat, declared by
      * `@deepseek-ai/dsh-client-ui-plugin-manager` (not a dependency of this
      * bundle). It is a KEYED slot dispatched with `entryKey = <package
      * name>#<row id>`; hitting it is what puts a 「配置」 control on this
      * plugin's row in the Plugins page and opens this card as that row's page.
-     *
-     * This is the 0.1.7 replacement for the removed `settings.plugin.item` /
-     * community `plugin-settings.item` seats: plugin configuration now lives
-     * on the plugin's own page, reached by clicking the plugin's name, rather
-     * than in a Settings navigation section.
      */
     'plugins.row.config': { kind: 'keyed'; scope: 'root'; owner: PluginConfigViewOwnerProps }
     /**
@@ -48,12 +43,6 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
      */
     'plugins.bundle.config': { kind: 'keyed'; scope: 'root'; owner: PluginConfigViewOwnerProps }
   }
-}
-
-/** Owner share of a sidebar footer action: only the column display state. */
-export interface SidebarFooterActionOwnerProps {
-  /** Whether the sidebar renders wide content (false = 56px rail). */
-  wide: boolean
 }
 
 /**

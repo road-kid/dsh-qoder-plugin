@@ -18,9 +18,12 @@
  */
 import {
   useCallback,
+  useMemo,
+  useRef,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from 'react'
 
@@ -230,4 +233,170 @@ export interface QdpIconButtonProps extends ButtonHTMLAttributes<HTMLButtonEleme
 /** 28x28 icon-only button; the icon is the consumer's child. */
 export function QdpIconButton({ label, className, type = 'button', ...rest }: QdpIconButtonProps): ReactNode {
   return <button {...rest} type={type} aria-label={label} title={label} className={cx('qdp-iconButton', className)} />
+}
+
+/* ------------------------------------------------------------------- slider */
+
+export interface QdpSliderProps {
+  /** Accessible name; the visible label is owned by the row. */
+  label: string
+  value: number
+  min: number
+  max: number
+  /** Value granularity for pointer drags and arrow keys (default 1000). */
+  step?: number
+  disabled?: boolean
+  /** Fires on every drag tick — consumers keep a local draft, never a write. */
+  onChange: (value: number) => void
+  /** Human-readable value for `aria-valuetext` (e.g. "200K"). */
+  valueText?: string
+  /** Marks drawn under the track (e.g. the catalog's supported windows). */
+  ticks?: readonly number[]
+  /** Tick/value formatter; defaults to `valueText` for the current value. */
+  format?: (value: number) => string
+  /**
+   * Values the handle anchors to after a drag (the catalog's declared context
+   * windows). When set, every pointer move and arrow key lands exactly on one
+   * of these — the slider answers "which offered size", never a free number.
+   */
+  snapTo?: readonly number[]
+  /** Root `data-testid`, for tests that need to find the control. */
+  testId?: string
+}
+
+/**
+ * Context-window slider: a thick filled rail with a narrow vertical grab handle
+ * at the fill's edge (the Qoder model-settings look). Pointer drags anywhere on
+ * the surface jump and follow the pointer; arrows, PageUp/PageDown and Home/End
+ * keep it keyboard operable. With `snapTo` the value always anchors to one of
+ * the offered windows instead of a free number. The component is fully
+ * controlled — it never writes anything by itself.
+ */
+export function QdpSlider({
+  label,
+  value,
+  min,
+  max,
+  step = 1000,
+  disabled,
+  onChange,
+  valueText,
+  ticks,
+  format,
+  snapTo,
+  testId,
+}: QdpSliderProps): ReactNode {
+  const formatValue = (raw: number): string => (
+    format !== undefined ? format(raw) : (raw === value && valueText !== undefined ? valueText : String(raw))
+  )
+  const percentOf = (raw: number): number => (span > 0 ? Math.min(100, Math.max(0, ((raw - min) / span) * 100)) : 0)
+  const trackRef = useRef<HTMLDivElement | null>(null)
+  const span = max > min ? max - min : 0
+  const ratio = span > 0 ? Math.min(1, Math.max(0, (value - min) / span)) : 0
+  /** The offered values that actually fit the shared axis, ascending. */
+  const anchors = useMemo(() => {
+    if (snapTo === undefined || snapTo.length === 0) return undefined
+    const inRange = snapTo
+      .filter(candidate => Number.isFinite(candidate) && candidate >= min && candidate <= max)
+      .slice()
+      .sort((a, b) => a - b)
+    return inRange.length > 0 ? inRange : undefined
+  }, [max, min, snapTo])
+  const snap = useCallback(
+    (raw: number): number => {
+      const clamped = Math.min(max, Math.max(min, raw))
+      if (anchors !== undefined) {
+        let best: number = anchors[0] ?? clamped
+        for (const candidate of anchors) {
+          if (Math.abs(candidate - clamped) < Math.abs(best - clamped)) best = candidate
+        }
+        return best
+      }
+      if (step <= 0) return clamped
+      const stepped = min + Math.round((clamped - min) / step) * step
+      return Math.min(max, Math.max(min, stepped))
+    },
+    [anchors, max, min, step],
+  )
+  const fromClientX = useCallback(
+    (clientX: number): void => {
+      const element = trackRef.current
+      if (element === null) return
+      const rect = element.getBoundingClientRect()
+      const share = rect.width > 0 ? (clientX - rect.left) / rect.width : 0
+      onChange(snap(min + Math.min(1, Math.max(0, share)) * span))
+    },
+    [max, min, onChange, snap, span],
+  )
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (disabled === true) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    fromClientX(event.clientX)
+  }
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (disabled === true || !event.currentTarget.hasPointerCapture(event.pointerId)) return
+    fromClientX(event.clientX)
+  }
+  const release = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (disabled === true) return
+    const big = step * 10
+    /** The offer after (direction 1) or before (-1) the current value. */
+    const neighbour = (direction: 1 | -1): number | undefined => {
+      if (anchors === undefined) return snap(value + direction * step)
+      const index = anchors.findIndex(candidate => candidate === value)
+      if (index === -1) return snap(value)
+      const nextIndex = Math.min(anchors.length - 1, Math.max(0, index + direction))
+      return anchors[nextIndex] ?? snap(value)
+    }
+    let next: number | undefined
+    if (event.key === 'ArrowRight' || event.key === 'ArrowUp') next = neighbour(1)
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') next = neighbour(-1)
+    else if (event.key === 'PageUp') next = snap(value + big)
+    else if (event.key === 'PageDown') next = snap(value - big)
+    else if (event.key === 'Home') next = min
+    else if (event.key === 'End') next = max
+    if (next === undefined) return
+    event.preventDefault()
+    if (next !== value) onChange(next)
+  }
+  return (
+    <div className="qdp-sliderField" data-testid={testId}>
+      <div
+        className="qdp-slider"
+        role="slider"
+        aria-label={label}
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        aria-valuetext={valueText ?? formatValue(value)}
+        aria-disabled={disabled === true || undefined}
+        tabIndex={disabled === true ? -1 : 0}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={release}
+        onPointerCancel={release}
+        onKeyDown={onKeyDown}
+      >
+        <div className="qdp-sliderTrack" ref={trackRef}>
+          <div className="qdp-sliderFill" style={{ width: `${(ratio * 100).toFixed(2)}%` }} />
+          <span className="qdp-sliderThumb" style={{ left: `${(ratio * 100).toFixed(2)}%` }} />
+        </div>
+      </div>
+      {ticks !== undefined && ticks.length > 0 && (
+        <div className="qdp-windowTicks">
+          {ticks.map(tick => (
+            <span key={tick} className="qdp-windowTick" style={{ left: `${percentOf(tick).toFixed(2)}%` }}>
+              {formatValue(tick)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }

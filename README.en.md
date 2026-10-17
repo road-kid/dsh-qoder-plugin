@@ -38,27 +38,31 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 - **PAT: save it and it works** — paste a PAT into the settings card and press *Save*; the token is validated live against that variant's region before anything is written, and the model group appears immediately — no DSH restart. Once signed in, *Replace PAT* (the new token overwrites only after it validates, so a mistyped paste can never strand a working credential) and *Clear PAT* are one click away.
 - **Two independent variants** — `qoder` (china) and `qoder-global` (global) keep separate credential files, routes and saved catalogs: a token minted on qoder.com does not work against the China deployment and vice versa.
 - **Three-tier model catalog (live → saved → fallback)** — the card states where the list on screen came from: *“Model list updated …”* (fetched now), *“Showing the saved model list from …”* (this account's last successful fetch, restored after a restart or a failed fetch), or *“Showing the built-in model list (not yet updated from Qoder)”* (the roster compiled into the plugin). The reason of the most recent failed fetch is shown too, and a *Refresh model list* button sits right there.
-- **One-toggle context window** — each variant card's *Context window* tab lists every model's available window sizes and carries its own *“Use the largest declared context window”* preference (on by default): on, models that declare a larger window are requested at it; off, at the catalog's default. Every window value comes from Qoder's catalog endpoint; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent toggle state.
-- **Model visibility toggles & batch controls** — each variant card provides a dedicated *Model Toggles* tab to freely enable or hide individual models; disabled models are hidden from the DSH model picker, keeping it tidy; includes instant search by name/ID and one-click *Enable all* / *Disable all* batch operations.
+- **Per-model context window (staged, one save)** — every model row carries a thick solid Qoder-style slider (tick labels under the track; dragging snaps to the windows the model declares — 200K / 400K / 1M). Dragging only edits a local draft — nothing is written per drag tick — and the enable switches plus window changes are committed together by one *Save changes*; a sticky *“N unsaved change(s)”* bar appears while the draft is dirty and *Cancel* restores the saved state. Requests carry the selected window; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent settings.
+- **Model visibility toggles** — the *Models* card lists every model of the selected variant; disabled models are hidden from the DSH model picker, keeping it tidy. Toggles stage locally like the window sliders and are committed by the same *Save changes*.
 - **Daily check-in (automatic + manual)** — 100 Credits are claimable every day. The claim window is **10:00 → 10:00 the next day (UTC+8)**, not a calendar day — the plugin judges "already claimed" strictly by the window: claim at 23:00 and the card still reads *Claimed today* at 00:44, flipping back to *Claim now* only when the next window opens at 10:00. A custom check-in time moves the window boundary with it. Automatic check-in is **off by default** and toggled per variant on the card (its time defaults to 10:00 UTC+8, the moment Qoder resets the campaign); once enabled it also catches up on startup so a missed window is not lost. The *Recent claims* panel lists every credit package you actually hold with its own expiry date — only genuine grants are recorded, and repeat clicks no longer mint phantom rows. **The international variant requires the Qoder desktop app to be installed on this machine**: the international service only serves the daily campaign to requests carrying a client-minted device risk identity, and when none is found the plugin says so plainly instead of falsely reporting "no campaign today". The China variant has no such requirement.
-- **Sidebar quota card + credit details** — the sidebar-display settings toggle a per-variant quota widget (off by default; each toggle needs its variant's PAT saved) with one shared refresh interval (default 5 min, minimum 1 min). Clicking the sidebar widget opens the *Qoder quota* panel: one row per credit package — *“Remaining / Total + bar | Expires”* — plus the cycle share and reset time. Click the same widget again to close; click the other to switch variants.
+- **Composer quota readout + credit panel** — a `Qoder · remaining` readout sits in the composer toolbar, and **only while this session uses a Qoder model** (switch to another model and it steps aside rather than occupying shared toolbar space). Clicking it opens a compact panel anchored above the readout: one row for the variant that owns the selected model, with plan tag, *remaining / total*, solid bar, percentage and expiry, a manual refresh and the auto-refresh note. The figures sum what the account really holds (`credits.unlimited` no longer hides real remaining credit). The readout can be hidden, or narrowed to one variant, from *Advanced* — stored as a per-browser preference rather than in the plugin settings file. The old sidebar widget and centre-column quota dashboard are gone; quota lives where it is used. Both share one refresh interval (default 5 min, minimum 1 min).
 - **Rate display `x<priceFactor>`** — each model name is suffixed with the Qoder-reported price multiplier (in the model picker: `Some Model · x0.79`, free is `x0.0`), spelled `x<n>` from the catalog's `price_factor`. Whole factors are padded to one decimal (`x1.0`) so a zero rate reads as a rate beside its fractional neighbours; fractional factors keep Qoder's own value (`x0.79`, `x1.6`). Display only — it never changes the request; models whose rate Qoder does not report simply show no suffix. The card's own model list spells the same number as `0.5x`; the value is identical, only the layout direction differs.
 
 ---
 
 ## A look at the UI
 
-The *Auto check-in* pane keeps everything about the daily grant in one view: the **Recent claims** ledger on the left (each package actually received, with its expiry) and **Available credit** on the right (remaining/total per package, with progress bars) plus the *Claim now* button.
+The settings page is four compact cards: **Account** (sign-in state, plan, credential source, variant switch, replace/clear PAT), **Check-in** (claim today, recent claims ledger, clear log), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Advanced** (daily auto check-in and its time, refresh interval, readout switches). Nothing is collapsed behind tabs, and no card draws its own chrome.
 
-![Usage and check-in pane](assets/checkin-credits.png)
+The *Check-in* card keeps today's claim, the ledger of grants actually received and the clear-log action together:
 
-The *Models* pane enables or hides models one by one, batch-enables/disables them, searches by name or ID, and sets each model's context window. A hidden model disappears from the DSH model picker:
+![Check-in card](assets/checkin-credits.png)
 
-![Model visibility and context windows](assets/model-toggles.png)
+The *Models* card toggles models row by row and sets each model's context window with a slider; changes stay staged until *Save changes*, and a hidden model disappears from the DSH model picker:
 
-The sidebar credit widget (off by default, toggled per variant on the card) shows the account's remaining credit and when it was last refreshed:
+![Model toggles and context windows](assets/model-toggles.png)
 
-![Sidebar credit widget](assets/sidebar-quota.png)
+The quota readout in the composer toolbar (only while the session uses a Qoder model) opens an anchored panel with the selected variant's remaining credit, plan and expiry:
+
+![Composer quota readout](assets/composer-quota.png)
+
+![Quota panel](assets/quota-panel.png)
 
 ---
 
@@ -143,7 +147,7 @@ Everything the plugin owns lives in one data directory: `<profile>/.dsh-connect-
 <profile>/.dsh-connect-qoder-x/
 ├── .qoder-auth.json              # China PAT ({version:2, pat, region, savedAt})
 ├── .qoder-global-auth.json       # Global PAT
-├── settings.json                 # sidebar display / check-in time and other own config
+├── settings.json                 # refresh interval / check-in time and other own config
 ├── checkin-status.json           # check-in state and the claims ledger
 └── state/
     ├── .qoder-catalog.json       # China per-account saved catalog
@@ -210,7 +214,7 @@ pnpm run check      # typecheck + test + test:qoder + build in one gate
 This project's implementation was informed by the following open-source projects — thanks to their authors:
 
 - [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect) — plugin skeleton and the connect mechanism
-- [dsh-workbuddy-connect](https://github.com/masknull/dsh-workbuddy-connect) — the shape of the settings card and the sidebar interactions
+- [dsh-connect-workbuddy](https://github.com/masknull/dsh-workbuddy-connect) — the shape of the composer readout and its anchored panel
 - [dsh-provider-qoder](https://github.com/mo-n/dsh-provider-qoder) — Qoder transport protocol details
 
 All of them are released under the MIT License, as is this project — see [LICENSE](./LICENSE). This is a community adapter — not affiliated with, authorized by, or endorsed by Qoder or DeepSeek, and not an official implementation.
