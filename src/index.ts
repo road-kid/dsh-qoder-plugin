@@ -38,7 +38,7 @@ import type { QoderWebCatalog, QoderWebProbeSection } from './status-paths.ts'
 import { QODER_SETTINGS_FACE_PATH } from './status-paths.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 import { emitJobTokenHint, emitJobTokenRefreshFailedHint, installJobTokenHint } from './job-token-hint.ts'
-import { SettingsStore, readLegacySections } from './settings-store.ts'
+import { SettingsStore } from './settings-store.ts'
 import { QODER_CONNECT_VERSION } from './version.ts'
 import { CHINA_VARIANT, GLOBAL_VARIANT, QODER_VARIANTS, type QoderVariant } from './variants.ts'
 
@@ -140,8 +140,8 @@ export {
   type QoderHostHeartbeat,
 } from './host-heartbeat.ts'
 
-/** Stable Cordis plugin name. */
-export const name = 'llm-qoder-x'
+/** Stable Cordis plugin name (matches the profile row id in cordis.patch.yml). */
+export const name = 'qoder-plugin'
 
 /** The model registry required before the provider can register. */
 export const inject = ['llm']
@@ -172,17 +172,6 @@ export const QODER_SETTINGS_NS = 'qoder' as SettingsNamespace
  * installed section whose namespace equals the card's slot key.
  */
 export const QODER_GLOBAL_SETTINGS_NS = 'qoder-global' as SettingsNamespace
-
-/**
- * Settings namespace owning the shared quota-card section.
- *
- * One card above the two variant cards configures both sidebar quota widgets
- * (China and global) from a single place, so its toggles cannot live in
- * either variant's section — they are per-variant fields on a cross-variant
- * card. The Plugins tab dispatches by namespace, so this section is what makes
- * that card render (see {@link QODER_GLOBAL_SETTINGS_NS} for the mechanism).
- */
-export const QODER_QUOTA_SETTINGS_NS = 'qoder-quota' as SettingsNamespace
 
 /**
  * How often the credential files are re-checked, in milliseconds.
@@ -252,6 +241,17 @@ export interface Config {
   disabledModels?: string[]
   /** Models disabled for the China variant (blacklist). */
   disabledModelsCN?: string[]
+  /**
+   * Master switch for the whole China variant (on by default).
+   *
+   * Off means the provider serves NO China model at all — the model picker
+   * hides the group — while the plugin card keeps listing the roster so the
+   * switch can be turned back on. Distinct from {@link Config.disabledModelsCN},
+   * which is a per-model blacklist.
+   */
+  variantEnabledCN?: boolean
+  /** The global variant's master switch; see {@link Config.variantEnabledCN}. */
+  variantEnabledGlobal?: boolean
   /** Show the China variant's sidebar quota card. */
   sidebarQuotaCN?: boolean
   /** Show the global variant's sidebar quota card. */
@@ -260,10 +260,13 @@ export interface Config {
   autoCheckInCN?: boolean
   /** Automatically check in daily at 10:00 (UTC+8) to claim credits for Global variant. */
   autoCheckInGlobal?: boolean
-  /** When the China variant checks in, as minutes past midnight in UTC+8 (600 = 10:00). */
-  checkInMinuteCN?: number
-  /** When the Global variant checks in, as minutes past midnight in UTC+8 (600 = 10:00). */
-  checkInMinuteGlobal?: number
+  /**
+   * When BOTH variants check in, as minutes past midnight in UTC+8 (600 = 10:00).
+   *
+   * One shared setting: the two products' campaigns reset at the same moment,
+   * so the card edits this field alone.
+   */
+  checkInMinute?: number
   /**
    * Sidebar quota refresh interval in milliseconds. One shared value (both
    * cards poll on it) because the two widgets hit the same rate-limited
@@ -360,6 +363,15 @@ const MODEL_CONTEXT_WINDOWS_FIELD = volatileField(z.dict(z.number().min(1), z.st
 /** Disabled models list (blacklist) */
 const DISABLED_MODELS_FIELD = volatileField(z.array(z.string()).default([])
   .description('Models hidden from the provider catalog and picker'))
+/**
+ * The whole-variant master switch (one per variant).
+ *
+ * On by default: an existing profile keeps serving both products. Off makes
+ * the provider expose none of that variant's models, while the card still
+ * lists them (see `QoderCatalog.setEnabled`).
+ */
+const VARIANT_ENABLED_FIELD = volatileField(z.boolean().default(true)
+  .description('启用该版本的全部模型（默认开启）'))
 /** Sidebar quota toggle (one per variant; both live on the shared quota card). */
 const QUOTA_TOGGLE_FIELD = volatileField(z.boolean().default(false)
   .description('Show this variant’s remaining-credit card in the sidebar footer (off by default)'))
@@ -367,7 +379,8 @@ const QUOTA_TOGGLE_FIELD = volatileField(z.boolean().default(false)
 const AUTO_CHECK_IN_FIELD = volatileField(z.boolean().default(false)
   .description('每天自动签到领取算力额度（默认关闭）'))
 /**
- * When a variant checks in, as minutes past midnight in UTC+8.
+ * The SHARED check-in moment (one control for both variants), as minutes past
+ * midnight in UTC+8.
  *
  * Stored as a plain minute count rather than a "HH:mm" string so the schema
  * itself rejects an impossible time: a browser time input yields 0–1439, and
@@ -378,7 +391,7 @@ const CHECK_IN_MINUTE_FIELD = volatileField(z.number()
   .default(DEFAULT_CHECK_IN_MINUTE)
   .min(0)
   .max(1439)
-  .description('每日自动签到的时刻（自 UTC+8 午夜起的分钟数，600 = 10:00）'))
+  .description('国内版与国际版共用的每日自动签到时刻（自 UTC+8 午夜起的分钟数，600 = 10:00）'))
 /**
  * Quota poll interval: default 5 minutes, floor 1 minute. The status route
  * performs a live upstream billing call per request with no cache, so an
@@ -408,52 +421,13 @@ export const Config: z<Config> = z.object({
   // which 0.1.7 has no concept of.
   disabledModels: DISABLED_MODELS_FIELD,
   disabledModelsCN: DISABLED_MODELS_FIELD,
+  variantEnabledCN: VARIANT_ENABLED_FIELD,
+  variantEnabledGlobal: VARIANT_ENABLED_FIELD,
   sidebarQuotaCN: QUOTA_TOGGLE_FIELD,
   sidebarQuotaGlobal: QUOTA_TOGGLE_FIELD,
   autoCheckInCN: AUTO_CHECK_IN_FIELD,
   autoCheckInGlobal: AUTO_CHECK_IN_FIELD,
-  checkInMinuteCN: CHECK_IN_MINUTE_FIELD,
-  checkInMinuteGlobal: CHECK_IN_MINUTE_FIELD,
-  quotaPollMs: QUOTA_POLL_FIELD,
-})
-
-/**
- * The China card's settings section: only the fields that card edits.
- *
- * A section is what makes its namespace "served", which is what the Plugins
- * tab dispatches a card by — so the schema and the card must stay split the
- * same way. `probeConsent` lives here because it predates the second variant;
- * it gates no current code path (only manual, per-click-confirmed probes run),
- * so it is left where existing users set it rather than moved and re-asked.
- */
-const CHINA_SECTION: z<Config> = z.object({
-  probeConsent: PROBE_CONSENT_FIELD,
-  useMaximumContextWindowCN: MAXIMUM_CONTEXT_WINDOW_CN_FIELD,
-  modelContextWindowsCN: MODEL_CONTEXT_WINDOWS_FIELD,
-  disabledModelsCN: DISABLED_MODELS_FIELD,
-})
-
-/** The global card's settings section and its context-window preferences. */
-const GLOBAL_SECTION: z<Config> = z.object({
-  useMaximumContextWindow: MAXIMUM_CONTEXT_WINDOW_FIELD,
-  modelContextWindows: MODEL_CONTEXT_WINDOWS_FIELD,
-  disabledModels: DISABLED_MODELS_FIELD,
-})
-
-/**
- * The shared quota card's section: both sidebar toggles and the poll interval.
- *
- * Only these fields — the card edits nothing else, and the Plugins tab pairs a
- * card with the section whose namespace it names, so a stray field here would
- * render as a control no other surface reads.
- */
-const QUOTA_SECTION: z<Config> = z.object({
-  sidebarQuotaCN: QUOTA_TOGGLE_FIELD,
-  sidebarQuotaGlobal: QUOTA_TOGGLE_FIELD,
-  autoCheckInCN: AUTO_CHECK_IN_FIELD,
-  autoCheckInGlobal: AUTO_CHECK_IN_FIELD,
-  checkInMinuteCN: CHECK_IN_MINUTE_FIELD,
-  checkInMinuteGlobal: CHECK_IN_MINUTE_FIELD,
+  checkInMinute: CHECK_IN_MINUTE_FIELD,
   quotaPollMs: QUOTA_POLL_FIELD,
 })
 
@@ -464,22 +438,24 @@ const QUOTA_SECTION: z<Config> = z.object({
  * One list per section, shared by the merge and by the test that pins it to
  * the schema. Writing the merge out by hand is what broke auto check-in: the
  * `qoder-quota` section grew four fields (`autoCheckInCN`, `autoCheckInGlobal`,
- * `checkInMinuteCN`, `checkInMinuteGlobal`) while the merge kept copying only
- * the three that predated them, so `current().autoCheckInCN` read `undefined`
- * forever and the scheduler saw the toggle as permanently off. The card saved
- * it, the file held it, and nothing ever acted on it.
+ * `checkInMinute`, `quotaPollMs`) while the merge kept copying only the three
+ * that predated them, so `current().autoCheckInCN` read `undefined` forever and
+ * the scheduler saw the toggle as permanently off. The card saved it, the file
+ * held it, and nothing ever acted on it.
  */
 export const CN_SECTION_KEYS = [
   'probeConsent',
   'useMaximumContextWindowCN',
   'modelContextWindowsCN',
   'disabledModelsCN',
+  'variantEnabledCN',
 ] as const satisfies readonly (keyof Config)[]
 
 export const GLOBAL_SECTION_KEYS = [
   'useMaximumContextWindow',
   'modelContextWindows',
   'disabledModels',
+  'variantEnabledGlobal',
 ] as const satisfies readonly (keyof Config)[]
 
 export const QUOTA_SECTION_KEYS = [
@@ -487,8 +463,7 @@ export const QUOTA_SECTION_KEYS = [
   'sidebarQuotaGlobal',
   'autoCheckInCN',
   'autoCheckInGlobal',
-  'checkInMinuteCN',
-  'checkInMinuteGlobal',
+  'checkInMinute',
   'quotaPollMs',
 ] as const satisfies readonly (keyof Config)[]
 
@@ -734,10 +709,12 @@ function createVariantRuntime(
   if (variant.id !== CHINA_VARIANT.id) {
     catalog.setUseMaximumContextWindow(initial.useMaximumContextWindow === true)
     if (initial.disabledModels !== undefined) catalog.setDisabledModels(initial.disabledModels)
+    catalog.setEnabled(initial.variantEnabledGlobal !== false)
   } else {
     catalog.setUseMaximumContextWindow(initial.useMaximumContextWindowCN === true)
     if (initial.modelContextWindowsCN !== undefined) catalog.setModelContextWindows(initial.modelContextWindowsCN)
     if (initial.disabledModelsCN !== undefined) catalog.setDisabledModels(initial.disabledModelsCN)
+    catalog.setEnabled(initial.variantEnabledCN !== false)
   }
   // Start hidden: a variant must serve no models until a token has actually
   // been adopted, so a signed-out variant is empty rather than showing a roster
@@ -1047,12 +1024,13 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       modelContextWindowsCN: {},
       disabledModels: [],
       disabledModelsCN: [],
+      variantEnabledCN: true,
+      variantEnabledGlobal: true,
       sidebarQuotaCN: false,
       sidebarQuotaGlobal: false,
       autoCheckInCN: false,
       autoCheckInGlobal: false,
-      checkInMinuteCN: 600,
-      checkInMinuteGlobal: 600,
+      checkInMinute: 600,
       quotaPollMs: 300_000,
     }
   }
@@ -1155,6 +1133,8 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
       case 'probeConsent':
       case 'useMaximumContextWindow':
       case 'useMaximumContextWindowCN':
+      case 'variantEnabledCN':
+      case 'variantEnabledGlobal':
       case 'sidebarQuotaCN':
       case 'sidebarQuotaGlobal':
       case 'autoCheckInCN':
@@ -1165,8 +1145,7 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
       case 'disabledModelsCN':
         if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) return `${field} must be an array of strings`
         break
-      case 'checkInMinuteCN':
-      case 'checkInMinuteGlobal':
+      case 'checkInMinute':
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 1439) return `${field} must be an integer minute 0..1439`
         break
       case 'quotaPollMs':
@@ -1179,127 +1158,6 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
     }
   }
   return undefined
-}
-
-/**
- * When the profile tree last recomposed, module-level so every apply sees it.
- *
- * The legacy settings.yaml import writes the profile patch one section at a
- * time for seconds after the Loader settles, emitting this event on every
- * write. Cleaning up our row in that window is futile — the import's next
- * section simply writes it back — so the cleanup waits for the tree to fall
- * quiet first.
- */
-let lastConfigReloadAt = Date.now()
-
-/** Wait until the profile tree has been quiet (the legacy import finished). */
-async function waitForProfileQuiet(): Promise<void> {
-  const deadline = Date.now() + 120_000
-  for (;;) {
-    if (Date.now() - lastConfigReloadAt >= 5_000) return
-    if (Date.now() >= deadline) return
-    await new Promise(resolve => setTimeout(resolve, 1_000))
-  }
-}
-
-/**
- * Delete this plugin's own fields from the profile entry config, leaving every
- * other key of the row untouched.
- *
- * One-time, right after the settings file has been seeded: the entry returns to
- * its shipped state, so no second source of truth remains. Both write APIs are
- * probed — `configEditor` (0.1.7) first, then the settings service's namespace
- * `replace` (0.1.5), which rebuilds each of this plugin's three sections from
- * the foreign keys alone.
- *
- * @param ctx - plugin context.
- * @param ownKeys - this plugin's declared config fields.
- * @param namespaces - the 0.1.5 section namespaces this plugin owns.
- */
-async function cleanupEntryConfig(ctx: Parameters<typeof apply>[0], ownKeys: readonly string[], namespaces: readonly string[]): Promise<void> {
-  // RETRIES, deliberately: `configEditor.edit` writes under the profile's
-  // package.json lock, and every plugin migrating on the same boot contends for
-  // that ONE lock — four sibling plugins seeding at once measured exactly one
-  // winner and three "timed out waiting for the writer lock" failures. The
-  // write is idempotent, so backing off (with jitter) makes the rest land.
-  const attempts = 10
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    try {
-      // The legacy settings.yaml import writes this same profile patch, one
-      // section at a time, for seconds after the Loader settles — and it holds
-      // the very lock this cleanup needs, and rewrites our row while we watch.
-      // Wait for that write storm to end before the first attempt, then back
-      // off between retries.
-      if (attempt === 0) await waitForProfileQuiet()
-      else await new Promise(resolve => setTimeout(resolve, 2_000 + Math.random() * 1_000))
-      const probe = ctx as unknown as {
-        get?: (name: string) => unknown
-        fiber?: { entry?: unknown }
-      }
-      // configEditor 双路探测：本 ctx 直取（0.1.7 官方写法），失败再从 settings
-      // 服务的 ownerContext（宿主根 ctx，configEditor 挂在那里）取。
-      const own: unknown = typeof probe.get === 'function'
-        ? (() => { try { return probe.get.call(ctx, 'configEditor') } catch { return undefined } })()
-        : undefined
-      const editor = (own ?? await new Promise<unknown>(resolve => {
-        ctx.inject(['settings'], settingsCtx => {
-          // `ownerContext` is a PRIVATE class member in 0.1.7, so the shape cast
-          // has to route through `unknown`: TS2352 rejects the direct cast
-          // because the two types no longer overlap. The runtime probe is
-          // unchanged and still guards with `typeof owner?.get === 'function'`,
-          // so a version that renames or removes the member degrades to
-          // `undefined` here instead of throwing.
-          const owner = (settingsCtx.settings as unknown as { ownerContext?: { get?: (name: string) => unknown } } | undefined)?.ownerContext
-          const viaOwner = typeof owner?.get === 'function'
-            ? (() => { try { return owner.get.call(owner, 'configEditor') } catch { return undefined } })()
-            : undefined
-          resolve(viaOwner)
-        })
-      })) as { edit(entry: unknown, change: (raw: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>): Promise<void> } | undefined
-      const entry = probe.fiber?.entry
-      if (editor !== undefined && entry !== undefined) {
-        // The change callback returns INHERITED plus the row's foreign keys, not
-        // "the row minus our keys": the profile's composition check
-        // (`isDeepStrictEqual(next, inherited)`) is what lets the editor drop the
-        // row's user layer entirely, and a hand-built `{}` fails that check
-        // whenever a bundle layer still carries a config for this entry.
-        // Any other plugin's (or the user's own) keys on the row stay.
-        await editor.edit(entry, (raw, inherited) => {
-          const next: Record<string, unknown> = { ...(inherited ?? {}) }
-          for (const [key, value] of Object.entries(raw ?? {})) {
-            if ((ownKeys as readonly string[]).includes(key)) continue
-            if (!Object.hasOwn(next, key)) next[key] = value
-          }
-          return next
-        })
-        return
-      }
-      // 0.1.5: rebuild each namespace's user layer empty. Every one of this
-      // plugin's three sections is declared by this plugin alone (its schema IS
-      // the field list), so an empty section is exactly "our keys, nothing else".
-      await new Promise(resolve => {
-        ctx.inject(['settings'], settingsCtx => {
-          const settings = settingsCtx.settings as unknown as {
-            installSection?: unknown
-            replace?: (ns: string, section: Record<string, unknown>) => Promise<unknown>
-          }
-          if (typeof settings?.replace !== 'function' || typeof settings.installSection !== 'function') {
-            resolve(undefined)
-            return
-          }
-          Promise.all(namespaces.map(ns => Promise.resolve(settings.replace!(ns, {})).catch(() => undefined)))
-            .then(() => resolve(undefined))
-        })
-      })
-      return
-    } catch (error: unknown) {
-      if (attempt === attempts - 1) {
-        ctx.logger?.warn?.('dsh-qoder-plugin: entry config cleanup failed', error)
-        return
-      }
-      await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1) + Math.random() * 500))
-    }
-  }
 }
 
 /** The account identity each variant last published a catalog for, across reloads. */
@@ -1338,77 +1196,6 @@ export function apply(ctx: Context, config: Config): void {
   const store = new SettingsStore()
   let current = (): Config => ({ ...readConfig(config), ...store.values() }) as Config
 
-  /**
-   * One-time migration: per field — the file never held it → take the entry;
-   * the card HAS written this file → keep the file; the entry carries a
-   * NON-DEFAULT value → take the entry (the legacy settings.yaml import lands
-   * only after the Loader settles, i.e. after this plugin's first apply, and a
-   * seed taken inside that window can hold a stale or mis-encoded value); the
-   * entry only carries the schema default → keep the file.
-   *
-   * That last clause is load-bearing: a bundle layer's insert config does NOT
-   * reach the composition (verified with `dsh --dump-config`), so once the
-   * one-time cleanup has emptied the entry row the entry answers pure defaults —
-   * treating those as authoritative would erase the user's values on the next
-   * boot. Re-checked on every apply, which is also what closes the legacy
-   * import's timing window.
-   *
-   * When the entry is authoritative, its own fields are then deleted from the
-   * profile row, so no second source of truth remains.
-   */
-  const migrateOwnSettings = (): void => {
-    const legacy = readLegacySections([QODER_SETTINGS_NS, QODER_GLOBAL_SETTINGS_NS, QODER_QUOTA_SETTINGS_NS])
-    const seeded: Record<string, unknown> = {}
-    for (const key of CONFIG_KEYS) {
-      const entryValue = readField(config, key)
-      const legacyValue = legacy === undefined ? undefined : legacy[key]
-      const holds = Object.hasOwn(store.user, key)
-      if (!holds) {
-        // First seed — the first NON-DEFAULT candidate, entry before legacy, and
-        // only then an explicit default so the stored layer stays complete. A
-        // schema default (an empty array, `true` for a toggle that defaults on)
-        // is NOT a value to seed on: seeding it here is what starved the legacy
-        // layer, whose document is the only surviving copy of this plugin's
-        // 0.1.5 settings.
-        if (entryValue !== undefined && JSON.stringify(entryValue) !== JSON.stringify(DEFAULT_FOR_FIELD[key])) seeded[key] = entryValue
-        else if (legacyValue !== undefined && JSON.stringify(legacyValue) !== JSON.stringify(DEFAULT_FOR_FIELD[key])) seeded[key] = legacyValue
-        else if (entryValue !== undefined) seeded[key] = entryValue
-        else if (legacyValue !== undefined) seeded[key] = legacyValue
-        continue
-      }
-      if (store.edited) continue
-      if (entryValue !== undefined && JSON.stringify(entryValue) !== JSON.stringify(DEFAULT_FOR_FIELD[key])) {
-        seeded[key] = entryValue
-        continue
-      }
-      if (legacyValue !== undefined && JSON.stringify(legacyValue) !== JSON.stringify(DEFAULT_FOR_FIELD[key])) {
-        seeded[key] = legacyValue
-      }
-    }
-    if (Object.keys(seeded).length === 0) return
-    store.patch(seeded)
-    void cleanupEntryConfig(ctx, CONFIG_KEYS, [QODER_SETTINGS_NS, QODER_GLOBAL_SETTINGS_NS, QODER_QUOTA_SETTINGS_NS])
-  }
-  migrateOwnSettings()
-
-  // A volatile-only configuration change — which is what the legacy
-  // settings.yaml import performs, because every field of this Config is
-  // `.volatile()` — commits through the loader's volatile fast path: the
-  // references are updated IN PLACE and `apply()` is NOT run again. Seeding
-  // only inside `apply` would never observe values arriving that way. This
-  // event fires on exactly that commit (the same mechanism the built-in
-  // `dsh-llm-pi-ai` uses), so the seed rule re-evaluates.
-  // Both events are Host-internal channels the 0.1.5 typings do not declare, so
-  // they reach `on` through the string-keyed escape hatch rather than the typed
-  // event map — exactly how the host's own `installSection`/probe wiring reads
-  // service shapes this bundle's typings predate.
-  const eventSink = ctx as unknown as { on: (event: string, listener: () => void) => void }
-  eventSink.on('loader/volatile-update', () => { migrateOwnSettings() })
-  // Every profile recomposition — including each section the legacy import
-  // writes — refreshes this stamp, which is what waitForProfileQuiet reads
-  // before cleaning our row up.
-  eventSink.on('app-boot/config-reload', () => { lastConfigReloadAt = Date.now() })
-
   /** Timers and in-flight work belonging to this plugin instance. */
   let stopped = false
   const timers: NodeJS.Timeout[] = []
@@ -1436,17 +1223,16 @@ export function apply(ctx: Context, config: Config): void {
    * unscheduled, so it falls back to the documented default rather than to
    * "now" or to an instant that never comes.
    */
-  const variantWindowMinute = (variantId: string): number => {
+  const variantWindowMinute = (): number => {
     const cfg = current()
-    const stored = variantId === CHINA_VARIANT.id ? cfg.checkInMinuteCN : cfg.checkInMinuteGlobal
-    return normalizeCheckInMinute(stored ?? DEFAULT_CHECK_IN_MINUTE)
+    return normalizeCheckInMinute(cfg.checkInMinute ?? DEFAULT_CHECK_IN_MINUTE)
   }
 
   const checkInScheduler = new CheckInScheduler({
     targets: runtimes.map(runtime => ({
       variantId: runtime.variant.id,
       checkIn: (signal?: AbortSignal) => runtime.checkIn(signal),
-      minuteOfDay: () => variantWindowMinute(runtime.variant.id),
+      minuteOfDay: () => variantWindowMinute(),
       onClaimed: () => {
         void runtime.client.fetchCredits().catch(() => undefined)
       },
@@ -1587,6 +1373,8 @@ export function apply(ctx: Context, config: Config): void {
       if (overrides !== undefined && runtime.catalog.setModelContextWindows(overrides)) changed = true
       const disabled = isChina ? next.disabledModelsCN : next.disabledModels
       if (runtime.catalog.setDisabledModels(disabled ?? [])) changed = true
+      const variantEnabled = isChina ? next.variantEnabledCN !== false : next.variantEnabledGlobal !== false
+      if (runtime.catalog.setEnabled(variantEnabled)) changed = true
     }
     if (changed) {
       for (const runtime of runtimes) runtime.invalidate()
@@ -1644,7 +1432,7 @@ export function apply(ctx: Context, config: Config): void {
          * minute is the variant's own configured moment, the same one the
          * scheduler fires on, so the two halves cannot drift apart.
          */
-        today: () => getClaimWindowDateString(Date.now(), variantWindowMinute(runtime.variant.id)),
+        today: () => getClaimWindowDateString(Date.now(), variantWindowMinute()),
       })
       registerQoderAuthRoute(webCtx, {
         path: runtime.variant.authPath,
@@ -1724,9 +1512,6 @@ export function apply(ctx: Context, config: Config): void {
             ? { state: 'refreshed', reason: `${runtime.catalog.current().length} models` }
             : { state: 'failed', reason: runtime.catalogError }
         },
-        clearCheckInLogs: () => {
-          checkInStore.clearLogs(runtime.variant.id)
-        },
         checkIn: async () => {
           const result = await runtime.checkIn()
           if (result.status !== 'error') {
@@ -1736,16 +1521,14 @@ export function apply(ctx: Context, config: Config): void {
              * The upstream answers `already-claimed` for every later request on
              * a claimed day, and that answer carries the CLICK clock rather
              * than the grant's, so re-writing the record would restamp the day
-             * with a time the grant never happened at. The store would no
-             * longer mint a ledger row for it (see `JsonFileCheckInStore`), but
-             * the record itself is what the card reads, so the honest move is
-             * to keep the original settlement and report the fresh answer.
+             * with a time the grant never happened at. The honest move is to
+             * keep the original settlement and report the fresh answer.
              */
             // The window this click landed in, from the variant's own
             // configured moment — the same label the scheduler and the card
             // use. Taking `result.date` instead would let a retimed window's
             // record and its guard disagree.
-            const window = getClaimWindowDateString(Date.now(), variantWindowMinute(runtime.variant.id))
+            const window = getClaimWindowDateString(Date.now(), variantWindowMinute())
             const settled = (() => {
               const record = checkInStore.read(runtime.variant.id)
               return record?.lastDate === window

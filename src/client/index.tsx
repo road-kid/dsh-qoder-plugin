@@ -66,11 +66,11 @@ export const inject = ['slots', 'locale', 'remote', 'remote.session']
 /**
  * The profile ROW ID this plugin runs as — the id its own patch declares.
  *
- * `cordis.patch.yml` inserts `- id: llm-qoder-x, name: dsh-qoder-plugin`, so
- * the Plugins page reports this plugin's row as `llm-qoder-x`. The browser half
+ * `cordis.patch.yml` inserts `- id: qoder-plugin, name: dsh-qoder-plugin`, so
+ * the Plugins page reports this plugin's row as `qoder-plugin`. The browser half
  * needs it for exactly one thing: the right half of {@link ROW_CONFIG_KEY}.
  */
-const ENTRY_ID = 'llm-qoder-x'
+const ENTRY_ID = 'qoder-plugin'
 
 /**
  * The two 0.1.7 seats this card registers into, on the Plugins page.

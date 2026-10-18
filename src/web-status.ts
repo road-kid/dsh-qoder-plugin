@@ -77,17 +77,6 @@ export interface QoderStatusRouteOptions {
     /** When today's claimed grant lapses, epoch ms; absent when unreported. */
     expiresAtMs?: number | undefined
     nextRunAt?: number | undefined
-    logs?: readonly {
-      id: string
-      date: string
-      timestamp: number
-      status: 'claimed' | 'already-claimed' | 'no-campaign' | 'error'
-      amount?: number | undefined
-      campaignKey?: string | undefined
-      message?: string | undefined
-      /** This claim's own expiry, epoch ms; absent when unreported. */
-      expiresAtMs?: number | undefined
-    }[] | undefined
   } | undefined
   /**
    * Today's date in UTC+8, `YYYY-MM-DD`.

@@ -247,7 +247,7 @@ afterEach(() => {
     view?.unmount()
   })
   view = null
-  setQuotaReadout(true, true, true)
+  setQuotaReadout(true)
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
@@ -324,43 +324,32 @@ describe('ComposerQuotaChip', () => {
     expect(requestedPaths()).not.toContain(QODER_STATUS_PATH)
   })
 
-  it('gates the chip on the master and per-variant readout switches', async () => {
+  it('gates the chip on the single readout switch', async () => {
     await mount('qoder')
     expect(hostsByClass('qdp-chip')).toHaveLength(1)
 
     act(() => {
-      setQuotaReadout(false, true, true)
+      setQuotaReadout(false)
     })
     expect(view!.toJSON()).toBeNull()
 
     act(() => {
-      setQuotaReadout(true, true, true)
+      setQuotaReadout(true)
     })
     expect(hostsByClass('qdp-chip')).toHaveLength(1)
 
-    act(() => {
-      setQuotaReadout(true, false, true)
-    })
-    expect(view!.toJSON()).toBeNull()
-
-    // The Global switch is irrelevant to a CN model.
-    act(() => {
-      setQuotaReadout(true, true, false)
-    })
-    expect(hostsByClass('qdp-chip')).toHaveLength(1)
-
-    // …but it hides the Global model.
+    // The switch is model-independent: it hides the Global chip too.
     act(() => {
       view!.unmount()
     })
     view = null
     await mount('qoder-global')
-    expect(view!.toJSON()).toBeNull()
+    expect(hostsByClass('qdp-chip')).toHaveLength(1)
 
     act(() => {
-      setQuotaReadout(true, true, true)
+      setQuotaReadout(false)
     })
-    expect(hostsByClass('qdp-chip')).toHaveLength(1)
+    expect(view!.toJSON()).toBeNull()
   })
 
   it('shows the signed-out hint for the active variant when signed out', async () => {

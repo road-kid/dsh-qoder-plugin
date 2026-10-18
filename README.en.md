@@ -24,7 +24,7 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 | Item | Value |
 |---|---|
 | Package name | `dsh-qoder-plugin` |
-| Profile row id | `llm-qoder-x` |
+| Profile row id | `qoder-plugin` |
 | Data directory | `<profile>/.dsh-qoder-plugin/` |
 | HTTP route prefix | `/plugins/dsh-qoder-plugin/*` |
 | CLI command | `dsh-qoder-plugin` |
@@ -38,23 +38,23 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 - **PAT: save it and it works** — paste a PAT into the settings card and press *Save*; the token is validated live against that variant's region before anything is written, and the model group appears immediately — no DSH restart. Once signed in, *Replace PAT* (the new token overwrites only after it validates, so a mistyped paste can never strand a working credential) and *Clear PAT* are one click away.
 - **Two independent variants** — `qoder` (china) and `qoder-global` (global) keep separate credential files, routes and saved catalogs: a token minted on qoder.com does not work against the China deployment and vice versa.
 - **Three-tier model catalog (live → saved → fallback)** — the card states where the list on screen came from: *“Model list updated …”* (fetched now), *“Showing the saved model list from …”* (this account's last successful fetch, restored after a restart or a failed fetch), or *“Showing the built-in model list (not yet updated from Qoder)”* (the roster compiled into the plugin). The reason of the most recent failed fetch is shown too, and a *Refresh model list* button sits right there.
-- **Per-model context window (staged, one save)** — every model row carries a thick solid Qoder-style slider (tick labels under the track; dragging snaps to the windows the model declares — 200K / 400K / 1M). Dragging only edits a local draft — nothing is written per drag tick — and the enable switches plus window changes are committed together by one *Save changes*; a sticky *“N unsaved change(s)”* bar appears while the draft is dirty and *Cancel* restores the saved state. Requests carry the selected window; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent settings.
-- **Model visibility toggles** — the *Models* card lists every model of the selected variant; disabled models are hidden from the DSH model picker, keeping it tidy. Toggles stage locally like the window sliders and are committed by the same *Save changes*.
-- **Daily check-in (automatic + manual)** — 100 Credits are claimable every day. The claim window is **10:00 → 10:00 the next day (UTC+8)**, not a calendar day — the plugin judges "already claimed" strictly by the window: claim at 23:00 and the card still reads *Claimed today* at 00:44, flipping back to *Claim now* only when the next window opens at 10:00. A custom check-in time moves the window boundary with it. Automatic check-in is **off by default** and toggled per variant on the card (its time defaults to 10:00 UTC+8, the moment Qoder resets the campaign); once enabled it also catches up on startup so a missed window is not lost. The *Recent claims* panel lists every credit package you actually hold with its own expiry date — only genuine grants are recorded, and repeat clicks no longer mint phantom rows. **The international variant requires the Qoder desktop app to be installed on this machine**: the international service only serves the daily campaign to requests carrying a client-minted device risk identity, and when none is found the plugin says so plainly instead of falsely reporting "no campaign today". The China variant has no such requirement.
-- **Composer quota readout + credit panel** — a `Qoder · remaining` readout sits in the composer toolbar, and **only while this session uses a Qoder model** (switch to another model and it steps aside rather than occupying shared toolbar space). Clicking it opens a compact panel anchored above the readout: one row for the variant that owns the selected model, with plan tag, *remaining / total*, solid bar, percentage and expiry, a manual refresh and the auto-refresh note. The figures sum what the account really holds (`credits.unlimited` no longer hides real remaining credit). The readout can be hidden, or narrowed to one variant, from *Advanced* — stored as a per-browser preference rather than in the plugin settings file. The old sidebar widget and centre-column quota dashboard are gone; quota lives where it is used. Both share one refresh interval (default 5 min, minimum 1 min).
+- **Per-model context window (staged, one save)** — every model row carries a thick solid Qoder-style slider (tick labels under the track; releasing snaps to the windows the model declares — 200K / 400K / 1M). Dragging is continuous again — nothing quantises under the pointer — and only the release settles on the nearest allowed window. Dragging only edits a local draft — nothing is written per drag tick — and the enable switches plus window changes are committed together by one *Save*; a sticky *“N unsaved change(s)”* bar appears while the draft is dirty and *Cancel* restores the saved state. Requests carry the selected window; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent settings.
+- **Model visibility toggles** — the *Models* card lists every model of the selected variant in Qoder's own order (no re-sorting — it matches the official GUI), with each model's reasoning efforts and the upstream default labelled. Disabled models are hidden from the DSH model picker, keeping it tidy. Toggles stage locally like the window sliders and are committed by the same *Save*.
+- **Daily check-in (automatic + manual)** — 100 Credits are claimable every day. The claim window is **10:00 → 10:00 the next day (UTC+8)**, not a calendar day — the plugin judges "already claimed" strictly by the window: claim at 23:00 and the card still reads *Claimed today* at 00:44, flipping back to *Claim now* only when the next window opens at 10:00. Automatic check-in is **off by default** and lives in *Advanced*; **one** *Check-in time* row drives both the China and the Global scheduler (default 10:00 UTC+8, the moment Qoder resets the campaign, and a custom time moves both window boundaries), and once enabled it also catches up on startup so a missed window is not lost. The account card shows the figures directly — 剩余积分 / 签到状态 / 当前使用 — beside a one-click **一键签到** that claims on both variants. **The international variant requires the Qoder desktop app to be installed on this machine**: the international service only serves the daily campaign to requests carrying a client-minted device risk identity, and when none is found the plugin says so plainly instead of falsely reporting "no campaign today". The China variant has no such requirement.
+- **Composer quota readout + credit panel** — a `Qoder · remaining` readout sits in the composer toolbar, and **only while this session uses a Qoder model** (switch to another model and it steps aside rather than occupying shared toolbar space). Clicking it opens a compact panel anchored above the readout: one row for the variant that owns the selected model, with plan tag, *remaining / total*, solid bar, percentage and expiry, a manual refresh and the auto-refresh note. The figures sum what the account really holds (`credits.unlimited` no longer hides real remaining credit). The readout is toggled by a single *Show credits in the composer* switch at the top of *Advanced* — one switch cannot contradict itself the way a per-variant pair could — and is stored as a per-browser preference rather than in the plugin settings file. The old sidebar widget and centre-column quota dashboard are gone; quota lives where it is used. Both share one refresh interval (default 5 min, minimum 1 min).
 - **Rate display `x<priceFactor>`** — each model name is suffixed with the Qoder-reported price multiplier (in the model picker: `Some Model · x0.79`, free is `x0.0`), spelled `x<n>` from the catalog's `price_factor`. Whole factors are padded to one decimal (`x1.0`) so a zero rate reads as a rate beside its fractional neighbours; fractional factors keep Qoder's own value (`x0.79`, `x1.6`). Display only — it never changes the request; models whose rate Qoder does not report simply show no suffix. The card's own model list spells the same number as `0.5x`; the value is identical, only the layout direction differs.
 
 ---
 
 ## A look at the UI
 
-The settings page is four compact cards: **Account** (sign-in state, plan, credential source, variant switch, replace/clear PAT), **Check-in** (claim today, recent claims ledger, clear log), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Advanced** (daily auto check-in and its time, refresh interval, readout switches). Nothing is collapsed behind tabs, and no card draws its own chrome.
+The settings page is three compact cards: **Account** (sign-in state, plan, the remaining-credit / check-in / current-account strip and 一键签到, the variant switch with its whole-variant checkboxes, credential source, replace/clear PAT), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Advanced** (show credits in the composer, auto check-in, check-in time, refresh interval). Nothing is collapsed behind tabs, and no card draws its own chrome.
 
-The *Check-in* card keeps today's claim, the ledger of grants actually received and the clear-log action together:
+The **China / Global** segmented switch sits at the top of the account card, and the checkbox on each tab enables or disables that whole variant's models; under it the summary strip carries the signed-in account's remaining credit, today's check-in state and the current account, with a *Check in all* button on the right:
 
-![Check-in card](assets/checkin-credits.png)
+![The account card: variant switch, remaining credit and check-in](assets/plugin-page.png)
 
-The *Models* card toggles models row by row and sets each model's context window with a slider; changes stay staged until *Save changes*, and a hidden model disappears from the DSH model picker:
+The *Models* card lists models in Qoder's own order, labels their reasoning efforts, and sets each model's context window with a free-sliding slider that snaps on release; changes stay staged until *Save*, and a hidden model disappears from the DSH model picker:
 
 ![Model toggles and context windows](assets/model-toggles.png)
 
@@ -74,9 +74,9 @@ DSH 0.1.7 gathers every plugin's configuration into the **Plugins page** (0.2.x 
 
 Click it to open the package page; the settings body renders **inline** under the package description — that is this plugin's settings UI:
 
-![Settings cards: four compact cards stacked in the page body](assets/plugin-page.png)
+![Settings cards: three compact cards stacked in the page body](assets/plugin-page.png)
 
-The card draws no disclosure shell of its own (the page supplies the title, the icon and the breadcrumb). Two panes carry everything: **Auto check-in** (account, available credit, the claims ledger, and the claim action) and **Models** (model visibility and context windows). The row's own *Configure* control opens the very same card.
+The card draws no disclosure shell of its own (the page supplies the title, the icon and the breadcrumb), so it renders the configuration body alone: three settings cards stacked top to bottom, nothing collapsed, no second-level tabs. Dark theme, compact sidebar and keyboard focus come from the DSH theme tokens — the plugin ships no palette of its own, and its buttons reuse the host's three official shapes: *Save* is a filled primary button (near-black on the light theme, near-white on the dark one), *Clear PAT* is the outlined danger button the Plugins page uses for uninstall (without the trash glyph, so the two remain distinguishable), and every other action is the borderless white button used across the other plugins.
 
 > **Can't find the settings?** This plugin's card appears on the *Plugins* page only. There is no entry under *Settings* — plugin configuration has lived on the *Plugins* page since DSH 0.1.7.
 
@@ -113,13 +113,11 @@ Swap the `--profile` value for the profile you use (`web` / `desktop` / `tui`) �
 
 > **Upgrading from 0.4.x**: the plugin moved from `dsh-connect-qoder-x` to
 > `dsh-qoder-plugin` (package name, module id, route prefix, data directory and
-> repository all changed; the profile row id stays `llm-qoder-x`, so the
-> provider and existing model selections are unaffected). Re-run the install
-> command above: on first use the old `<profile>/.dsh-connect-qoder-x/` data
-> folder is migrated to `.dsh-qoder-plugin/` (PAT and settings preserved), and
-> the per-browser readout switches migrate to their new localStorage key.
-> Remove the old package from the profile (the plugin manager's Remove action,
-> or `dsh plugin --profile web remove dsh-connect-qoder-x`).
+> repository all changed). **Since 0.6.0 the profile row id also moved, from
+> `llm-qoder-x` to `qoder-plugin`** — after reinstalling, press *Configure* on the
+> row once more; the providers (`qoder` / `qoder-global`) and existing model
+> selections are unaffected, and `<profile>/.dsh-qoder-plugin/` stays where it is.
+> Re-run the install command above.
 
 
 
@@ -127,9 +125,11 @@ Swap the `--profile` value for the profile you use (`web` / `desktop` / `tui`) �
 
 - **Install from GitHub** (above, recommended): the repository ships the built
   `lib/`, so the sources are usable as-is with no build-script permission.
-- **Install from npm**: the package is not on npm yet; once published,
-  `dsh plugin add dsh-qoder-plugin` installs prebuilt code and needs no build
-  permission (see DSH's [publish guide](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)).
+- **Install from npm**: `dsh plugin --profile web add dsh-qoder-plugin` installs
+  prebuilt code and needs no build permission (see DSH's
+  [publish guide](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)).
+  The npm package and the GitHub `v*` tags ship from the same commit, so
+  `pnpm add dsh-qoder-plugin@<version>` pins a specific release.
 - **Why doesn't the market find it by name?** DSH's plugin market searches the
   configured **market indexes** (`index.json`), not the npm registry directly, so
   an npm package that no index lists is still invisible there. To make it
@@ -173,8 +173,8 @@ Everything the plugin owns lives in one data directory: `<profile>/.dsh-qoder-pl
 <profile>/.dsh-qoder-plugin/
 ├── .qoder-auth.json              # China PAT ({version:2, pat, region, savedAt})
 ├── .qoder-global-auth.json       # Global PAT
-├── settings.json                 # refresh interval / check-in time and other own config
-├── checkin-status.json           # check-in state and the claims ledger
+├── settings.json                 # refresh interval / check-in time / per-variant enable, own config
+├── checkin-status.json           # check-in state (claimed today + when), no ledger
 └── state/
     ├── .qoder-catalog.json       # China per-account saved catalog
     ├── .qoder-global-catalog.json
@@ -208,7 +208,7 @@ Since DSH 0.1.7, plugin configuration is carried by `ui-plugin-manager`'s **keye
 
 | Slot | Key | Effect |
 |---|---|---|
-| `plugins.row.config` | `dsh-qoder-plugin#llm-qoder-x` | the row gains a *Configure* control that opens this card |
+| `plugins.row.config` | `dsh-qoder-plugin#qoder-plugin` | the row gains a *Configure* control that opens this card |
 | `plugins.bundle.config` | `dsh-qoder-plugin` | the same card renders inline on the package page |
 
 The row key is `` `${package name}#${row id}` `` — the package name comes from `package.json`, the row id from the `id` this plugin's patch declares. **Spelling both out in full is what keeps that key unique in any profile**, clear of other Qoder plugins.
@@ -231,7 +231,22 @@ pnpm run typecheck  # tsc across the host and client tsconfigs
 pnpm run check      # typecheck + test + test:qoder + build in one gate
 ```
 
-> **Known failures:** the full suite is **469** cases, and every run lands at **462–463 passed / 6–7 failed**. The failures sit in three files: `tests/adapter.spec.ts` (1 — the code and the test expectation contradict each other), `tests/catalog-lifecycle.spec.ts` (1 — module-level state leaks between cases), and `tests/reasoning-merge.spec.ts` (5 — 5-second-timeout flakes that fire after `boot()`, varying between 4 and 5 per run, which is why the passed count swings 462/463). These three files are long-standing baseline failures, not introduced by this version. Separately, `test:qoder` (the node --test Qoder transport suite) is **131/131** green.
+> **Known failures:** the full suite is **496** cases, and every run lands at **488–490 passed / 6–8 failed**. The failures sit in three files: `tests/adapter.spec.ts` (1 — the code and the test expectation contradict each other), `tests/catalog-lifecycle.spec.ts` (1 — module-level state leaks between cases), and `tests/reasoning-merge.spec.ts` (5 — 5-second-timeout flakes that fire after `boot()`, varying between 4 and 6 per run, which is why the failed count swings 6–8). These three files are long-standing baseline failures, not introduced by this version. Separately, `test:qoder` (the node --test Qoder transport suite) is **131/131** green.
+
+### Releasing
+
+The version in `package.json` and the committed `lib/` are the single source of truth; a release is always these four steps:
+
+```sh
+pnpm run check                                       # gate: typecheck + test + test:qoder + build
+npm version <patch|minor|major> --no-git-tag-version
+npm publish --registry https://registry.npmjs.org    # prepack re-runs build; the tarball is the files whitelist
+git tag -a v<version> -m "v<version>" && git push origin main --tags
+```
+
+- If your `.npmrc` points the default registry at a mirror (e.g. `registry.npmmirror.com`), publishing must name `--registry https://registry.npmjs.org` explicitly — mirrors are read-only and cannot be published to.
+- The `prepack` script is pinned to `npm run build`, so publishing from a fresh clone still ships the current `lib/`, matching what the repository commits.
+- Write the CHANGELOG entry first, tag afterwards: every `v*` tag maps 1:1 to an npm version, so a rollback is just a checkout of that tag.
 
 ---
 

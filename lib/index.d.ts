@@ -166,7 +166,7 @@ interface QoderProbeAction {
    * All are writes, which is why they share this route's in-process key
    * and loopback guards rather than the read-only status GET.
    */
-  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'clear-checkin-logs' | 'checkin' | 'set-models-enabled' | 'set-model-context-window';
+  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'checkin' | 'set-models-enabled' | 'set-model-context-window';
   /** Target model id; required for `probe` and `set-model-context-window`. */
   model?: string;
   /** Requested value for `set-maximum-context-window` or `set-models-enabled`. */
@@ -327,17 +327,6 @@ type QoderWebStatus = {
      * which is exactly the doubt a missing timer created.
      */
     nextRunAt?: number | undefined;
-    logs?: readonly {
-      id: string;
-      date: string;
-      timestamp: number;
-      status: 'claimed' | 'already-claimed' | 'no-campaign' | 'error';
-      amount?: number | undefined;
-      campaignKey?: string | undefined;
-      message?: string | undefined;
-      /** This claim's own expiry, epoch ms; absent when unreported. */
-      expiresAtMs?: number | undefined;
-    }[] | undefined;
   };
   /**
    * In-process key authorizing PAT writes, including clearing. Travels with
@@ -595,13 +584,23 @@ declare const FALLBACK_QODER_MODELS: readonly QoderModelInfo[];
 declare class QoderCatalog {
   private models;
   private visible;
+  /**
+   * Master switch for the whole variant (the card's 国内版/国际版 toggle).
+   *
+   * Separate from {@link visible}: `visible` is the CREDENTIAL gate (nobody
+   * signed in ⇒ nothing to serve), while this is the user's deliberate "do not
+   * use this product at all" choice. It gates `current()` — what the provider
+   * serves to the model picker — but NOT `all()`, because the card still has to
+   * list the models so the switch can be turned back on.
+   */
+  private enabled;
   private useMaximumContextWindow;
   /** Per-model window overrides (model id → tokens); an override wins over the preference. */
   private modelContextWindows;
   /** Disabled model IDs (blacklist); disabled models are filtered out from current(). */
   private disabledModels;
   constructor(initial?: readonly QoderModelInfo[]);
-  /** Current entries; empty while the variant has no usable credential, excluding disabled models. */
+  /** Current entries; empty while the variant has no usable credential or is switched off, excluding disabled models. */
   current(): readonly QoderModelInfo[];
   /** All configured entries including disabled ones; empty while the variant has no usable credential. */
   all(): readonly QoderModelInfo[];
@@ -616,6 +615,17 @@ declare class QoderCatalog {
   setVisible(visible: boolean): boolean;
   /** Select the largest declared window where the upstream offers one. */
   setUseMaximumContextWindow(useMaximum: boolean): boolean;
+  /**
+   * Switch this whole variant on or off (the card's per-variant master switch).
+   *
+   * Only {@link current} is gated, never {@link all}: the card must keep listing
+   * the roster so the user can switch the variant back on. Returns whether the
+   * value changed, so the caller can skip an invalidation over an identical
+   * write.
+   */
+  setEnabled(enabled: boolean): boolean;
+  /** Whether this variant is switched on. */
+  isEnabled(): boolean;
   /**
    * Replace the per-model window overrides wholesale. Returns whether the map
    * changed, so the caller can skip an invalidation over an identical write.
@@ -1453,8 +1463,8 @@ declare function processStartTimeMs(pid: number): number | undefined;
 declare function isHeartbeatProcessAlive(heartbeat: QoderHostHeartbeat): boolean;
 //#endregion
 //#region src/index.d.ts
-/** Stable Cordis plugin name. */
-declare const name = "llm-qoder-x";
+/** Stable Cordis plugin name (matches the profile row id in cordis.patch.yml). */
+declare const name = "qoder-plugin";
 /** The model registry required before the provider can register. */
 declare const inject: string[];
 /**
@@ -1482,16 +1492,6 @@ declare const QODER_SETTINGS_NS: SettingsNamespace;
  * installed section whose namespace equals the card's slot key.
  */
 declare const QODER_GLOBAL_SETTINGS_NS: SettingsNamespace;
-/**
- * Settings namespace owning the shared quota-card section.
- *
- * One card above the two variant cards configures both sidebar quota widgets
- * (China and global) from a single place, so its toggles cannot live in
- * either variant's section — they are per-variant fields on a cross-variant
- * card. The Plugins tab dispatches by namespace, so this section is what makes
- * that card render (see {@link QODER_GLOBAL_SETTINGS_NS} for the mechanism).
- */
-declare const QODER_QUOTA_SETTINGS_NS: SettingsNamespace;
 /** Plugin configuration. */
 interface Config {
   /**
@@ -1517,6 +1517,17 @@ interface Config {
   disabledModels?: string[];
   /** Models disabled for the China variant (blacklist). */
   disabledModelsCN?: string[];
+  /**
+   * Master switch for the whole China variant (on by default).
+   *
+   * Off means the provider serves NO China model at all — the model picker
+   * hides the group — while the plugin card keeps listing the roster so the
+   * switch can be turned back on. Distinct from {@link Config.disabledModelsCN},
+   * which is a per-model blacklist.
+   */
+  variantEnabledCN?: boolean;
+  /** The global variant's master switch; see {@link Config.variantEnabledCN}. */
+  variantEnabledGlobal?: boolean;
   /** Show the China variant's sidebar quota card. */
   sidebarQuotaCN?: boolean;
   /** Show the global variant's sidebar quota card. */
@@ -1525,10 +1536,13 @@ interface Config {
   autoCheckInCN?: boolean;
   /** Automatically check in daily at 10:00 (UTC+8) to claim credits for Global variant. */
   autoCheckInGlobal?: boolean;
-  /** When the China variant checks in, as minutes past midnight in UTC+8 (600 = 10:00). */
-  checkInMinuteCN?: number;
-  /** When the Global variant checks in, as minutes past midnight in UTC+8 (600 = 10:00). */
-  checkInMinuteGlobal?: number;
+  /**
+   * When BOTH variants check in, as minutes past midnight in UTC+8 (600 = 10:00).
+   *
+   * One shared setting: the two products' campaigns reset at the same moment,
+   * so the card edits this field alone.
+   */
+  checkInMinute?: number;
   /**
    * Sidebar quota refresh interval in milliseconds. One shared value (both
    * cards poll on it) because the two widgets hit the same rate-limited
@@ -1554,14 +1568,14 @@ declare const Config: z<Config>;
  * One list per section, shared by the merge and by the test that pins it to
  * the schema. Writing the merge out by hand is what broke auto check-in: the
  * `qoder-quota` section grew four fields (`autoCheckInCN`, `autoCheckInGlobal`,
- * `checkInMinuteCN`, `checkInMinuteGlobal`) while the merge kept copying only
- * the three that predated them, so `current().autoCheckInCN` read `undefined`
- * forever and the scheduler saw the toggle as permanently off. The card saved
- * it, the file held it, and nothing ever acted on it.
+ * `checkInMinute`, `quotaPollMs`) while the merge kept copying only the three
+ * that predated them, so `current().autoCheckInCN` read `undefined` forever and
+ * the scheduler saw the toggle as permanently off. The card saved it, the file
+ * held it, and nothing ever acted on it.
  */
-declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindowCN", "modelContextWindowsCN", "disabledModelsCN"];
-declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels"];
-declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinuteCN", "checkInMinuteGlobal", "quotaPollMs"];
+declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindowCN", "modelContextWindowsCN", "disabledModelsCN", "variantEnabledCN"];
+declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels", "variantEnabledGlobal"];
+declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs"];
 /**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their
@@ -1574,4 +1588,4 @@ declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGloba
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_QUOTA_SETTINGS_NS, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, apply, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };
+export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, apply, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };

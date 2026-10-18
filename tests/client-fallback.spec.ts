@@ -30,7 +30,7 @@ import { QODER_PROBE_PATH } from '../src/status-paths.ts'
  * `ENTRY_ID` is the PROFILE ROW ID this bundle's patch inserts — the right half
  * of the `plugins.row.config` key, not a `configForms` namespace.
  */
-const ENTRY_ID = 'llm-qoder-x'
+const ENTRY_ID = 'qoder-plugin'
 const ROW_CONFIG_SLOT = 'plugins.row.config'
 const BUNDLE_CONFIG_SLOT = 'plugins.bundle.config'
 const PACKAGE_NAME = 'dsh-qoder-plugin'
@@ -303,7 +303,7 @@ describe('client card fallback', () => {
     expect(errors).toEqual([])
 
     const row = registerCalls.find(call => call['name'] === ROW_CONFIG_SLOT)
-    expect(row?.['key']).toBe('dsh-qoder-plugin#llm-qoder-x')
+    expect(row?.['key']).toBe('dsh-qoder-plugin#qoder-plugin')
 
     restore()
   })
@@ -380,8 +380,8 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
     // written as one literal, so assert the two halves and their concatenation.
     expect(entrySource).toContain(`const ROW_CONFIG_KEY = \`\${PACKAGE_NAME}#\${ENTRY_ID}\``)
     expect(entrySource).toContain("const PACKAGE_NAME = 'dsh-qoder-plugin'")
-    expect(entrySource).toContain("const ENTRY_ID = 'llm-qoder-x'")
-    expect(mirrorSource).toContain('dsh-qoder-plugin#llm-qoder-x')
+    expect(entrySource).toContain("const ENTRY_ID = 'qoder-plugin'")
+    expect(mirrorSource).toContain('dsh-qoder-plugin#qoder-plugin')
 
     // Seats the plugin must NOT claim any more. Read from the CALL SITES, not
     // the whole file: the entry's comments name the retired slots on purpose.

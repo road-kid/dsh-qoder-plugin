@@ -94,6 +94,16 @@ export const FALLBACK_QODER_MODELS: readonly QoderModelInfo[] = [
 export class QoderCatalog {
   private models: readonly QoderModelInfo[]
   private visible = true
+  /**
+   * Master switch for the whole variant (the card's 国内版/国际版 toggle).
+   *
+   * Separate from {@link visible}: `visible` is the CREDENTIAL gate (nobody
+   * signed in ⇒ nothing to serve), while this is the user's deliberate "do not
+   * use this product at all" choice. It gates `current()` — what the provider
+   * serves to the model picker — but NOT `all()`, because the card still has to
+   * list the models so the switch can be turned back on.
+   */
+  private enabled = true
   private useMaximumContextWindow = false
   /** Per-model window overrides (model id → tokens); an override wins over the preference. */
   private modelContextWindows: Readonly<Record<string, number>> = {}
@@ -104,9 +114,9 @@ export class QoderCatalog {
     this.models = initial
   }
 
-  /** Current entries; empty while the variant has no usable credential, excluding disabled models. */
+  /** Current entries; empty while the variant has no usable credential or is switched off, excluding disabled models. */
   current(): readonly QoderModelInfo[] {
-    if (!this.visible) return []
+    if (!this.visible || !this.enabled) return []
     return this.all().filter(model => !this.disabledModels.has(model.id))
   }
 
@@ -154,6 +164,25 @@ export class QoderCatalog {
     if (this.useMaximumContextWindow === useMaximum) return false
     this.useMaximumContextWindow = useMaximum
     return true
+  }
+
+  /**
+   * Switch this whole variant on or off (the card's per-variant master switch).
+   *
+   * Only {@link current} is gated, never {@link all}: the card must keep listing
+   * the roster so the user can switch the variant back on. Returns whether the
+   * value changed, so the caller can skip an invalidation over an identical
+   * write.
+   */
+  setEnabled(enabled: boolean): boolean {
+    if (this.enabled === enabled) return false
+    this.enabled = enabled
+    return true
+  }
+
+  /** Whether this variant is switched on. */
+  isEnabled(): boolean {
+    return this.enabled
   }
 
   /**

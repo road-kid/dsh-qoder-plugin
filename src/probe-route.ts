@@ -53,8 +53,6 @@ export interface QoderProbeRouteOptions {
   setModelsEnabled?: (options: { models: readonly string[]; enabled: boolean }) => Promise<{ state: string; reason?: string }>
   /** Write one model's context-window override (0 clears it back to default). */
   setModelContextWindow?: (options: { model: string; window: number }) => Promise<{ state: string; reason?: string }>
-  /** Drop every recorded check-in log entry for this variant. */
-  clearCheckInLogs?: () => void
   /**
    * Trigger manual check-in for this variant.
    *
@@ -115,7 +113,6 @@ function parseAction(text: string): QoderProbeAction | undefined {
   const wrapped = parsed as Record<string, unknown>
   const action = wrapped['action']
   if (action === 'clear') return { action: 'clear' }
-  if (action === 'clear-checkin-logs') return { action: 'clear-checkin-logs' }
   if (action === 'checkin') return { action: 'checkin' }
   // No payload: the variant is already known from the route the request arrived
   // on, so the browser cannot ask this route to refresh a different provider.
@@ -188,11 +185,6 @@ export function qoderProbeHandler(
       return
     }
     try {
-      if (action.action === 'clear-checkin-logs') {
-        deps.clearCheckInLogs?.()
-        json(res, 200, { state: 'cleared' })
-        return
-      }
       if (action.action === 'checkin') {
         if (deps.checkIn === undefined) {
           json(res, 404, { error: 'checkin-not-supported' })

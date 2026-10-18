@@ -2,9 +2,9 @@
 # default model. Credentials are Personal Access Tokens (PATs) the user
 # pastes into the plugin's card; no OAuth or device flow is started.
 #
-# The row id is `llm-qoder-x`, NOT the package name: the browser half keys its
-# `plugins.row.config` registration by `<package name>#<row id>`, so this file
-# and the client's ROW_ID constant must agree.
+# The row id is `qoder-plugin`: the browser half keys its `plugins.row.config`
+# registration by `<package name>#<row id>`, so this file and the client's
+# ROW_ID constant must agree.
 - insert:
-    - id: llm-qoder-x
+    - id: qoder-plugin
       name: dsh-qoder-plugin

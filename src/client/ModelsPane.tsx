@@ -51,39 +51,18 @@ export interface ModelsPaneProps {
 }
 
 /*
- * Display order, NOT upstream order.
+ * Display order IS upstream order.
  *
- * The discovery answer arrives in whatever order the upstream lists it, which
- * puts 「Qoder Auto」 in an arbitrary place for the default/auto entry users look
- * for first. The roster is sorted by a deliberate tier (auto/default first,
- * then the strongest tiers, then the cheap ones); anything the upstream adds
- * that this list does not know is kept at the end in upstream order — an
- * unknown entry is still better than a hidden one.
+ * The catalogue arrives in the same order the official Qoder GUI lists models
+ * (the discovery answer preserves it end to end: upstream payload →
+ * `normalizeQoderModels` → catalog store → status document), and that order is
+ * what users match against the official app — Auto first, then the product
+ * families. No local re-sort: any sort here would detach the pane from the GUI
+ * the user is comparing against, and would also reshuffle rows whenever the
+ * upstream introduces a model this file never heard of.
  */
-const MODEL_TIER: readonly string[] = ['auto', 'ultimate', 'performance', 'cmodel', 'efficient', 'lite']
-
-const tierOf = (id: string): number => {
-  const tier = MODEL_TIER.indexOf(id)
-  return tier === -1 ? MODEL_TIER.length : tier
-}
-
-const capabilityOf = (model: QoderCatalogModelSnapshot): number => model.defaultContextWindow ?? model.contextWindow ?? 0
-
 function orderModels(models: readonly QoderCatalogModelSnapshot[] | undefined): QoderCatalogModelSnapshot[] {
-  return [...(models ?? [])].sort((a, b) => {
-    const byTier = tierOf(a.id) - tierOf(b.id)
-    if (byTier !== 0) return byTier
-    /*
-     * The sort key is the DEFAULT window, never the effective one: an override
-     * replaces `contextWindow` outright, so sorting by it would move a row the
-     * moment its own slider changed — the list would "乱动" under the cursor
-     * the user is aiming at. `defaultContextWindow` is the upstream value and
-     * is untouched by overrides.
-     */
-    const byCapability = capabilityOf(b) - capabilityOf(a)
-    // Last resort: the id, so equal rows keep a fixed order across renders.
-    return byCapability !== 0 ? byCapability : a.id.localeCompare(b.id)
-  })
+  return [...(models ?? [])]
 }
 
 /** Current/preferred window from the catalogue; an override already replaced `contextWindow`. */
@@ -113,6 +92,35 @@ function formatTokens(tokens: number): string {
 
 function formatRate(factor: number): string {
   return `${factor.toFixed(1)}x`
+}
+
+/**
+ * The reasoning-effort tag's text, or `undefined` when the model advertises no
+ * selectable efforts.
+ *
+ * Wire ids are translated through the locale (unknown ids fall back to their
+ * raw spelling), and the upstream's default effort is called out so the user
+ * can see which level the model actually runs at until they change it.
+ */
+function effortsTagText(
+  model: QoderCatalogModelSnapshot,
+  t: QoderPluginCardInjected['t'],
+): string | undefined {
+  const efforts = (model.reasoningEfforts ?? []).filter(id => id !== '')
+  if (efforts.length === 0) return undefined
+  const nameOf = (id: string): string =>
+    id === 'low' ? t('effortLow')
+      : id === 'medium' ? t('effortMedium')
+        : id === 'high' ? t('effortHigh')
+          : id === 'xhigh' ? t('effortXhigh')
+            : id === 'max' ? t('effortMax')
+              : id === 'minimal' ? t('effortMinimal')
+                : id
+  const levels = efforts.map(nameOf).join(' · ')
+  const fallback = model.defaultReasoningEffort !== undefined && efforts.includes(model.defaultReasoningEffort)
+    ? `（${t('modelEffortsDefault', { name: nameOf(model.defaultReasoningEffort) })}）`
+    : ''
+  return t('modelEfforts', { levels }) + fallback
 }
 
 /** Round an axis end up to a clean K/M boundary so tick labels stay readable. */
@@ -174,6 +182,8 @@ function modelSignature(list: readonly QoderCatalogModelSnapshot[], disabled: re
       model.defaultContextWindow ?? null,
       model.supportedContextWindows === undefined ? null : [...model.supportedContextWindows],
       model.priceFactor ?? null,
+      model.reasoningEfforts === undefined ? null : [...model.reasoningEfforts],
+      model.defaultReasoningEffort ?? null,
     ]),
     disabled: [...disabled],
   })
@@ -272,6 +282,7 @@ export function ModelsPane({
             const staged = draft.windows[model.id]
             const value = staged ?? baseline
             const current = value === undefined ? undefined : clampWindow(value, minWindow, axisMax)
+            const effortsText = effortsTagText(model, t)
             return (
               <div
                 key={model.id}
@@ -298,17 +309,23 @@ export function ModelsPane({
                       invented when it is unknown (a guessed 1x would claim the
                       model is baseline-priced). */}
                   {model.priceFactor === undefined ? null : <QdpTag>{formatRate(model.priceFactor)}</QdpTag>}
+                  {/* The effort levels the model can reason at, with the
+                      upstream default called out — the same list the official
+                      GUI offers in its model detail view. */}
+                  {effortsText === undefined ? null : <QdpTag>{effortsText}</QdpTag>}
                   <span className="qdp-modelMeta">{model.id}</span>
                 </span>
                 <div className="qdp-modelAxis">
                   {current === undefined ? (
                     <span className="qdp-modelMeta">—</span>
                   ) : (
-                    /* Snap to the sizes the catalogue offers: a drag or key
-                       lands exactly on a declared window instead of a free
-                       number. Without declared windows the 1000-token step is
-                       used. `snapTo` is omitted (not undefined) when the
-                       catalogue does not advertise windows. */
+                    /* Snap to the sizes the catalogue offers when the drag
+                       ENDS: while dragging the handle follows the pointer
+                       freely (stepless), then settles on the nearest declared
+                       window so only an offered size is ever saved. Without
+                       declared windows the 1000-token step is used. `snapTo`
+                       is omitted (not undefined) when the catalogue does not
+                       advertise windows. */
                     <QdpSlider
                       label={t('contextWindowAria')}
                       value={current}
@@ -354,6 +371,7 @@ export function ModelsPane({
             <QdpButton
               data-testid="qdp-models-save"
               variant="primary"
+              size="md"
               disabled={saving}
               onClick={saveDraft}
             >

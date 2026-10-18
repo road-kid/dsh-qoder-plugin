@@ -14,12 +14,13 @@ import { quotaReadout, setQuotaReadout } from '../src/client/quota-settings-stor
 /**
  * Card tests for the compact settings page.
  *
- * The page is four cards (账号 / 签到 / 模型 / 高级设置), and the card owns three
+ * The page is three cards (账号 / 模型 / 高级设置), and the card owns three
  * sensitive write paths: the PAT entry (what it sends and which header
- * authorizes it), the check-in claim, and the models pane's BATCHED save (one
- * refresh for the whole change set, never one per toggle). A signed-out account
- * gets only 账号 + 高级设置 — check-in and model preferences for an account
- * nobody is signed into would be settings that cannot be exercised yet.
+ * authorizes it), the batched 一键签到 claim, and the models pane's BATCHED
+ * save (one refresh for the whole change set, never one per toggle). A
+ * signed-out account gets only 账号 + 高级设置 — model preferences for an
+ * account nobody is signed into would be settings that cannot be exercised
+ * yet.
  */
 
 const t = (key: keyof typeof en, params: Record<string, unknown> = {}): string =>
@@ -120,21 +121,19 @@ describe('Qoder plugin card', () => {
     if (action.action === 'set-models-enabled') return writeReply
     if (action.action === 'set-model-context-window') return writeReply
     if (action.action === 'checkin') return { state: 'claimed', amount: 100 }
-    if (action.action === 'clear-checkin-logs') return { state: 'cleared' }
     return { state: 'ok', validation: 'non-validating', efforts: [] }
   }
 
   afterEach(() => {
     act(() => view?.unmount())
-    // The readout switches are CARD-owned client preferences (the host rejects
-    // the field), so their store is module state shared across tests.
-    setQuotaReadout(true, true, true)
+    // The readout switch is a CARD-owned client preference (the host does not
+    // own the field), so its store is module state shared across tests.
+    setQuotaReadout(true)
     vi.unstubAllGlobals()
   })
 
   interface SettingsSeed {
     autoCheckInCN?: boolean
-    checkInMinuteCN?: number
     quotaPollMs?: number
   }
 
@@ -151,8 +150,6 @@ describe('Qoder plugin card', () => {
         value: {
           autoCheckInCN: false,
           autoCheckInGlobal: false,
-          checkInMinuteCN: 600,
-          checkInMinuteGlobal: 600,
           quotaPollMs: 300_000,
           ...seed,
         },
@@ -163,11 +160,12 @@ describe('Qoder plugin card', () => {
   }
   type SettingsScope = ReturnType<typeof fakeSettingsScope>
 
-  async function mount(variant?: QoderCardVariant, scope?: SettingsScope): Promise<void> {
+  async function mount(variant?: QoderCardVariant, scope?: SettingsScope, unified = false): Promise<void> {
     const props = {
       t,
       ...variant === undefined ? {} : { variant },
       ...scope === undefined ? {} : { scope },
+      ...unified ? { unified: true as const } : {},
     } as unknown as Parameters<typeof QoderPluginCard>[0]
     await act(async () => { view = create(createElement(QoderPluginCard, props)) })
     // The page body is a grid of cards; the owner draws the title/breadcrumb,
@@ -178,8 +176,8 @@ describe('Qoder plugin card', () => {
   }
 
   /** Render the page with a bound settings face (needed for the advanced card). */
-  async function mountWithSettings(scope: SettingsScope, variant?: QoderCardVariant): Promise<void> {
-    await mount(variant, scope)
+  async function mountWithSettings(scope: SettingsScope, variant?: QoderCardVariant, unified = false): Promise<void> {
+    await mount(variant, scope, unified)
   }
 
   const titles = (): string[] => view!.root
@@ -227,12 +225,11 @@ describe('Qoder plugin card', () => {
 
   // ---- page anatomy ---------------------------------------------------------
 
-  it('renders the signed-in page as exactly four cards, in contract order', async () => {
+  it('renders the signed-in page as exactly three cards, in contract order', async () => {
     await mount()
-    expect(sectionCount()).toBe(4)
+    expect(sectionCount()).toBe(3)
     expect(titles()).toEqual([
       en.accountHeading,
-      en.quotaSectionUsage,
       en.paneModels,
       en.quotaSectionAdvanced,
     ])
@@ -250,69 +247,54 @@ describe('Qoder plugin card', () => {
     expect(patInputs()).toHaveLength(1)
   })
 
-  // ---- advanced card: quota-readout switches ---------------------------------
+  // ---- advanced card: readout switch + variant header checkboxes -----------
 
-  it('renders the readout switches default-on even without a signed-in account', async () => {
+  /** The per-variant checkboxes living beside the segmented 版本 tabs. */
+  const variantChecks = () => inputs().filter(node => node.props.className === 'qdp-segCheck')
+
+  it('renders one readout switch and the two variant header checkboxes', async () => {
     signedOut()
-    await mountWithSettings(fakeSettingsScope())
-    // The rows are configuration, not account state: a signed-out page keeps
-    // 账号 + 高级设置, and the readout group still reflects the stored values.
+    // The checkbox pair lives in the unified header's segmented switcher.
+    await mountWithSettings(fakeSettingsScope(), undefined, true)
+    // These rows are configuration, not account state: a signed-out page keeps
+    // 账号 + 高级设置 and still reflects the stored values.
     expect(titles()).toEqual([en.accountHeading, en.quotaSectionAdvanced])
     const tree = rendered()
     expect(tree).toContain(en.quotaReadoutEnabledLabel)
     expect(tree).toContain(en.quotaReadoutEnabledDesc)
-    expect(tree).toContain(en.quotaReadoutCNLabel)
-    expect(tree).toContain(en.quotaReadoutCNDesc)
-    expect(tree).toContain(en.quotaReadoutGlobalLabel)
-    expect(tree).toContain(en.quotaReadoutGlobalDesc)
-    for (const label of [en.quotaReadoutEnabledLabel, en.quotaReadoutCNLabel, en.quotaReadoutGlobalLabel]) {
-      const node = switchFor(label)
-      expect(node).toBeDefined()
-      expect(node!.props['aria-checked']).toBe(true)
-      // The master has no `disabled` attribute at all; the variants carry
-      // `disabled={false}` while it is on.
-      expect(node!.props.disabled).toBeFalsy()
+    // The per-variant readout rows are gone.
+    expect(tree).not.toContain('国内版额度')
+    expect(tree).not.toContain('国际版额度')
+    const readout = switchFor(en.quotaReadoutEnabledLabel)
+    expect(readout).toBeDefined()
+    expect(readout!.props['aria-checked']).toBe(true)
+    expect(readout!.props.disabled).toBeFalsy()
+    // The master switches became checkboxes beside the segmented tabs.
+    expect(variantChecks()).toHaveLength(2)
+    for (const box of variantChecks()) {
+      expect(box.props.checked).toBe(true)
+      expect(box.props.disabled).toBeFalsy()
     }
   })
 
-  it('writes each readout switch to its own field, immediately', async () => {
+  it('writes the readout switch to the client store, not the settings face', async () => {
     signedOut()
     const scope = fakeSettingsScope()
     await mountWithSettings(scope)
-    // Variant switches first: once the master is off they are disabled by
-    // design, exactly like the UI users see.
-    await flip(en.quotaReadoutCNLabel)
-    expect(quotaReadout()).toEqual({ enabled: true, cn: false, global: true })
-    await flip(en.quotaReadoutGlobalLabel)
-    expect(quotaReadout()).toEqual({ enabled: true, cn: false, global: false })
-    // Toggling the master carries the two per-variant values through unchanged.
     await flip(en.quotaReadoutEnabledLabel)
-    expect(quotaReadout()).toEqual({ enabled: false, cn: false, global: false })
-    // This is a CLIENT preference, not a host settings field: nothing may reach
-    // the settings face (the shipped host rejects `quotaReadoutEnabled`).
+    expect(quotaReadout().enabled).toBe(false)
+    // A CLIENT preference: nothing reaches the host settings face.
     expect(scope.set).not.toHaveBeenCalled()
   })
 
-  it('disables both variant readout switches, and drops their writes, under the master', async () => {
-    signedOut()
-    setQuotaReadout(false, true, true)
+  it('writes each variant header checkbox to its own settings field', async () => {
     const scope = fakeSettingsScope()
-    await mountWithSettings(scope)
-    expect(switchFor(en.quotaReadoutEnabledLabel)!.props['aria-checked']).toBe(false)
-    for (const label of [en.quotaReadoutCNLabel, en.quotaReadoutGlobalLabel]) {
-      expect(switchFor(label)!.props.disabled).toBe(true)
-      // A disabled button is still in the tree; a programmatic click must not
-      // write a preference the master switch has hidden.
-      await flip(label)
-    }
-    expect(quotaReadout()).toEqual({ enabled: false, cn: true, global: true })
-    expect(scope.set).not.toHaveBeenCalled()
-    // The master itself stays live: turning it back on re-arms both variants
-    // (and keeps their stored values).
-    await flip(en.quotaReadoutEnabledLabel)
-    expect(quotaReadout()).toEqual({ enabled: true, cn: true, global: true })
-    expect(switchFor(en.quotaReadoutCNLabel)!.props.disabled).toBe(false)
-    expect(switchFor(en.quotaReadoutGlobalLabel)!.props.disabled).toBe(false)
+    await mountWithSettings(scope, undefined, true)
+    const [cnBox, globalBox] = variantChecks()
+    await act(async () => { cnBox!.props.onChange({ target: { checked: false } }) })
+    expect(scope.set).toHaveBeenCalledWith('variantEnabledCN', false)
+    await act(async () => { globalBox!.props.onChange({ target: { checked: false } }) })
+    expect(scope.set).toHaveBeenCalledWith('variantEnabledGlobal', false)
   })
 
   it('keeps the refresh interval an immediate write in the advanced card', async () => {
@@ -456,52 +438,27 @@ describe('Qoder plugin card', () => {
     expect([...intervalHandles.keys()]).toHaveLength(0)
   })
 
-  // ---- check-in card --------------------------------------------------------
+  // ---- account card: the batched 一键签到 ------------------------------------
 
-  it('renders the claim row and the compact ledger, then writes the clear action', async () => {
+  it('posts the batched claim write to its own probe route and reports the outcome', async () => {
     signedIn({
-      checkIn: {
-        lastDate: '2026-10-17',
-        today: '2026-10-18',
-        lastAt: 1_700_000_000_000,
-        status: 'claimed',
-        amount: 100,
-        logs: [
-          { id: 'g1', date: '2026-10-17', timestamp: 1_700_000_000_000, status: 'claimed', amount: 100 },
-          { id: 'g2', date: '2026-10-16', timestamp: 1_699_900_000_000, status: 'claimed', amount: 50 },
-        ],
-      },
+      checkIn: { lastDate: '2026-10-17', today: '2026-10-18', lastAt: 1, status: 'claimed', amount: 100 },
     })
     await mount()
-    const tree = rendered()
-    expect(tree).toContain(t('ledgerCount', { count: 2 }))
-    expect(tree).toContain('+100')
-    // Yesterday's grant does not disable today's claim (the DATE must match).
-    expect(buttonLabels()).toContain(en.checkInNow)
-    await press(en.checkInClear)
-    expect(getBodies('clear-checkin-logs')).toHaveLength(1)
-    const logRows = view!.root.findAll(node => node.props.className === 'qdp-logRow')
-    expect(logRows).toHaveLength(2)
-  })
-
-  it('posts the claim write to its own probe route and reports the outcome', async () => {
-    signedIn({
-      checkIn: { lastDate: '2026-10-17', today: '2026-10-18', lastAt: 1, status: 'claimed', amount: 100, logs: [] },
-    })
-    await mount()
-    await press(en.checkInNow)
+    await press(en.checkInAll)
+    // This standalone card only knows its OWN variant is signed in (the Global
+    // sign-in is reported through the unified page), so one claim is sent.
     expect(getBodies('checkin')).toHaveLength(1)
     expect(posts[0]!.url).toBe(QODER_CN_CARD.probePath)
     expect(rendered()).toContain(t('autoCheckInStatusClaimed', { amount: 100 }))
   })
 
-  it('shows the claimed tag instead of the button when today is already claimed', async () => {
+  it('shows the claimed tag on the account strip when today is already claimed', async () => {
     signedIn({
-      checkIn: { lastDate: '2026-10-18', today: '2026-10-18', lastAt: 1, status: 'already-claimed', amount: 100, logs: [] },
+      checkIn: { lastDate: '2026-10-18', today: '2026-10-18', lastAt: 1, status: 'already-claimed', amount: 100 },
     })
     await mount()
     expect(rendered()).toContain(en.checkInClaimedToday)
-    expect(buttonLabels()).not.toContain(en.checkInNow)
   })
 
   // ---- models card: batched save wiring -------------------------------------

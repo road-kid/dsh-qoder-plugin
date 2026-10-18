@@ -144,7 +144,7 @@ export interface QoderProbeAction {
    * All are writes, which is why they share this route's in-process key
    * and loopback guards rather than the read-only status GET.
    */
-  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'clear-checkin-logs' | 'checkin' | 'set-models-enabled' | 'set-model-context-window'
+  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'checkin' | 'set-models-enabled' | 'set-model-context-window'
   /** Target model id; required for `probe` and `set-model-context-window`. */
   model?: string
   /** Requested value for `set-maximum-context-window` or `set-models-enabled`. */
@@ -311,17 +311,6 @@ export type QoderWebStatus =
        * which is exactly the doubt a missing timer created.
        */
       nextRunAt?: number | undefined
-      logs?: readonly {
-        id: string
-        date: string
-        timestamp: number
-        status: 'claimed' | 'already-claimed' | 'no-campaign' | 'error'
-        amount?: number | undefined
-        campaignKey?: string | undefined
-        message?: string | undefined
-        /** This claim's own expiry, epoch ms; absent when unreported. */
-        expiresAtMs?: number | undefined
-      }[] | undefined
     }
     /**
      * In-process key authorizing PAT writes, including clearing. Travels with

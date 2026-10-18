@@ -31,6 +31,7 @@ import {
 } from './controls.tsx'
 import type { QdpDotState } from './controls.tsx'
 import { ModelsPane, type ModelsDraft } from './ModelsPane.tsx'
+import { creditSummary } from './quota-merge.ts'
 import type { QoderSettingsKey } from './locales.ts'
 import type { QuotaSection, QuotaSettingsScope } from './QuotaSettingsCard.tsx'
 import {
@@ -125,11 +126,6 @@ export type QoderPluginCardProps =
 
 /** Page-level poll period, in milliseconds. */
 const POLL_INTERVAL_MS = 60_000
-/**
- * Manual grants carry no upstream expiry; the campaign's own rule is 30 days
- * from the claim. Kept as one constant so a campaign-rule change is one edit.
- */
-const MANUAL_GRANT_VALIDITY_MS = 30 * 24 * 60 * 60 * 1000
 /** 10:00 UTC+8, the upstream campaign's reset moment (mirrors QuotaSettingsCard). */
 const CHECK_IN_MINUTE_DEFAULT = 600
 /** Default billing-endpoint poll period, in milliseconds (mirrors the settings face). */
@@ -152,11 +148,7 @@ function dotStateOf(status: 'loading' | QoderWebStatus['status']): QdpDotState {
   return 'idle'
 }
 
-/** Date-only formatting for expiries: the day is what a validity window means. */
-function formatDate(ms: number): string {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(ms))
-}
-
+/** Time-of-day formatting for "next run" and credential-saved lines. */
 function formatTime(ms: number): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ms))
 }
@@ -282,13 +274,16 @@ function CheckInTimeRow({ label, value, disabled, onPick }: {
   )
 }
 
-/** One variant's automatic check-in settings, projected from the settings face. */
+/** The advanced-settings rows, projected from the settings face. */
 interface CheckInSettings {
   autoCN: boolean
   autoGlobal: boolean
-  minuteCN: number
-  minuteGlobal: number
+  /** The one shared check-in moment, minutes past midnight UTC+8. */
+  minute: number
   pollMs: number
+  /** The whole-variant master switches (on unless explicitly off). */
+  variantCN: boolean
+  variantGlobal: boolean
   status: 'loading' | 'ready' | 'unavailable'
   writable: boolean
 }
@@ -296,15 +291,16 @@ interface CheckInSettings {
 const UNAVAILABLE_SETTINGS: CheckInSettings = {
   autoCN: false,
   autoGlobal: false,
-  minuteCN: CHECK_IN_MINUTE_DEFAULT,
-  minuteGlobal: CHECK_IN_MINUTE_DEFAULT,
+  minute: CHECK_IN_MINUTE_DEFAULT,
   pollMs: POLL_DEFAULT_MS,
+  variantCN: true,
+  variantGlobal: true,
   status: 'unavailable',
   writable: false,
 }
 
 /**
- * Read the check-in half of the settings face as a STABLE STRING.
+ * Read the advanced-settings half of the settings face as a STABLE STRING.
  *
  * `useSyncExternalStore`'s getSnapshot must return the same reference between
  * renders unless the store changed. The face's value is a fresh object per
@@ -312,9 +308,9 @@ const UNAVAILABLE_SETTINGS: CheckInSettings = {
  * (React #185); the JSON string below is stable by construction, and is parsed
  * back into the fields the card actually renders.
  *
- * The readout switches are deliberately NOT projected here: they are a
- * client-side preference (the shipped host's settings face rejects the field),
- * so they live in the shared store and are read directly by the advanced card.
+ * The readout switch is deliberately NOT projected here: it is a client-side
+ * preference (the shipped host's settings face does not own it), so it lives in
+ * the shared store and is read directly by the advanced card.
  */
 function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): string {
   if (scope === undefined) return 'unavailable'
@@ -323,11 +319,12 @@ function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): str
   return JSON.stringify([
     value.autoCheckInCN === true,
     value.autoCheckInGlobal === true,
-    typeof value.checkInMinuteCN === 'number' ? value.checkInMinuteCN : CHECK_IN_MINUTE_DEFAULT,
-    typeof value.checkInMinuteGlobal === 'number' ? value.checkInMinuteGlobal : CHECK_IN_MINUTE_DEFAULT,
+    typeof value.checkInMinute === 'number' ? value.checkInMinute : CHECK_IN_MINUTE_DEFAULT,
     snapshot.status,
     snapshot.writable,
     typeof value.quotaPollMs === 'number' ? value.quotaPollMs : POLL_DEFAULT_MS,
+    value.variantEnabledCN !== false,
+    value.variantEnabledGlobal !== false,
   ])
 }
 
@@ -338,18 +335,18 @@ function parseSettingsKey(raw: string): CheckInSettings {
     if (!Array.isArray(parsed) || parsed.length < 6) return UNAVAILABLE_SETTINGS
     const autoCN = parsed[0] === true
     const autoGlobal = parsed[1] === true
-    const minuteCN = typeof parsed[2] === 'number' ? parsed[2] : CHECK_IN_MINUTE_DEFAULT
-    const minuteGlobal = typeof parsed[3] === 'number' ? parsed[3] : CHECK_IN_MINUTE_DEFAULT
-    const status = parsed[4] === 'ready' || parsed[4] === 'loading' ? parsed[4] : 'unavailable'
-    const pollMs = typeof parsed[6] === 'number' ? parsed[6] : POLL_DEFAULT_MS
+    const minute = typeof parsed[2] === 'number' ? parsed[2] : CHECK_IN_MINUTE_DEFAULT
+    const status = parsed[3] === 'ready' || parsed[3] === 'loading' ? parsed[3] : 'unavailable'
+    const pollMs = typeof parsed[5] === 'number' ? parsed[5] : POLL_DEFAULT_MS
     return {
       autoCN,
       autoGlobal,
-      minuteCN,
-      minuteGlobal,
+      minute,
       pollMs,
+      variantCN: parsed[6] !== false,
+      variantGlobal: parsed[7] !== false,
       status,
-      writable: parsed[5] === true,
+      writable: parsed[4] === true,
     }
   } catch {
     return UNAVAILABLE_SETTINGS
@@ -357,22 +354,22 @@ function parseSettingsKey(raw: string): CheckInSettings {
 }
 
 /**
- * Render the Qoder account, check-in, model and advanced-settings sections as
- * the Plugins page's configuration page (or its one-liner, when the owner asks
+ * Render the Qoder account, model and advanced-settings sections as the
+ * Plugins page's configuration page (or its one-liner, when the owner asks
  * for `summary`).
  *
  * On `page` this component renders the configuration BODY only: the Plugins
  * page draws the breadcrumb, icon, title, version and description, so no shell
- * chrome or second title lives here. The page is a grid of four cards:
+ * chrome or second title lives here. The page is a grid of three cards:
  *
- * 1. 账号 — variant switcher, one compact status row, credential row, PAT entry
- * 2. 签到 — today's claim row + recent-grants row + a capped ledger list
- * 3. 模型 — catalogue provenance + refresh, then the models pane body
- * 4. 高级设置 — auto check-in, its UTC+8 time, quota-readout switches, poll interval
+ * 1. 账号 — variant switcher (with per-variant enable checkboxes), status row,
+ *    account summary strip, credential row, PAT entry
+ * 2. 模型 — catalogue provenance + refresh, then the models pane body
+ * 3. 高级设置 — quota-readout switch, auto check-in + its UTC+8 time, poll interval
  *
  * A signed-out account renders 账号 (with the PAT entry) and 高级设置 only:
- * check-in and model preferences for an account nobody is signed into would be
- * settings the user cannot exercise yet.
+ * model preferences for an account nobody is signed into would be settings the
+ * user cannot exercise yet.
  */
 /** 14px stroke refresh glyph, so the icon-button matches the host's icon set. */
 function RefreshGlyph(): ReactNode {
@@ -425,7 +422,6 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const [patError, setPatError] = useState<string>()
   const [patNotice, setPatNotice] = useState<string>()
   const [checkingIn, setCheckingIn] = useState(false)
-  const [clearingLogs, setClearingLogs] = useState(false)
   const [checkInNotice, setCheckInNotice] = useState<string>()
   /** 「删除 PAT」的内联确认：点一次进入确认，再点一次才真正清除。 */
   const [confirmingClear, setConfirmingClear] = useState(false)
@@ -547,7 +543,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
      * The route answers HTTP 200 for a failed refresh and puts the failure in
      * `{state:'failed', reason}` — checking `response.ok` alone would treat
      * every failure as a success: no throw, no message, just the old model list
-     * still on screen. The body is parsed the same way `manualCheckIn` parses
+     * still on screen. The body is parsed the same way `manualCheckInAll` parses
      * it, so both manual actions report their outcome consistently.
      */
     let result: { state?: string; reason?: string } | undefined
@@ -590,44 +586,61 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     }
   }, [currentVariant.probePath, refresh, status, t, trackController])
 
-  const manualCheckIn = useCallback(async (): Promise<void> => {
-    const key = status?.status === 'signed-in' ? status.probeKey : undefined
+  /**
+   * 「一键签到」: claim today's benefit for EVERY signed-in variant in one click.
+   *
+   * The probe key is process-wide (one key authorizes both variants' routes),
+   * so the card can drive the other variant's route without a second read. A
+   * variant that is not signed in is skipped rather than attempted: its route
+   * would only answer with a credential error the user cannot act on from here.
+   *
+   * One failure must not abort the other claim: each target is wrapped
+   * separately and its own sentence is appended, so a China failure still lets
+   * Global claim (and vice versa).
+   */
+  const manualCheckInAll = useCallback(async (): Promise<void> => {
+    const document = status?.status === 'signed-in' ? status : undefined
+    const key = document?.probeKey
     if (key === undefined) return
     setCheckingIn(true)
     setCheckInNotice(undefined)
     const controller = trackController()
+    const sentences: string[] = []
     try {
-      const response = await fetch(currentVariant.probePath, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Qoder-Probe-Key': key },
-        credentials: 'same-origin',
-        signal: controller.signal,
-        body: JSON.stringify({ action: 'checkin' } satisfies QoderProbeAction),
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const result = await response.json() as { state?: string; amount?: number; reason?: string; reasonCode?: string }
-      if (result.state === 'claimed') {
-        setCheckInNotice(t('autoCheckInStatusClaimed', { amount: result.amount ?? 100 }))
-      } else if (result.state === 'already-claimed') {
-        setCheckInNotice(t('autoCheckInStatusAlready'))
-      } else if (result.state === 'no-campaign') {
-        setCheckInNotice(t('autoCheckInStatusNoCampaign'))
-      } else if (result.reasonCode === 'no-client') {
-        /*
-         * The one failure the user can fix, so it gets its own sentence
-         * instead of the generic "error: <English prose>" line. The
-         * international campaign is only served to requests carrying an
-         * identity minted by an installed Qoder client, so its absence is a
-         * missing dependency, not a broken account.
-         */
-        setCheckInNotice(t('checkInNeedsClient'))
-      } else if (result.reason) {
-        setCheckInNotice(t('autoCheckInStatusError', { message: result.reason }))
+      for (const variant of QODER_CARD_VARIANTS) {
+        const isCurrent = variant.id === currentVariant.id
+        const signedIn = isCurrent || (variant.id === 'qoder' ? liveSignIn.cn : liveSignIn.global)
+        if (!signedIn) continue
+        const name = t(variant.id === 'qoder' ? 'variantTabCN' : 'variantTabGlobal')
+        try {
+          const response = await fetch(variant.probePath, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Qoder-Probe-Key': key },
+            credentials: 'same-origin',
+            signal: controller.signal,
+            body: JSON.stringify({ action: 'checkin' } satisfies QoderProbeAction),
+          })
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          const result = await response.json() as { state?: string; amount?: number; reason?: string; reasonCode?: string }
+          const text = result.state === 'claimed'
+            ? t('autoCheckInStatusClaimed', { amount: result.amount ?? 100 })
+            : result.state === 'already-claimed'
+              ? t('autoCheckInStatusAlready')
+              : result.state === 'no-campaign'
+                ? t('autoCheckInStatusNoCampaign')
+                : result.reasonCode === 'no-client'
+                  ? t('checkInNeedsClient')
+                  : result.reason === undefined
+                    ? undefined
+                    : t('autoCheckInStatusError', { message: result.reason })
+          if (text !== undefined) sentences.push(`${name} · ${text}`)
+        } catch (error: unknown) {
+          if (controller.signal.aborted === true) return
+          const message = error instanceof Error ? error.message : t('requestFailed')
+          sentences.push(`${name} · ${message}`)
+        }
       }
-    } catch (error: unknown) {
-      if (mounted.current && controller.signal.aborted !== true) {
-        setCheckInNotice(error instanceof Error ? error.message : t('requestFailed'))
-      }
+      if (mounted.current && sentences.length > 0) setCheckInNotice(sentences.join('；'))
     } finally {
       manualControllers.current.delete(controller)
       if (mounted.current) setCheckingIn(false)
@@ -637,37 +650,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     } finally {
       manualControllers.current.delete(controller)
     }
-  }, [currentVariant.probePath, refresh, status, t, trackController])
-
-  const clearCheckInLogs = useCallback(async (): Promise<void> => {
-    const key = status?.status === 'signed-in' ? status.probeKey : undefined
-    if (key === undefined) return
-    setClearingLogs(true)
-    setCheckInNotice(undefined)
-    const controller = trackController()
-    try {
-      const response = await fetch(currentVariant.probePath, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Qoder-Probe-Key': key },
-        credentials: 'same-origin',
-        signal: controller.signal,
-        body: JSON.stringify({ action: 'clear-checkin-logs' } satisfies QoderProbeAction),
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    } catch (error: unknown) {
-      if (mounted.current && controller.signal.aborted !== true) {
-        setCheckInNotice(error instanceof Error ? error.message : t('requestFailed'))
-      }
-    } finally {
-      manualControllers.current.delete(controller)
-      if (mounted.current) setClearingLogs(false)
-    }
-    try {
-      await refresh(controller.signal)
-    } finally {
-      manualControllers.current.delete(controller)
-    }
-  }, [currentVariant.probePath, refresh, status, t, trackController])
+  }, [currentVariant.id, liveSignIn, refresh, status, t, trackController])
 
   /**
    * One probe-route write, WITHOUT a status re-read.
@@ -940,15 +923,22 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
 
   // Per-variant state dots for the segmented switcher: the variant being read
   // shows the live document state, the other one its last known sign-in state.
+  // A variant switched OFF (its checkbox unchecked) is grey regardless of its
+  // account: the switcher describes what is offered, and a disabled variant
+  // offers nothing — signed in or not.
   const reported = signedIn?.()
   const cnSignedIn = reported !== undefined ? reported.cn : liveSignIn.cn
   const globalSignedIn = reported !== undefined ? reported.global : liveSignIn.global
-  const cnDotState = dotStateOf(isUnified && activeVariantId === 'qoder'
-    ? (status === undefined ? 'loading' : status.status)
-    : (cnSignedIn ? 'signed-in' : 'signed-out'))
-  const globalDotState = dotStateOf(isUnified && activeVariantId === 'qoder-global'
-    ? (status === undefined ? 'loading' : status.status)
-    : (globalSignedIn ? 'signed-in' : 'signed-out'))
+  const cnDotState = settings.variantCN === false
+    ? 'idle'
+    : dotStateOf(isUnified && activeVariantId === 'qoder'
+      ? (status === undefined ? 'loading' : status.status)
+      : (cnSignedIn ? 'signed-in' : 'signed-out'))
+  const globalDotState = settings.variantGlobal === false
+    ? 'idle'
+    : dotStateOf(isUnified && activeVariantId === 'qoder-global'
+      ? (status === undefined ? 'loading' : status.status)
+      : (globalSignedIn ? 'signed-in' : 'signed-out'))
   const planTag = status?.status === 'signed-in' && status.plan !== undefined
     ? t('planTier', { name: status.plan.planTierName })
     : undefined
@@ -973,11 +963,12 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const settingsSignedIn = reported !== undefined
     ? Boolean(reported[settingsVariant])
     : Boolean(liveSignIn[settingsVariant])
+  /** Whether EITHER account is signed in — the shared check-in time needs one. */
+  const anySignedIn = Boolean(cnSignedIn || globalSignedIn)
   const autoCheckInOn = settingsVariant === 'cn' ? settings.autoCN : settings.autoGlobal
-  const checkInMinute = settingsVariant === 'cn' ? settings.minuteCN : settings.minuteGlobal
+  /** One moment for both variants: the card edits a single shared setting. */
+  const checkInMinute = settings.minute
   const readoutEnabled = readout.enabled
-  const readoutCN = readout.cn
-  const readoutGlobal = readout.global
   const pollMinutes = Math.max(1, Math.round(settings.pollMs / 60_000))
   /**
    * One write path for every advanced-card control: the local settings face is
@@ -997,85 +988,79 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     if (!settingsSignedIn) return
     writeSetting(settingsVariant === 'cn' ? 'autoCheckInCN' : 'autoCheckInGlobal', next)
   }
+  /**
+   * The ONE check-in time.
+   *
+   * The shared field is the value the host's scheduler reads first, so writing
+   * it alone retimes both variants. The legacy per-variant fields are cleared
+   * (null) so a stale value can never outrank the shared one on an older
+   * settings face that keeps them.
+   */
   const writeCheckInMinute = (minutes: number): void => {
-    if (!settingsSignedIn) return
-    writeSetting(settingsVariant === 'cn' ? 'checkInMinuteCN' : 'checkInMinuteGlobal', minutes)
+    if (!anySignedIn) return
+    writeSetting('checkInMinute', minutes)
   }
   /**
-   * The three readout switches are NOT gated on sign-in: they describe what the
-   * composer chip should show, and a user configuring the plugin before signing
-   * in must still be able to hide a variant they never signed into. Only the
-   * master switch gates the two variant switches.
+   * The readout switch is NOT gated on sign-in: it describes what the composer
+   * chip should show, and a user configuring the plugin before signing in must
+   * still be able to hide it.
    *
-   * They write the shared STORE, not the settings scope: the shipped host's
-   * settings face rejects `quotaReadoutEnabled` (HTTP 400 unknown field), and a
-   * host restart is not available. `setQuotaReadout` bumps the store's revision
-   * synchronously, so the card re-renders from the store; the master toggle
-   * carries the two per-variant values through unchanged.
+   * It writes the shared STORE, not the settings scope: the shipped host does
+   * not own this preference, and a browser preference must work against any
+   * loaded host version. `setQuotaReadout` bumps the store's revision
+   * synchronously, so the card re-renders from it.
    */
   const writeReadoutEnabled = (next: boolean): void => {
-    setQuotaReadout(next, readout.cn, readout.global)
+    setQuotaReadout(next)
   }
-  const writeReadoutCN = (next: boolean): void => {
-    // The switch carries `disabled` while the master is off; this guard makes a
-    // programmatic click (tests, assistive tech) obey the same rule.
-    if (!readout.enabled) return
-    setQuotaReadout(readout.enabled, next, readout.global)
-  }
-  const writeReadoutGlobal = (next: boolean): void => {
-    if (!readout.enabled) return
-    setQuotaReadout(readout.enabled, readout.cn, next)
+  /**
+   * The per-variant master checkboxes beside the switcher tabs. They gate the
+   * PROVIDER (no model of that variant is offered) without touching the
+   * per-model blacklist, so flipping one back on restores exactly the previous
+   * model selection.
+   */
+  const writeVariantEnabled = (variant: 'cn' | 'global', next: boolean): void => {
+    writeSetting(variant === 'cn' ? 'variantEnabledCN' : 'variantEnabledGlobal', next)
   }
   const writePollMinutes = (minutes: number): void => {
     writeSetting('quotaPollMs', Math.max(POLL_MIN_MS, minutes * 60_000))
   }
 
-  // ── check-in card data ────────────────────────────────────────────────
+  // ── check-in strip data ───────────────────────────────────────────────
   const checkIn = signedInDoc?.checkIn
-  const now = Date.now()
   /**
    * Today's benefit is already in — whether this process granted it or merely
    * found the upstream reporting it as claimed.
    *
    * `already-claimed` must count: the upstream answers that way for every later
    * request on a claimed day, so treating only `claimed` as "done" re-armed the
-   * button and invited the repeat click that appended a phantom ledger row. The
-   * DATE must count too — `checkIn` is the persisted record, not a live reading,
-   * and `today` is stamped host-side in UTC+8 (the day the scheduler uses), so a
-   * `claimed` row from three days ago no longer disables today's button.
+   * button and invited the repeat click. The DATE must count too — `checkIn` is
+   * the persisted record, not a live reading, and `today` is stamped host-side
+   * in UTC+8 (the day the scheduler uses), so a `claimed` row from three days
+   * ago no longer disables today's button.
    */
   const claimedToday = checkIn !== undefined
     && checkIn.lastDate === checkIn.today
     && (checkIn.status === 'claimed' || checkIn.status === 'already-claimed')
-  const effectiveExpiryOf = (entry: { timestamp: number; expiresAtMs?: number | undefined }): number =>
-    entry.expiresAtMs ?? entry.timestamp + MANUAL_GRANT_VALIDITY_MS
-  /*
-   * Only grants that actually landed are listed. `already-claimed` is an
-   * observation that the upstream had already granted today, not a grant: its
-   * timestamp is that request's clock, not a payout moment (the upstream does
-   * not report one), so counting it would invent a grant that never happened.
-   */
-  const claimedLogs = (checkIn?.logs ?? [])
-    .filter(entry => entry.status === 'claimed')
-    .sort((a, b) => b.timestamp - a.timestamp)
-  const latestLog = claimedLogs[0]
-  const latestExpiry = latestLog === undefined ? undefined : effectiveExpiryOf(latestLog)
-  const ledgerExpiryText = latestLog === undefined
-    ? t('ledgerEmpty')
-    : latestExpiry === undefined
-      ? ''
-      : latestExpiry <= now
-        ? t('ledgerExpired')
-        : t('ledgerExpiresAt', { date: formatDate(latestExpiry) })
-  const ledgerSummary = claimedLogs.length === 0
-    ? t('ledgerEmpty')
-    : `${t('ledgerCount', { count: claimedLogs.length })} · ${ledgerExpiryText}`
-  const nextRunCaption = autoCheckInOn && checkIn?.nextRunAt !== undefined
-    ? t('checkInNextRun', { time: formatTime(checkIn.nextRunAt) })
-    : undefined
   const catalogCaption = signedInDoc === undefined ? undefined : catalogCaptionOf(signedInDoc.catalog, t)
 
   // ── account card data ─────────────────────────────────────────────────
+  /**
+   * The account summary strip (剩余积分 / 签到状态 / 当前使用 / 一键签到).
+   *
+   * The remaining figure follows the SAME rule as the composer chip — summed
+   * package remainder, "Unlimited" only when nothing is countable — because a
+   * second currency rule on the same document is a bug waiting to happen.
+   */
+  const creditsText = signedInDoc?.credits === undefined
+    ? '—'
+    : (() => {
+      const summary = creditSummary(signedInDoc.credits)
+      return summary.unlimited
+        ? t('quotaUnlimited')
+        : new Intl.NumberFormat(undefined).format(summary.remain)
+    })()
+  const accountName = signedInDoc?.pat?.accountName
   const credentialMeta = signedInDoc?.pat === undefined
     ? undefined
     : [
@@ -1105,6 +1090,18 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                       <span>{t('variantTabCN')}</span>
                     </>
                   ),
+                  trailing: (
+                    <input
+                      type="checkbox"
+                      className="qdp-segCheck"
+                      checked={settings.variantCN}
+                      disabled={settings.status === 'unavailable'}
+                      aria-label={`${t('variantTabCN')} — ${t('variantEnable')}`}
+                      title={t('variantEnable')}
+                      onClick={event => { event.stopPropagation() }}
+                      onChange={event => { writeVariantEnabled('cn', event.target.checked) }}
+                    />
+                  ),
                 },
                 {
                   value: 'qoder-global',
@@ -1113,6 +1110,18 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                       <QdpStateDot state={globalDotState} />
                       <span>{t('variantTabGlobal')}</span>
                     </>
+                  ),
+                  trailing: (
+                    <input
+                      type="checkbox"
+                      className="qdp-segCheck"
+                      checked={settings.variantGlobal}
+                      disabled={settings.status === 'unavailable'}
+                      aria-label={`${t('variantTabGlobal')} — ${t('variantEnable')}`}
+                      title={t('variantEnable')}
+                      onClick={event => { event.stopPropagation() }}
+                      onChange={event => { writeVariantEnabled('global', event.target.checked) }}
+                    />
                   ),
                 },
               ]}
@@ -1138,6 +1147,37 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               {planMeta === undefined || planMeta === '' ? null : <span className="qdp-rowDesc">{planMeta}</span>}
             </div>
           </div>
+          {signedInDoc === undefined ? null : (
+            <div className="qdp-accountSummary">
+              <div className="qdp-accountStat">
+                <span className="qdp-accountStatLabel">{t('creditsRemaining')}</span>
+                <span className="qdp-accountStatValue qdp-num">{creditsText}</span>
+              </div>
+              <div className="qdp-accountStat">
+                <span className="qdp-accountStatLabel">{t('checkInStatus')}</span>
+                <span className="qdp-accountStatValue">
+                  {claimedToday
+                    ? <QdpTag tone="success">{t('checkInClaimedToday')}</QdpTag>
+                    : <span>{t('checkInNotClaimed')}</span>}
+                </span>
+              </div>
+              <div className="qdp-accountStat">
+                <span className="qdp-accountStatLabel">{t('accountCurrent')}</span>
+                <span className="qdp-accountStatValue">{accountName ?? t('signedIn')}</span>
+              </div>
+              <div className="qdp-accountActions">
+                <QdpButton
+                  variant="primary"
+                  size="sm"
+                  disabled={busy || checkingIn || !anySignedIn}
+                  onClick={() => { void manualCheckInAll() }}
+                >
+                  {checkingIn ? t('checkInChecking') : t('checkInAll')}
+                </QdpButton>
+              </div>
+            </div>
+          )}
+          {checkInNotice === undefined ? null : <p className="qdp-body">{checkInNotice}</p>}
           {signedInDoc?.pat === undefined || replacing ? null : (
             <div className="qdp-row">
               <div className="qdp-rowText">
@@ -1145,7 +1185,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                 {credentialMeta === undefined ? null : <span className="qdp-rowDesc">{credentialMeta}</span>}
               </div>
               <div className="qdp-rowControl">
-                <QdpButton variant="ghost" size="sm" disabled={busy || patBusy} onClick={() => { setReplacing(true) }}>
+                <QdpButton variant="outline" size="sm" disabled={busy || patBusy} onClick={() => { setReplacing(true) }}>
                   {t('patReplace')}
                 </QdpButton>
                 <QdpButton
@@ -1197,81 +1237,14 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
         </div>
       </section>
 
-      {/* ── 2. 签到: today's claim, recent grants, capped ledger list ── */}
-      {signedInDoc === undefined ? null : (
-        <section className="qdp-card">
-          <div className="qdp-sectionHead">
-            <h2 className="qdp-sectionTitle">{t('quotaSectionUsage')}</h2>
-          </div>
-          <div className="qdp-sectionBody">
-            <div className="qdp-row">
-              <div className="qdp-rowText">
-                <span className="qdp-rowTitle">
-                  <QdpStateDot state={claimedToday ? 'done' : 'idle'} />
-                  <span>{t('checkInTodayTitle')}</span>
-                </span>
-                {nextRunCaption === undefined ? null : <span className="qdp-rowDesc">{nextRunCaption}</span>}
-              </div>
-              <div className="qdp-rowControl">
-                {claimedToday ? (
-                  <QdpTag tone="success">{t('checkInClaimedToday')}</QdpTag>
-                ) : (
-                  <QdpButton
-                    variant="primary"
-                    disabled={busy || checkingIn}
-                    onClick={() => { void manualCheckIn() }}
-                  >
-                    {checkingIn ? t('checkInChecking') : t('checkInNow')}
-                  </QdpButton>
-                )}
-              </div>
-            </div>
-            <div className="qdp-row">
-              <div className="qdp-rowText">
-                <span className="qdp-rowTitle">{t('ledgerHeading')}</span>
-                <span className="qdp-rowDesc">{ledgerSummary}</span>
-              </div>
-              <div className="qdp-rowControl">
-                <QdpButton
-                  variant="ghost"
-                  size="sm"
-                  disabled={clearingLogs || claimedLogs.length === 0}
-                  onClick={() => { void clearCheckInLogs() }}
-                >
-                  {clearingLogs ? t('checkInClearing') : t('checkInClear')}
-                </QdpButton>
-              </div>
-            </div>
-            {claimedLogs.length === 0 ? null : (
-              <div className="qdp-logList">
-                {claimedLogs.map(entry => {
-                  const expiry = effectiveExpiryOf(entry)
-                  const expired = expiry <= now
-                  return (
-                    <div key={entry.id} className="qdp-logRow">
-                      <span className="qdp-muted">{formatTime(entry.timestamp)}</span>
-                      <span className="qdp-num">{entry.amount === undefined ? '—' : `+${String(entry.amount)}`}</span>
-                      <span className={expired ? 'qdp-error' : 'qdp-caption'}>
-                        {expired ? t('ledgerExpired') : t('ledgerExpiresAt', { date: formatDate(expiry) })}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-            {checkInNotice === undefined ? null : <p className="qdp-body">{checkInNotice}</p>}
-          </div>
-        </section>
-      )}
-
-      {/* ── 3. 模型: provenance + refresh in the head, the pane body below ── */}
+      {/* ── 2. 模型: provenance + refresh in the head, the pane body below ── */}
       {signedInDoc === undefined ? null : (
         <section className="qdp-card">
           <div className="qdp-sectionHead">
             <h2 className="qdp-sectionTitle">{t('paneModels')}</h2>
             {catalogCaption === undefined ? null : <span className="qdp-caption">{catalogCaption}</span>}
             <QdpButton
-              variant="ghost"
+              variant="outline"
               size="sm"
               disabled={busy}
               onClick={() => { void refreshModels() }}
@@ -1298,12 +1271,25 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
         </section>
       )}
 
-      {/* ── 4. 高级设置: auto check-in + time, readout switches, poll interval ── */}
+      {/* ── 3. 高级设置: readout switch, auto check-in + its shared time, poll ── */}
       <section className="qdp-card">
         <div className="qdp-sectionHead">
           <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
         </div>
         <div className="qdp-sectionBody">
+          <div className="qdp-row">
+            <div className="qdp-rowText">
+              <span className="qdp-rowTitle">{t('quotaReadoutEnabledLabel')}</span>
+              <span className="qdp-rowDesc">{t('quotaReadoutEnabledDesc')}</span>
+            </div>
+            <div className="qdp-rowControl">
+              <QdpSwitch
+                checked={readoutEnabled}
+                label={t('quotaReadoutEnabledLabel')}
+                onChange={writeReadoutEnabled}
+              />
+            </div>
+          </div>
           <div className="qdp-row">
             <div className="qdp-rowText">
               <span className="qdp-rowTitle">{t('paneUsage')}</span>
@@ -1324,58 +1310,15 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
           </div>
           <div className="qdp-row">
             <div className="qdp-rowText">
-              <span className="qdp-rowTitle">
-                {settingsVariant === 'cn' ? t('checkInTimeCN') : t('checkInTimeGlobal')}
-              </span>
+              <span className="qdp-rowTitle">{t('checkInTime')}</span>
               <span className="qdp-rowDesc">{t('checkInTimeHint')}</span>
             </div>
             <div className="qdp-rowControl">
               <CheckInTimeRow
-                label={settingsVariant === 'cn' ? t('checkInTimeCN') : t('checkInTimeGlobal')}
+                label={t('checkInTime')}
                 value={checkInMinute}
-                disabled={!settingsSignedIn || !autoCheckInOn}
+                disabled={!anySignedIn}
                 onPick={writeCheckInMinute}
-              />
-            </div>
-          </div>
-          <div className="qdp-row">
-            <div className="qdp-rowText">
-              <span className="qdp-rowTitle">{t('quotaReadoutEnabledLabel')}</span>
-              <span className="qdp-rowDesc">{t('quotaReadoutEnabledDesc')}</span>
-            </div>
-            <div className="qdp-rowControl">
-              <QdpSwitch
-                checked={readoutEnabled}
-                label={t('quotaReadoutEnabledLabel')}
-                onChange={writeReadoutEnabled}
-              />
-            </div>
-          </div>
-          <div className="qdp-row">
-            <div className="qdp-rowText">
-              <span className="qdp-rowTitle">{t('quotaReadoutCNLabel')}</span>
-              <span className="qdp-rowDesc">{t('quotaReadoutCNDesc')}</span>
-            </div>
-            <div className="qdp-rowControl">
-              <QdpSwitch
-                checked={readoutCN}
-                disabled={!readoutEnabled}
-                label={t('quotaReadoutCNLabel')}
-                onChange={writeReadoutCN}
-              />
-            </div>
-          </div>
-          <div className="qdp-row">
-            <div className="qdp-rowText">
-              <span className="qdp-rowTitle">{t('quotaReadoutGlobalLabel')}</span>
-              <span className="qdp-rowDesc">{t('quotaReadoutGlobalDesc')}</span>
-            </div>
-            <div className="qdp-rowControl">
-              <QdpSwitch
-                checked={readoutGlobal}
-                disabled={!readoutEnabled}
-                label={t('quotaReadoutGlobalLabel')}
-                onChange={writeReadoutGlobal}
               />
             </div>
           </div>

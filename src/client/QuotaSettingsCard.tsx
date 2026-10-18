@@ -73,14 +73,18 @@ export interface QuotaSettingsCardInjected {
   scope?: QuotaSettingsScope<QuotaSection> | undefined
 }
 
-/** The section this card edits (mirrors the host-side QUOTA_SECTION). */
+/** The section this card edits (mirrors the host Config's advanced fields). */
 export interface QuotaSection {
   sidebarQuotaCN?: boolean
   sidebarQuotaGlobal?: boolean
   autoCheckInCN?: boolean
   autoCheckInGlobal?: boolean
-  checkInMinuteCN?: number
-  checkInMinuteGlobal?: number
+  /** The one moment both variants check in at. */
+  checkInMinute?: number
   quotaPollMs?: number
+  /** The whole China variant's master switch (on by default). */
+  variantEnabledCN?: boolean
+  /** The whole global variant's master switch (on by default). */
+  variantEnabledGlobal?: boolean
 }
 

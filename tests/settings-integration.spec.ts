@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -522,8 +522,9 @@ describe('Qoder Host settings integration', () => {
     const wrong = await face.post(QODER_SETTINGS_FACE_PATH, { probeConsent: true }, 'not-the-key')
     expect(wrong.status).toBe(403)
     expect(wrong.body.error).toBe('invalid-key')
-    // Neither refusal may have touched the file.
-    expect(await readFile(settingsFile(), 'utf8')).not.toContain('"probeConsent": true')
+    // Neither refusal may create or touch the store: without the boot-time
+    // migration seed the file only appears on the first ACCEPTED write.
+    await expect(stat(settingsFile())).rejects.toMatchObject({ code: 'ENOENT' })
 
     const accepted = await face.post(QODER_SETTINGS_FACE_PATH, { probeConsent: true }, document.body.key as string)
     expect(accepted.status).toBe(200)

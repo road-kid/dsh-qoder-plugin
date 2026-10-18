@@ -1,5 +1,66 @@
 # Changelog
 
+Entries describe user-visible behaviour; commit messages carry the mechanism.
+
+## 0.6.0
+
+### Changed — row id, account summary strip, official-style buttons, snap slider
+
+Follow-up to 0.5.0 from six user reports against the live settings page: the
+variant switches lived in the wrong card, the check-in time was duplicated per
+variant, the context slider snapped mid-drag, every button was borderless, and
+the account card showed no credit or check-in figures.
+
+- **The profile row id is `qoder-plugin`** (was `llm-qoder-x`). The package name
+  and the row id now agree, so `plugins.row.config` keys as
+  `dsh-qoder-plugin#qoder-plugin`. After reinstalling, press *Configure* on the
+  row once more; the provider ids (`qoder`, `qoder-global`) and the existing
+  model selections are unchanged.
+- **One readout switch.** The 国内版 / 国际版 quota-readout toggles in 高级设置 are
+  gone — a single switch cannot contradict itself the way two could. It is now
+  called **在对话框显示积分** and sits at the top of 高级设置, above 自动签到.
+- **Per-variant enable is back, in the variant switcher.** Each segmented tab
+  (国内版 / 国际版) carries a checkbox that turns that variant's models off
+  wholesale; its state dot and 自动签到 row follow the checkbox. The whole-variant
+  switches that had been dropped from 高级设置 are therefore reachable again.
+- **One 签到时间 for both variants** (`checkInMinute`) drives the China and the
+  Global scheduler; 高级设置 labels it 签到时间 instead of 签到时间（国内版）.
+- **Context slider free-slides, then snaps.** Dragging is continuous again
+  (no more quantising under the pointer); releasing — or stopping the keyboard
+  step — settles on the nearest window the model allows.
+- **Buttons follow the official design system.** 保存/保存设置 is a filled
+  primary button (near-black on the light theme, near-white on the dark one)
+  and the PAT 清除 control is the outlined danger button the Plugins page uses
+  for uninstall (minus its trash glyph, so the two stay distinguishable).
+  Everything else is the borderless white button from the other plugins.
+- **The account card carries the account summary.** Directly under the sign-in
+  row: 剩余积分 (same summation rule as the composer chip), 签到状态 (今日已签到 /
+  今日未签到), 当前使用 (the signed-in account name) and a one-click **一键签到**
+  that claims on both variants in one batch.
+- **Removed — the 使用与签到 card, its grant ledger and the `clear-checkin-logs`
+  action.** Per-grant history bought nothing once the account card carries the
+  summary; the plugin is heading toward multi-account risk-control
+  auto-switching, which needs a different bookkeeping shape.
+- **Removed — legacy compatibility shims.** The `checkInMinuteCN` /
+  `checkInMinuteGlobal` fields, the 0.1.5 `settings.yaml` import, the automatic
+  `.dsh-connect-qoder-x/` data-directory migration and the
+  `dsh-connect-qoder-x:readout` localStorage migration are all gone; until 0.6.0
+  the plugin had a single user installing it from source, so no shim earned its
+  keep.
+- **The models pane no longer re-sorts the roster**: it shows the upstream order
+  verbatim (which is the official GUI's order) and labels each model's reasoning
+  efforts, calling out the upstream default.
+
+**Upgrade from 0.5.0**
+
+1. Re-run the install command:
+   `dsh plugin --profile web add github:road-kid/dsh-qoder-plugin` — or, now
+   that the package is on npm, `dsh plugin --profile web add dsh-qoder-plugin`.
+2. Press *Configure* on the plugin row once — the row key changed with the row
+   id, so the old registration is ignored.
+3. Nothing in `<profile>/.dsh-qoder-plugin/` moves; the PAT, settings and
+   check-in record are read by name.
+
 ## 0.5.0
 
 ### Changed — renamed to `dsh-qoder-plugin`
@@ -10,8 +71,8 @@ found in the plugin market under its own name. It is now **`dsh-qoder-plugin`**
 everywhere: npm package name, module registration id, HTTP route prefix
 (`/plugins/dsh-qoder-plugin/*`), CLI command (`dsh-qoder-plugin`), data
 directory (`.dsh-qoder-plugin/`) and the GitHub repository
-(`road-kid/dsh-qoder-plugin`). The profile row id stays `llm-qoder-x`, so the
-provider id and existing model selections are unchanged.
+(`road-kid/dsh-qoder-plugin`). The profile row id stays `llm-qoder-x` in this
+release, so the provider id and existing model selections are unchanged.
 
 **Upgrade from 0.4.x**
 
@@ -100,9 +161,6 @@ values, and the card structure follows the plugin-page slot contract:
 - **Consistent controls.** Local switch/segmented/button/state-dot/input controls
   reproduce the official geometry (switch 36×20, segmented track 12/4/8, buttons
   H28/H36) without adding a runtime dependency on `ui-primitives`.
-
-All notable changes to this project are documented here. Entries describe
-user-visible behaviour; commit messages carry the mechanism.
 
 ## 0.3.0
 

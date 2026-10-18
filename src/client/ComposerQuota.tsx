@@ -52,7 +52,7 @@ import {
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { QODER_CARD_VARIANTS, type QoderCardVariant, type QoderPluginCardInjected } from './QoderPluginCard.tsx'
 import { cx, QdpIconButton, QdpTag } from './controls.tsx'
-import { clampPercent } from './quota-merge.ts'
+import { clampPercent, creditSummary } from './quota-merge.ts'
 import { isQoderWebStatus } from './status-document.ts'
 import {
   noteQuotaStatus,
@@ -124,40 +124,6 @@ function expiryText(value: string): string {
  */
 function chipNameKey(card: QoderCardVariant): 'quotaChipCN' | 'quotaChipGlobal' {
   return card.id === 'qoder-global' ? 'quotaChipGlobal' : 'quotaChipCN'
-}
-
-/** The remaining-credit figures every readout is built from. */
-interface CreditSummary {
-  /** Summed remainder across the packages. */
-  remain: number
-  /** Countable size: summed package sizes, else the reported total, else 0. */
-  total: number
-  /** True only when the document has no countable size at all. */
-  unlimited: boolean
-}
-
-/**
- * Distill a credits document into the numbers the chip and the panel show.
- *
- * "Unlimited" means "there is nothing to count", not "the upstream flagged it":
- * live documents report `credits.unlimited: true` while still carrying real
- * per-package sizes (the CN gift plan), and treating the flag alone as unlimited
- * hid thousands of remaining credits behind 不限量. The rule (m01963 item 5):
- * unlimited only when `Σ account.size <= 0`; otherwise `Σ remain / Σ size`,
- * falling back to `credits.totalSize` when every package reports size 0.
- */
-function creditSummary(credits: QoderWebCredits): CreditSummary {
-  const accounts = credits.accounts
-  const remain = accounts.reduce((sum, account) => sum + account.remain, 0)
-  const summedSize = accounts.reduce((sum, account) => sum + account.size, 0)
-  const unlimited = summedSize <= 0
-    && (credits.unlimited === true || accounts.some(account => account.unlimited === true))
-  let total = 0
-  if (!unlimited) {
-    if (summedSize > 0) total = summedSize
-    else if (credits.totalSize !== undefined && credits.totalSize > 0) total = credits.totalSize
-  }
-  return { remain, total, unlimited }
 }
 
 /**
@@ -309,16 +275,15 @@ export function ComposerQuotaChip({ directory, t }: ComposerQuotaInjected): Reac
   const subscribe = useCallback((listener: () => void) => directory.subscribe(listener), [directory])
   const snapshot = useCallback(() => directory.getSnapshot(), [directory])
   const selection = useSyncExternalStore(subscribe, snapshot, snapshot).current
-  // Readout switches come from the shared settings document: subscribe so a
-  // saved master/variant switch hides or shows the chip without a reload.
+  // The readout switch comes from the shared client store: subscribe so a
+  // flipped switch hides or shows the chip without a reload.
   useSyncExternalStore(onQuotaSettingsChange, quotaSettingsRevision, quotaSettingsRevision)
   const readout = quotaReadout()
   const card = selection == null
     ? undefined
     : QODER_CARD_VARIANTS.find(variant => variant.id === selection.provider)
   if (card === undefined) return null
-  const variantEnabled = card.id === 'qoder-global' ? readout.global : readout.cn
-  return readout.enabled && variantEnabled ? <ComposerQuota card={card} t={t} /> : null
+  return readout.enabled ? <ComposerQuota card={card} t={t} /> : null
 }
 
 /**

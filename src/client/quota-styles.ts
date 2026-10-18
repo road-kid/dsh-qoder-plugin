@@ -133,6 +133,45 @@ export const QUOTA_CSS = `
   align-items: center;
   gap: 6px;
 }
+/*
+ * The account card's summary strip: remaining credit, check-in state, the
+ * account in use, and the one-click check-in at the trailing edge.
+ */
+.qdp-accountSummary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 10px 0;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.qdp-accountStat {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.qdp-accountStatLabel {
+  font: var(--dsw-font-xxxs-11, var(--dsw-font-xxs-12));
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+.qdp-accountStatValue {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  font: var(--dsw-font-xxs-strong-12);
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qdp-accountActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
 .qdp-metaRow {
   display: flex;
   flex-wrap: wrap;
@@ -215,6 +254,15 @@ export const QUOTA_CSS = `
 
 /* ---------------------------------------------------------------- buttons */
 
+/*
+ * Geometry from the host's own Button (ui-primitives): sm 28px/R8, md 36px/R12,
+ * no icon padding, hairline border. The DEFAULT button is the official
+ * outline style (transparent on the card, 0.5px border-l3, primary label),
+ * which is what the other plugin's white buttons are: a thin frame, never a
+ * bare label floating on the card. The primary fill is the official filled CTA
+ * — black in the light theme, white in the dark one, because it reads
+ * --dsw-alias-button-primary-fill (= brand-primary), not a literal colour.
+ */
 .qdp-btn {
   display: inline-flex;
   flex: 0 0 auto;
@@ -223,10 +271,10 @@ export const QUOTA_CSS = `
   gap: 4px;
   height: 28px;
   padding: 0 10px;
-  border: 0.5px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l3);
   border-radius: var(--dsw-radius-sm);
-  background: none;
-  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
   font: var(--dsw-font-xxs-strong-12);
   white-space: nowrap;
   cursor: pointer;
@@ -238,8 +286,9 @@ export const QUOTA_CSS = `
 }
 .qdp-btn:disabled {
   border-color: var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-2);
+  background: transparent;
   color: var(--dsw-alias-label-tertiary);
+  opacity: 0.5;
   cursor: default;
 }
 .qdp-btnMd {
@@ -249,36 +298,58 @@ export const QUOTA_CSS = `
   font: var(--dsw-font-s-strong-14);
 }
 .qdp-btnPrimary {
-  border-color: var(--dsw-alias-button-primary-fill);
+  border-color: transparent;
   background: var(--dsw-alias-button-primary-fill);
   color: var(--dsw-alias-label-primary-foreground);
 }
 .qdp-btnPrimary:hover:not(:disabled) {
-  border-color: var(--dsw-alias-button-primary-hover);
+  border-color: transparent;
   background: var(--dsw-alias-button-primary-hover);
   color: var(--dsw-alias-label-primary-foreground);
 }
 .qdp-btnPrimary:disabled {
-  border-color: var(--dsw-alias-button-primary-fill);
+  border-color: transparent;
   background: var(--dsw-alias-button-primary-fill);
   color: var(--dsw-alias-label-primary-foreground);
-  opacity: 0.45;
+  opacity: 0.4;
 }
+/* The destructive confirm: the official danger fill (a red primary). */
 .qdp-btnDanger {
-  border-color: var(--dsw-alias-state-error-primary);
+  border-color: transparent;
   background: var(--dsw-alias-state-error-primary);
   color: var(--dsw-alias-label-primary-foreground);
 }
-.qdp-btnDangerQuiet {
+.qdp-btnDanger:hover:not(:disabled) {
   border-color: transparent;
+  background: var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-label-primary-foreground);
+  opacity: 0.9;
+}
+/*
+ * 删除: the official UNINSTALL button (PluginManagerPage's danger rule), minus its
+ * trash icon: red ink on transparent, red border at 30% so it recedes until
+ * hovered, red wash on hover. Deliberately not the danger FILL — an uninstall
+ * does not shout until clicked, and neither does removing a PAT.
+ */
+.qdp-btnDangerQuiet {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 30%, transparent);
+  background: transparent;
   color: var(--dsw-alias-state-error-primary);
 }
 .qdp-btnDangerQuiet:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover-danger);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent);
   color: var(--dsw-alias-state-error-primary);
 }
+/* A deliberately frameless button; only for inline actions that already sit in
+   a framed control group (e.g. a text-ish "cancel"). */
 .qdp-btnGhost {
   border-color: transparent;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+}
+.qdp-btnGhost:hover:not(:disabled) {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
 }
 .qdp-iconButton {
   display: inline-flex;
@@ -371,6 +442,25 @@ export const QUOTA_CSS = `
 }
 .qdp-segItem:disabled {
   opacity: 0.5;
+  cursor: default;
+}
+/* Cell wrapper when an option carries a trailing control (the variant enable
+   checkbox): the cell becomes the track's flex child so the tab inside keeps
+   its own geometry, and the checkbox sits beside it without actuating it. */
+.qdp-segCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.qdp-segCheck {
+  width: 14px;
+  height: 14px;
+  margin: 0 6px 0 0;
+  accent-color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+.qdp-segCheck:disabled {
+  opacity: 0.4;
   cursor: default;
 }
 
@@ -646,32 +736,6 @@ export const QUOTA_CSS = `
   flex: 0 0 auto;
   align-items: center;
   gap: 6px;
-}
-
-/* ------------------------------------------------------- check-in ledger */
-
-.qdp-logList {
-  display: flex;
-  flex-direction: column;
-  max-height: 138px;
-  padding: 2px 0;
-  overflow-y: auto;
-  scrollbar-width: thin;
-}
-.qdp-logRow {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-height: 26px;
-  padding: 4px 0;
-  font: var(--dsw-font-xxs-12);
-  color: var(--dsw-alias-label-secondary);
-}
-.qdp-logRow + .qdp-logRow {
-  border-top: 0.5px solid var(--dsw-alias-border-l1);
-}
-.qdp-logRow .qdp-num {
-  margin-left: auto;
 }
 
 /* ------------------------------------------------- chip + anchored panel */

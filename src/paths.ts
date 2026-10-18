@@ -19,7 +19,7 @@
  * @module dsh-qoder-plugin/paths
  */
 
-import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, type Dirent } from 'node:fs'
+import { readFileSync, readdirSync, realpathSync, type Dirent } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
@@ -117,29 +117,6 @@ function discoverProfileDir(): string | undefined {
   return candidates.find(candidate => profileLinksToThisPackage(candidate))
 }
 
-/** The pre-0.5.0 folder name, migrated to {@link QODER_DATA_DIR_NAME} on first use. */
-const LEGACY_DATA_DIR_NAME = '.dsh-connect-qoder-x'
-
-/**
- * Move a pre-0.5.0 data folder to its new name, once.
- *
- * The plugin was called `dsh-connect-qoder-x` before 0.5.0, so an upgrade
- * would otherwise start with an empty data dir and lose the saved PAT and
- * settings. Only runs when the new folder does not exist yet and the legacy
- * one does; failures (read-only home, locked files) are not fatal — the
- * plugin simply starts fresh and the user can rename the folder by hand.
- */
-function migrateLegacyDataDir(base: string): void {
-  const legacy = join(base, LEGACY_DATA_DIR_NAME)
-  const current = join(base, QODER_DATA_DIR_NAME)
-  try {
-    if (existsSync(current) || !existsSync(legacy)) return
-    renameSync(legacy, current)
-  } catch {
-    // Best effort: an unmigrated upgrade is a fresh start, not a crash.
-  }
-}
-
 /**
  * The plugin's data directory: `<profile>/.dsh-qoder-plugin`.
  *
@@ -152,7 +129,6 @@ export function qoderPluginDataDir(): string {
   const override = process.env[QODER_DATA_DIR_ENV]
   if (override !== undefined && override.trim() !== '') return override
   const base = discoverProfileDir() ?? resolveDshHome()
-  migrateLegacyDataDir(base)
   return join(base, QODER_DATA_DIR_NAME)
 }
 

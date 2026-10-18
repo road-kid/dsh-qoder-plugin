@@ -1,6 +1,3 @@
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { QoderCheckInService, type QoderCheckInResult } from '../src/qoder/transport/checkin.ts'
 import type { QoderAuthService } from '../src/qoder/transport/auth.ts'
@@ -8,7 +5,6 @@ import {
   CheckInScheduler,
   DEFAULT_CHECK_IN_MINUTE,
   isPastCheckInTime,
-  JsonFileCheckInStore,
   msUntilNextCheckIn,
   normalizeCheckInMinute,
   type CheckInStatusStore,
@@ -308,7 +304,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: (id) => storeRecords[id],
       write: (id, record) => { storeRecords[id] = record },
-      clearLogs: (id) => { if (storeRecords[id]) storeRecords[id].logs = [] },
     }
 
     const checkIn = vi.fn(async () => ({
@@ -354,7 +349,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { records[id] = record },
-      clearLogs: id => { if (records[id]) records[id].logs = [] },
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -392,7 +386,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { records[id] = record },
-      clearLogs: id => { if (records[id]) records[id].logs = [] },
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -432,7 +425,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { records[id] = record },
-      clearLogs: id => { if (records[id]) records[id].logs = [] },
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -471,7 +463,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { records[id] = record },
-      clearLogs: id => { if (records[id]) records[id].logs = [] },
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -514,7 +505,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { records[id] = record },
-      clearLogs: id => { if (records[id]) records[id].logs = [] },
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -550,7 +540,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: () => undefined,
       write: (_id, record) => { writes.push(record) },
-      clearLogs: () => {},
     }
     const scheduler = new CheckInScheduler({
       targets: [{
@@ -586,7 +575,7 @@ describe('CheckInScheduler', () => {
         minuteOfDay: () => DEFAULT_CHECK_IN_MINUTE,
       }],
       isEnabled: () => true,
-      store: { read: () => undefined, write: () => {}, clearLogs: () => {} },
+      store: { read: () => undefined, write: () => {} },
       now: () => new Date('2026-09-22T00:00:00.000Z').getTime(), // 08:00 UTC+8
     })
 
@@ -607,7 +596,6 @@ describe('CheckInScheduler', () => {
     const store: CheckInStatusStore = {
       read: id => records[id],
       write: (id, record) => { writes.push(record); records[id] = record },
-      clearLogs: () => {},
     }
     const checkIn = vi.fn(async () => ({
       variantId: 'qoder',
@@ -637,61 +625,6 @@ describe('CheckInScheduler', () => {
     await scheduler.sweepAll(true, 'qoder')
     expect(writes).toHaveLength(0)
     scheduler.dispose()
-  })
-
-  it('accumulates and caps history logs up to 30 entries in JsonFileCheckInStore', () => {
-    const records: Record<string, CheckInRecord> = {}
-    const store: CheckInStatusStore = {
-      read: (id) => records[id],
-      clearLogs: (id) => { if (records[id]) records[id].logs = [] },
-      write: (id, record) => {
-        const existing = records[id]?.logs ?? []
-        const newLog = {
-          id: `${record.lastDate}-${record.lastAt}`,
-          date: record.lastDate,
-          timestamp: record.lastAt,
-          status: record.status,
-          ...record.amount === undefined ? {} : { amount: record.amount },
-        }
-        records[id] = {
-          ...record,
-          logs: [newLog, ...existing].slice(0, 30),
-        }
-      },
-    }
-
-    for (let i = 1; i <= 35; i++) {
-      store.write('qoder', {
-        lastDate: `2026-09-${String(i).padStart(2, '0')}`,
-        lastAt: 1700000000000 + i * 1000,
-        status: 'claimed',
-        amount: 100,
-      })
-    }
-
-    const saved = store.read('qoder')
-    expect(saved?.logs).toHaveLength(30)
-    // Most recent is first
-    expect(saved?.logs?.[0]?.date).toBe('2026-09-35')
-  })
-
-  it('mints a ledger row only for a genuine grant', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'qoder-checkin-'))
-    try {
-      const store = new JsonFileCheckInStore(join(dir, 'checkin-status.json'))
-      const grantedAt = 1790502156407
-      store.write('qoder', { lastDate: '2026-09-27', lastAt: grantedAt, status: 'claimed', amount: 100 })
-      expect(store.read('qoder')?.logs).toHaveLength(1)
-      store.write('qoder', { lastDate: '2026-09-27', lastAt: 1790521920000, status: 'already-claimed', amount: 100 })
-      expect(store.read('qoder')?.logs).toHaveLength(1)
-      expect(store.read('qoder')?.logs?.[0]?.timestamp).toBe(grantedAt)
-      store.write('qoder', { lastDate: '2026-09-28', lastAt: 1790600000000, status: 'no-campaign' })
-      expect(store.read('qoder')?.logs).toHaveLength(1)
-      store.write('qoder', { lastDate: '2026-09-28', lastAt: 1790600000001, status: 'claimed', amount: 100 })
-      expect(store.read('qoder')?.logs?.map(e => e.date)).toEqual(['2026-09-28', '2026-09-27'])
-    } finally {
-      await rm(dir, { recursive: true, force: true })
-    }
   })
 })
 

@@ -9,7 +9,7 @@
  * tests, with no React and no fetch.
  */
 
-import type { QoderWebCreditAccount } from '../status-paths.ts'
+import type { QoderWebCreditAccount, QoderWebCredits } from '../status-paths.ts'
 
 /** One merged sidebar row: a package group and its summed figures. */
 export interface QuotaGroup {
@@ -160,4 +160,42 @@ export function sortPackageRows<T extends { remain: number; unlimited?: true; pa
     else spent.push(row)
   }
   return [...live, ...spent]
+}
+
+/** The remaining-credit figures every readout is built from. */
+export interface CreditSummary {
+  /** Summed remainder across the packages. */
+  remain: number
+  /** Countable size: summed package sizes, else the reported total, else 0. */
+  total: number
+  /** True only when the document has no countable size at all. */
+  unlimited: boolean
+}
+
+/**
+ * Distill a credits document into the numbers the chip, the panel and the
+ * account card show.
+ *
+ * "Unlimited" means "there is nothing to count", not "the upstream flagged it":
+ * live documents report `credits.unlimited: true` while still carrying real
+ * per-package sizes (the CN gift plan), and treating the flag alone as unlimited
+ * hid thousands of remaining credits behind 不限量. The rule: unlimited only
+ * when `Σ account.size <= 0`; otherwise `Σ remain / Σ size`, falling back to
+ * `credits.totalSize` when every package reports size 0.
+ *
+ * Lives here (a pure module both client surfaces already import) rather than in
+ * the composer chip, so the account card cannot drift from the chip's figure.
+ */
+export function creditSummary(credits: QoderWebCredits): CreditSummary {
+  const accounts = credits.accounts
+  const remain = accounts.reduce((sum, account) => sum + account.remain, 0)
+  const summedSize = accounts.reduce((sum, account) => sum + account.size, 0)
+  const unlimited = summedSize <= 0
+    && (credits.unlimited === true || accounts.some(account => account.unlimited === true))
+  let total = 0
+  if (!unlimited) {
+    if (summedSize > 0) total = summedSize
+    else if (credits.totalSize !== undefined && credits.totalSize > 0) total = credits.totalSize
+  }
+  return { remain, total, unlimited }
 }

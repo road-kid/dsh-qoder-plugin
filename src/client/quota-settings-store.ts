@@ -29,11 +29,17 @@ export interface QuotaSignInState {
 }
 
 let pollIntervalMs = 300_000
-/** Composer-readout switches: master + one per variant (all on by default). */
+/**
+ * The composer-readout switch: ONE preference for the whole chip.
+ *
+ * It used to be a master flag plus one flag per variant, but the card now
+ * offers a single 「在对话框显示积分」 switch, so the per-variant halves were
+ * redundant. The chip follows the session's own model directory, so there was
+ * never a case where "hide China's readout but keep Global's" said anything a
+ * user could act on.
+ */
 export interface QuotaReadoutState {
   enabled: boolean
-  cn: boolean
-  global: boolean
 }
 
 /**
@@ -46,12 +52,10 @@ export interface QuotaReadoutState {
  * honest about where the value lives.
  */
 const READOUT_STORAGE_KEY = 'dsh-qoder-plugin:readout'
-/** Pre-0.5.0 key (the plugin's former package name); read once and migrated to {@link READOUT_STORAGE_KEY}. */
-const LEGACY_READOUT_STORAGE_KEY = 'dsh-connect-qoder-x:readout'
 
-/** The all-on state used when nothing (or nothing valid) was stored. */
+/** The on state used when nothing (or nothing valid) was stored. */
 function defaultQuotaReadout(): QuotaReadoutState {
-  return { enabled: true, cn: true, global: true }
+  return { enabled: true }
 }
 
 /** A stored flag counts as on unless it was explicitly `false`. */
@@ -78,22 +82,15 @@ function loadQuotaReadout(): QuotaReadoutState {
   const storage = readoutStorage()
   if (storage === undefined) return defaultQuotaReadout()
   try {
-    const raw = storage.getItem(READOUT_STORAGE_KEY) ?? storage.getItem(LEGACY_READOUT_STORAGE_KEY)
+    const raw = storage.getItem(READOUT_STORAGE_KEY)
     if (raw === null) return defaultQuotaReadout()
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return defaultQuotaReadout()
-    const stored = parsed as { enabled?: unknown; cn?: unknown; global?: unknown }
-    const state: QuotaReadoutState = {
-      enabled: readoutFlag(stored.enabled),
-      cn: readoutFlag(stored.cn),
-      global: readoutFlag(stored.global),
-    }
-    // A pre-0.5.0 preference follows the plugin's new package name.
-    if (storage.getItem(READOUT_STORAGE_KEY) === null) {
-      storage.setItem(READOUT_STORAGE_KEY, JSON.stringify(state))
-      storage.removeItem(LEGACY_READOUT_STORAGE_KEY)
-    }
-    return state
+    const stored = parsed as { enabled?: unknown }
+    // Only `enabled` is read: a value written by the pre-simplification
+    // version may also carry `cn`/`global`, which no longer gate anything and
+    // must not be resurrected into the single switch's state.
+    return { enabled: readoutFlag(stored.enabled) }
   } catch {
     // Corrupt JSON is not a reason to hide the chip: fall back to all-on.
     return defaultQuotaReadout()
@@ -154,22 +151,22 @@ export function quotaToggles(): QuotaSignInState {
 }
 
 /**
- * Update the composer-readout switches.
+ * Update the composer-readout switch.
  *
  * This is a CLIENT-SIDE preference (see {@link READOUT_STORAGE_KEY}), not a
  * settings-file write: it persists to localStorage, bumps the revision so
  * every composer chip re-renders, and never touches the host document.
  */
-export function setQuotaReadout(enabled: boolean, cn: boolean, global: boolean): void {
-  if (readout.enabled !== enabled || readout.cn !== cn || readout.global !== global) {
-    readout = { enabled, cn, global }
+export function setQuotaReadout(enabled: boolean): void {
+  if (readout.enabled !== enabled) {
+    readout = { enabled }
     readoutSnapshot = { ...readout }
     persistQuotaReadout(readout)
     bump()
   }
 }
 
-/** Read the composer-readout switches. */
+/** Read the composer-readout switch. */
 export function quotaReadout(): QuotaReadoutState {
   return readoutSnapshot
 }

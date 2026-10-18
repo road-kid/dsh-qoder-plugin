@@ -43,7 +43,7 @@ const LITE = modelOf('lite', 'Qoder Lite', [200_000, 400_000])
 const PERFORMANCE = modelOf('performance', 'Qoder Performance', [200_000, 1_000_000])
 const AUTO = modelOf('auto', 'Qoder Auto', [200_000, 400_000, 1_000_000])
 
-/** Roster handed in upstream order; the pane owns the display order. */
+/** Roster handed in upstream order; the pane preserves it verbatim. */
 const ROSTER = [LITE, PERFORMANCE, AUTO]
 
 function must<T>(value: T | undefined, what: string): T {
@@ -152,10 +152,12 @@ describe('models pane', () => {
     })
   }
 
-  it('renders one row per model in display order on one shared absolute axis', async () => {
+  it('renders one row per model in upstream order on one shared absolute axis', async () => {
     await mount()
 
-    expect(rows().map(node => node.props['data-model-id'])).toEqual(['auto', 'performance', 'lite'])
+    // No re-sorting: the pane displays the roster exactly as upstream ordered
+    // it (the API payload already matches the official GUI).
+    expect(rows().map(node => node.props['data-model-id'])).toEqual(['lite', 'performance', 'auto'])
     // The name is a second label for the same checkbox: the checkbox has a
     // stable id and the visible name targets it (clicking the name toggles).
     expect(checkbox('auto').props.id).toBe('qdp-model-auto')
@@ -178,6 +180,22 @@ describe('models pane', () => {
 
     expect(saveBar()).toBeUndefined()
     expect(saves).toHaveLength(0)
+  })
+
+  it('labels each model’s reasoning efforts and calls out the upstream default', async () => {
+    await mount({
+      models: [
+        { ...AUTO, reasoningEfforts: ['low', 'medium', 'xhigh'], defaultReasoningEffort: 'medium' },
+        LITE,
+      ],
+    })
+    const autoText = text(row('auto'))
+    expect(autoText).toContain(t('modelEfforts', {
+      levels: `${t('effortLow')} · ${t('effortMedium')} · ${t('effortXhigh')}`,
+    }))
+    expect(autoText).toContain(t('modelEffortsDefault', { name: t('effortMedium') }))
+    // A model that advertises no efforts draws no tag at all.
+    expect(text(row('lite'))).not.toContain('Efforts:')
   })
 
   it('bounds the roster in a scroll region with the sticky header inside it', async () => {

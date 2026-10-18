@@ -103,6 +103,13 @@ export interface QdpSegmentedOption<T extends string> {
   value: T
   label: ReactNode
   disabled?: boolean
+  /**
+   * A control rendered BESIDE the tab (not inside it): the variant enable
+   * checkbox. Interactive content cannot nest inside a `role="tab"` button,
+   * so when this is present the tab and the control are wrapped in one cell
+   * span; clicking the control must not actuate the tab (stopPropagation).
+   */
+  trailing?: ReactNode
 }
 
 export interface QdpSegmentedProps<T extends string> {
@@ -156,21 +163,30 @@ export function QdpSegmented<T extends string>({
   }
   return (
     <div role="tablist" aria-label={label} className="qdp-seg">
-      {options.map(option => (
-        <button
-          key={option.value}
-          type="button"
-          role="tab"
-          aria-selected={option.value === value}
-          tabIndex={option.value === value ? 0 : -1}
-          disabled={disabled === true || option.disabled === true}
-          className={cx('qdp-segItem', option.value === value && 'qdp-segItemActive')}
-          onClick={() => onChange(option.value)}
-          onKeyDown={onKeyDown}
-        >
-          {option.label}
-        </button>
-      ))}
+      {options.map(option => {
+        const tab = (
+          <button
+            key={option.value}
+            type="button"
+            role="tab"
+            aria-selected={option.value === value}
+            tabIndex={option.value === value ? 0 : -1}
+            disabled={disabled === true || option.disabled === true}
+            className={cx('qdp-segItem', option.value === value && 'qdp-segItemActive')}
+            onClick={() => onChange(option.value)}
+            onKeyDown={onKeyDown}
+          >
+            {option.label}
+          </button>
+        )
+        if (option.trailing === undefined) return tab
+        return (
+          <span key={option.value} className="qdp-segCell">
+            {tab}
+            {option.trailing}
+          </span>
+        )
+      })}
     </div>
   )
 }
@@ -255,9 +271,14 @@ export interface QdpSliderProps {
   /** Tick/value formatter; defaults to `valueText` for the current value. */
   format?: (value: number) => string
   /**
-   * Values the handle anchors to after a drag (the catalog's declared context
-   * windows). When set, every pointer move and arrow key lands exactly on one
-   * of these — the slider answers "which offered size", never a free number.
+   * Values a drag settles on when the pointer is released (the catalog's
+   * declared context windows).
+   *
+   * While dragging the handle follows the pointer freely (quantized to `step`,
+   * so the number on screen stays readable) — the "stepless" feel the model
+   * slider had before. Only on release does the value snap to the NEAREST of
+   * these offers, so the saved window is always one the upstream declares.
+   * Arrow keys keep stepping through the offers directly.
    */
   snapTo?: readonly number[]
   /** Root `data-testid`, for tests that need to find the control. */
@@ -267,10 +288,11 @@ export interface QdpSliderProps {
 /**
  * Context-window slider: a thick filled rail with a narrow vertical grab handle
  * at the fill's edge (the Qoder model-settings look). Pointer drags anywhere on
- * the surface jump and follow the pointer; arrows, PageUp/PageDown and Home/End
- * keep it keyboard operable. With `snapTo` the value always anchors to one of
- * the offered windows instead of a free number. The component is fully
- * controlled — it never writes anything by itself.
+ * the surface jump and follow the pointer CONTINUOUSLY; arrows,
+ * PageUp/PageDown and Home/End keep it keyboard operable. With `snapTo` the
+ * value is snapped to the nearest offered window when the drag ENDS, so a
+ * moving handle is a free position while a saved one is always an offer. The
+ * component is fully controlled — it never writes anything by itself.
  */
 export function QdpSlider({
   label,
@@ -318,15 +340,37 @@ export function QdpSlider({
     },
     [anchors, max, min, step],
   )
+  /**
+   * The value a live drag reports: clamped, then quantized to `step` only.
+   *
+   * Deliberately NOT `snap`: dragging must not jump between the offered
+   * windows, or the handle feels ratcheted. `step` (1 000 tokens by default) is
+   * fine enough that the movement reads as continuous, while keeping the
+   * displayed number free of round-off noise.
+   */
+  const free = useCallback(
+    (raw: number): number => {
+      const clamped = Math.min(max, Math.max(min, raw))
+      if (step <= 0) return clamped
+      const stepped = min + Math.round((clamped - min) / step) * step
+      return Math.min(max, Math.max(min, stepped))
+    },
+    [max, min, step],
+  )
+  /** Continuous position of the drag in flight; the release handler snaps it. */
+  const lastRaw = useRef<number | undefined>(undefined)
   const fromClientX = useCallback(
     (clientX: number): void => {
       const element = trackRef.current
       if (element === null) return
       const rect = element.getBoundingClientRect()
       const share = rect.width > 0 ? (clientX - rect.left) / rect.width : 0
-      onChange(snap(min + Math.min(1, Math.max(0, share)) * span))
+      const raw = min + Math.min(1, Math.max(0, share)) * span
+      // Remember the free position: the RELEASE handler is what snaps it.
+      lastRaw.current = raw
+      onChange(free(raw))
     },
-    [max, min, onChange, snap, span],
+    [free, min, onChange, span],
   )
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (disabled === true) return
@@ -338,10 +382,23 @@ export function QdpSlider({
     if (disabled === true || !event.currentTarget.hasPointerCapture(event.pointerId)) return
     fromClientX(event.clientX)
   }
+  /**
+   * End of drag: snap to the nearest offer.
+   *
+   * `lastRaw` is the continuous position the drag ended at, not `value` — the
+   * controlled parent may still be rendering the previous tick when the release
+   * lands, so reading the raw pointer position is what makes the snap land
+   * where the user let go.
+   */
   const release = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
+    const raw = lastRaw.current
+    lastRaw.current = undefined
+    if (raw === undefined) return
+    const snapped = snap(raw)
+    if (snapped !== value) onChange(snapped)
   }
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (disabled === true) return

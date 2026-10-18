@@ -2,7 +2,7 @@
   "name": "dsh-qoder-plugin",
   "displayName": "dsh-qoder-plugin",
   "description": "把 Qoder 模型接入 DeepSeek Harness：用 PAT 调用与 Qoder CLI 同源的模型服务，支持国内版 / 国际版双区域、模型开关、上下文窗口与每日签到，并提供只读的额度概览。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": "corrinehu",
   "keywords": [
     "dsh-plugin",
@@ -50,6 +50,10 @@
     "locale/*.json"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/road-kid/dsh-qoder-plugin.git"
@@ -118,9 +122,6 @@
     "tsdown": "^0.22.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8"
-  },
-  "dependencies": {
-    "js-yaml": "^4.1.0"
   },
   "icon": "./assets/icon.svg"
 }
