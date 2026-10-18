@@ -724,14 +724,14 @@ export const QUOTA_CSS = `
   position: absolute;
   top: 50%;
   width: 1px;
-  height: 6px;
+  height: 7px;
   border-radius: 999px;
-  background: var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-label-caption);
   transform: translate(-50%, -50%);
 }
 .qdp-windowTickMarkMajor {
-  height: 8px;
-  background: var(--dsw-alias-border-l3);
+  height: 10px;
+  background: var(--dsw-alias-label-tertiary);
 }
 /* Tier labels sit on the field colour so the ruler passes behind them. */
 .qdp-windowTick {

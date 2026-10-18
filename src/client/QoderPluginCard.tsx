@@ -1290,6 +1290,31 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               />
             </div>
           </div>
+          {/* The poll interval drives the composer's remaining-credit label
+              itself, so it sits right under the readout switch it serves. */}
+          {settings.status === 'unavailable' ? null : (
+            <div className="qdp-row">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">{t('quotaPollLabel')}</span>
+                <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
+              </div>
+              <div className="qdp-rowControl">
+                <QdpInput
+                  className="qdp-inputShort"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={pollMinutes}
+                  aria-label={t('quotaPollLabel')}
+                  onChange={event => {
+                    const minutes = Number.parseInt(event.target.value, 10)
+                    if (Number.isFinite(minutes) && minutes >= 1) writePollMinutes(minutes)
+                  }}
+                />
+                <span className="qdp-caption">{t('quotaPollUnit')}</span>
+              </div>
+            </div>
+          )}
           <div className="qdp-row">
             <div className="qdp-rowText">
               <span className="qdp-rowTitle">{t('paneUsage')}</span>
@@ -1322,29 +1347,6 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               />
             </div>
           </div>
-          {settings.status === 'unavailable' ? null : (
-            <div className="qdp-row">
-              <div className="qdp-rowText">
-                <span className="qdp-rowTitle">{t('quotaPollLabel')}</span>
-                <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
-              </div>
-              <div className="qdp-rowControl">
-                <QdpInput
-                  className="qdp-inputShort"
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={pollMinutes}
-                  aria-label={t('quotaPollLabel')}
-                  onChange={event => {
-                    const minutes = Number.parseInt(event.target.value, 10)
-                    if (Number.isFinite(minutes) && minutes >= 1) writePollMinutes(minutes)
-                  }}
-                />
-                <span className="qdp-caption">{t('quotaPollUnit')}</span>
-              </div>
-            </div>
-          )}
           {settings.status === 'ready' && !settings.writable ? (
             <p className="qdp-error">{t('quotaSettingsSaveFailed')}</p>
           ) : null}
