@@ -377,12 +377,18 @@ describe('models pane', () => {
     await act(async () => { button('qdp-models-save').props.onClick() })
     expect(saves).toEqual([{ disabled: [], windows: { auto: 400_000 } }])
 
-    // A single fixed window offers no alternative: the row shows the number
-    // instead of a slider, so no interpolated size can ever be staged.
+    // A single-window row still draws the rail, like the official GUI: the
+    // lone tier is the only anchor, so no interpolated size can be staged.
     const fixedWindow: QoderCatalogModelSnapshot = { id: 'auto', name: 'Qoder Auto', contextWindow: 200_000 }
     await mount({ models: [fixedWindow, PERFORMANCE] })
-    expect(row('auto').findAll(node => node.props.role === 'slider')).toHaveLength(0)
+    expect(row('auto').findAll(node => node.props.role === 'slider')).toHaveLength(1)
+    const fixedSlider = must(mustRenderer().root.findAllByType(QdpSlider)[0], 'fixed-window slider')
+    expect(fixedSlider.props.snapTo).toEqual([200_000])
+    expect(slider('auto').props['aria-valuenow']).toBe(200_000)
+    expect(slider('auto').props['aria-valuetext']).toBe('200K')
     expect(text(row('auto'))).toContain('200K')
+    await pressArrowRight('auto')
+    expect(slider('auto').props['aria-valuenow']).toBe(200_000)
   })
 
   it('returns a window dragged back to its baseline to the diff', async () => {

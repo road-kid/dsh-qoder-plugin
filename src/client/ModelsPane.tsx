@@ -325,15 +325,13 @@ export function ModelsPane({
                 <div className="qdp-modelAxis">
                   {current === undefined ? (
                     <span className="qdp-modelMeta">—</span>
-                  ) : tiers.length <= 1 ? (
-                    /* The catalogue offers this model no alternative window, so
-                       the size is fixed: a slider here could only invite values
-                       the upstream never declares. Show the number itself. */
-                    <span className="qdp-modelWindow">{formatTokens(current)}</span>
                   ) : (
                     /* One slide, one offered size: a pointer move lands on the
                        neighbouring tier instead of an interpolated window, and
-                       the label of the tier in force is the dark one. */
+                       the label of the tier in force is the dark one. A row
+                       whose catalogue offers a single window still draws the
+                       rail — the official GUI does, and the lone tier anchors
+                       the drag, so no interpolated size can be staged. */
                     <QdpSlider
                       label={t('contextWindowAria')}
                       value={current}
