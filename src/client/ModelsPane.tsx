@@ -121,7 +121,7 @@ function effortsTagText(
   const fallback = model.defaultReasoningEffort !== undefined && efforts.includes(model.defaultReasoningEffort)
     ? ` (${t('modelEffortsDefault', { name: nameOf(model.defaultReasoningEffort) })})`
     : ''
-  return t('modelEfforts', { levels }) + fallback
+  return levels + fallback
 }
 
 /** Round an axis end up to a clean K/M boundary so tick labels stay readable. */
@@ -276,6 +276,7 @@ export function ModelsPane({
           <div className="qdp-modelColumns">
             <span aria-hidden="true" />
             <span>{t('modelNameColumn')}</span>
+            <span>{t('effortsHeading')}</span>
             <span>{t('contextHeading')}</span>
           </div>
           {list.map(model => {
@@ -315,13 +316,12 @@ export function ModelsPane({
                   {model.priceFactor === undefined ? null : <QdpTag>{formatRate(model.priceFactor)}</QdpTag>}
                   {/* Wire id, right where the upstream GUI shows it. */}
                   <span className="qdp-modelMeta">{model.id}</span>
-                  {/* The effort levels the model can reason at, with the
-                      upstream default called out — the same list the official
-                      GUI offers in its model detail view. Rendered to the RIGHT
-                      of the id so the tiers sit beside the model they belong
-                      to; a model without selectable effort says so. */}
-                  <QdpTag>{effortsText}</QdpTag>
                 </span>
+                {/* The effort levels the model can reason at, under the column
+                    header; the upstream default is called out and a model with
+                    no selectable effort says so. The wire vocabulary stays
+                    English in every UI language, like the official GUI. */}
+                <span className="qdp-modelEfforts">{effortsText}</span>
                 <div className="qdp-modelAxis">
                   {current === undefined ? (
                     <span className="qdp-modelMeta">—</span>

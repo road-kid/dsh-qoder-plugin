@@ -95,6 +95,7 @@ export const en = {
   modelsNoModels: 'No models available.',
   modelsNoMatch: 'No models matching "{query}".',
   modelNameColumn: 'Model name',
+  effortsHeading: 'Reasoning effort',
   contextHeading: 'Context window',
   contextUpTo: 'up to {size}',
   contextDefault: 'default {size}',
@@ -197,7 +198,6 @@ export const en = {
   quotaReadoutEnabledLabel: 'Show credits in the composer',
   quotaReadoutEnabledDesc: 'A remaining-credit chip in the composer toolbar; click it to open the details panel.',
   checkInTime: 'Check-in time',
-  modelEfforts: 'Efforts: {levels}',
   modelEffortsDefault: 'default {name}',
   effortMinimal: 'minimal',
   effortLow: 'low',
@@ -310,6 +310,7 @@ export const zh: Record<QoderSettingsKey, string> = {
   modelsNoModels: '暂无可配置的模型。',
   modelsNoMatch: '未找到匹配“{query}”的模型。',
   modelNameColumn: '模型名称',
+  effortsHeading: '思考强度',
   contextHeading: '上下文窗口',
   contextUpTo: '最高 {size}',
   contextDefault: '默认 {size}',
@@ -418,7 +419,6 @@ export const zh: Record<QoderSettingsKey, string> = {
    * not translated UI words, and the official Qoder app lists them untranslated
    * too. Translating them made the pane read 「思考：高 · 最大（默认最大）」.
    */
-  modelEfforts: 'Efforts: {levels}',
   modelEffortsDefault: 'default {name}',
   effortMinimal: 'minimal',
   effortLow: 'low',

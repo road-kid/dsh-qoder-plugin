@@ -251,16 +251,15 @@ describe('models pane', () => {
       ],
     })
     const autoText = text(row('auto'))
-    expect(autoText).toContain(t('modelEfforts', {
-      levels: `${t('effortLow')} · ${t('effortMedium')} · ${t('effortXhigh')}`,
-    }))
-    expect(autoText).toContain(t('modelEffortsDefault', { name: t('effortMedium') }))
-    // The tag follows the id chip, so the tiers sit to the right of the model's
-    // name; a model that advertises no efforts says so instead of drawing
-    // nothing at all.
-    expect(autoText.indexOf('auto')).toBeLessThan(autoText.indexOf('Efforts:'))
+    // The column header names the thing, so the cell holds just the tiers plus
+    // the upstream default — no "Efforts:" prefix in the cell.
+    expect(autoText).toContain(`${t('effortLow')} · ${t('effortMedium')} · ${t('effortXhigh')}`)
+    expect(autoText).toContain(`(${t('modelEffortsDefault', { name: t('effortMedium') })})`)
+    expect(autoText).not.toContain('Efforts:')
+    // The effort cell is a column of its own, to the right of the model name;
+    // a model that advertises no efforts says so instead of drawing nothing.
+    expect(autoText.indexOf('auto')).toBeLessThan(autoText.indexOf(t('effortLow')))
     expect(text(row('lite'))).toContain(en.effortsUnsupported)
-    expect(text(row('lite'))).not.toContain('Efforts:')
   })
 
   it('keeps the effort vocabulary English in the Chinese UI', async () => {
@@ -280,7 +279,7 @@ describe('models pane', () => {
     // Wire ids are model parameters, not translated UI words: the official
     // Qoder app lists the same levels, and a translated tag read
     // 「思考：高 · 最大（默认最大）」.
-    expect(text(row('auto'))).toContain('Efforts: high · max (default max)')
+    expect(text(row('auto'))).toContain('high · max (default max)')
     expect(text(row('auto'))).not.toMatch(/[\u4e00-\u9fff]/)
     expect(text(row('lite'))).toContain('not supported')
   })

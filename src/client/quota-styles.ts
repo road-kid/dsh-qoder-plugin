@@ -623,7 +623,11 @@ export const QUOTA_CSS = `
 
 .qdp-modelScroll {
   max-height: 420px;
+  /* Vertical scrolling only: a horizontal bar under the roster was pure noise,
+     and the extra right padding keeps the scrollbar off the context slider. */
+  overflow-x: hidden;
   overflow-y: auto;
+  padding-right: 12px;
   overscroll-behavior: contain;
 }
 .qdp-modelColumns {
@@ -631,8 +635,8 @@ export const QUOTA_CSS = `
   top: 0;
   z-index: 1;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 232px;
-  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1.15fr) 232px;
+  gap: 12px;
   align-items: center;
   padding: 4px 0 4px;
   border-bottom: 0.5px solid var(--dsw-alias-border-l2);
@@ -642,8 +646,8 @@ export const QUOTA_CSS = `
 }
 .qdp-modelRow {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 232px;
-  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1.15fr) 232px;
+  gap: 12px;
   align-items: center;
   min-height: 44px;
   padding: 6px 0;
@@ -689,6 +693,15 @@ export const QUOTA_CSS = `
   font: var(--dsw-font-xxxs-11);
   color: var(--dsw-alias-label-caption);
   font-variant-numeric: tabular-nums;
+}
+/* The effort column: the tiers themselves, no "Efforts:" prefix — the column
+   header says what they are. */
+.qdp-modelEfforts {
+  min-width: 0;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 .qdp-modelAxis {
   min-width: 0;
