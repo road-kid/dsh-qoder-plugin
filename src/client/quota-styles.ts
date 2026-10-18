@@ -568,49 +568,55 @@ export const QUOTA_CSS = `
 
 /* ---------------------------------------------------------------- sliders */
 
+/* The official Qoder model-settings slider: a 56 px field, an 18 px rail on the
+   vertical centre, a 2 × 12 px grab tick at the fill's edge and a 12 px label
+   row hanging 40 px below the field's top. The rail is a soft neutral and the
+   fill a 42 % brand tint, so the grab tick reads as the only strong mark. */
 .qdp-slider {
   position: relative;
-  display: flex;
-  align-items: center;
-  height: 32px;
-  padding: 0 2px;
+  width: 100%;
+  max-width: 252px;
+  height: 56px;
   border-radius: var(--dsw-radius-xs);
   cursor: pointer;
   touch-action: none;
   user-select: none;
 }
 .qdp-slider[aria-disabled='true'] {
-  opacity: 0.5;
+  opacity: 0.55;
   cursor: default;
 }
 .qdp-sliderTrack {
-  position: relative;
-  width: 100%;
-  height: 12px;
-  border-radius: 999px;
-  corner-shape: round;
-  background: var(--dsw-alias-interactive-bg-hover);
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 18px;
+  transform: translateY(-50%);
 }
+.qdp-sliderRail,
 .qdp-sliderFill {
   position: absolute;
   top: 0;
   left: 0;
   height: 100%;
-  border-radius: 999px;
-  corner-shape: round;
-  /* A solid, readable bar (the Qoder model-settings look): the fill is a
-     strong brand tint, the handle the same colour at full strength. */
-  background: var(--dsw-alias-state-business-primary);
-  opacity: 0.42;
+  border-radius: var(--dsw-radius-xs);
+}
+.qdp-sliderRail {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+/* The chosen stretch is a quiet neutral, exactly like the upstream rail: the
+   strong mark on the control is the grab tick, not a saturated fill. */
+.qdp-sliderFill {
+  background: var(--dsw-alias-border-l3);
 }
 .qdp-sliderThumb {
   position: absolute;
-  top: 50%;
-  width: 4px;
-  height: 20px;
-  border-radius: 2px;
+  top: 3px;
+  width: 2px;
+  height: 12px;
+  border-radius: 1px;
   background: var(--dsw-alias-state-business-primary);
-  transform: translate(-50%, -50%);
 }
 
 /* ----------------------------------------------------------------- models */
@@ -696,34 +702,53 @@ export const QUOTA_CSS = `
 }
 .qdp-sliderField {
   position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
   min-width: 0;
 }
 .qdp-windowTicks {
-  position: relative;
+  position: absolute;
+  top: 40px;
+  right: 0;
+  left: 0;
   height: 12px;
-  margin: 0 2px;
+  pointer-events: none;
 }
+/* Hairline ruler under the rail: 33 marks across the field, every eighth one
+   taller and a step darker, matching the official scale. */
+.qdp-windowTickMark {
+  position: absolute;
+  top: 50%;
+  width: 1px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--dsw-alias-border-l2);
+  transform: translate(-50%, -50%);
+}
+.qdp-windowTickMarkMajor {
+  height: 8px;
+  background: var(--dsw-alias-border-l3);
+}
+/* Tier labels sit on the field colour so the ruler passes behind them. */
 .qdp-windowTick {
   position: absolute;
-  transform: translateX(-50%);
+  top: 50%;
+  padding: 0 4px;
+  background: var(--dsw-alias-settings-card-fill);
   font: var(--dsw-font-xxxs-11);
+  font-size: 9px;
+  line-height: 12px;
   color: var(--dsw-alias-label-tertiary);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-.qdp-windowTick:first-child {
-  transform: none;
-}
-.qdp-windowTick:last-child {
-  transform: translateX(-100%);
 }
 /* The window in force is the only dark number: the other tiers are offers the
    user has not selected, so they keep the tertiary (grey) tone. */
 .qdp-windowTickActive {
   color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+/* A disabled slider greys every label, the active one included. */
+.qdp-slider[aria-disabled='true'] .qdp-windowTick {
+  color: var(--dsw-alias-label-caption);
 }
 
 /* --------------------------------------------------------------- save bar */

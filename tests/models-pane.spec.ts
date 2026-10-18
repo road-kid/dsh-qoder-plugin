@@ -128,6 +128,18 @@ describe('models pane', () => {
       && node.props.className.split(' ').includes('qdp-windowTick'))
   }
 
+  /** The hairline ruler under a row's rail (major marks included). */
+  function rulerMarks(modelId: string): ReactTestInstance[] {
+    return row(modelId).findAll(node =>
+      typeof node.type === 'string'
+      && typeof node.props.className === 'string'
+      && node.props.className.split(' ').includes('qdp-windowTickMark'))
+  }
+
+  function styleOf(node: ReactTestInstance): Record<string, string> {
+    return (node.props.style ?? {}) as Record<string, string>
+  }
+
   function saveBar(): ReactTestInstance | undefined {
     return hosts(node => node.props.className === 'qdp-saveBar')[0]
   }
@@ -189,6 +201,28 @@ describe('models pane', () => {
     expect(ticks('auto').map(node => node.props.className.split(' ').includes('qdp-windowTickActive')))
       .toEqual([true, false, false])
 
+    // The official geometry: the scale starts at zero, so a 200K window covers
+    // the first fifth of the 1M axis; the label at the far end pulls left so it
+    // stays inside the field, and the ruler carries 33 hairlines with every
+    // eighth one drawn as a major mark.
+    expect(ticks('auto').map(node => styleOf(node).left)).toEqual(['20.00%', '40.00%', '100.00%'])
+    expect(ticks('auto').map(node => styleOf(node).transform)).toEqual([
+      'translate(-50%, -50%)',
+      'translate(-50%, -50%)',
+      'translate(-100%, -50%)',
+    ])
+    const track = must(
+      row('auto').findAll(node => node.props.className === 'qdp-sliderTrack')[0],
+      'slider track',
+    )
+    expect(track.findAll(node => node.props.className === 'qdp-sliderRail').map(node => styleOf(node).width))
+      .toEqual(['100.00%'])
+    expect(styleOf(must(track.findAll(node => node.props.className === 'qdp-sliderFill')[0], 'fill')).width)
+      .toBe('20.00%')
+    expect(rulerMarks('auto')).toHaveLength(33)
+    expect(rulerMarks('auto').filter(node => node.props.className.split(' ').includes('qdp-windowTickMarkMajor')))
+      .toHaveLength(5)
+
     expect(saveBar()).toBeUndefined()
     expect(saves).toHaveLength(0)
   })
@@ -203,6 +237,8 @@ describe('models pane', () => {
     expect(ticks('performance').map(node => text(node))).toEqual(['272K', '400K', '1M'])
     expect(slider('performance').props['aria-valuenow']).toBe(272_000)
     expect(ticks('performance')[0]?.props.className).toContain('qdp-windowTickActive')
+    // Zero-based scale: 272K is 27.2 % of the 1M axis, not 9 % of a 200K–1M span.
+    expect(styleOf(must(ticks('performance')[0], '272K label')).left).toBe('27.20%')
     // The shared scale still spans the roster: its left end is the narrowest offer.
     expect(slider('performance').props['aria-valuemin']).toBe(200_000)
   })

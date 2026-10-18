@@ -266,7 +266,7 @@ export interface QdpSliderProps {
   onChange: (value: number) => void
   /** Human-readable value for `aria-valuetext` (e.g. "200K"). */
   valueText?: string
-  /** Marks drawn under the track (e.g. the catalog's supported windows). */
+  /** Labelled tiers under the rail (e.g. the catalog's supported windows). */
   ticks?: readonly number[]
   /** Tick/value formatter; defaults to `valueText` for the current value. */
   format?: (value: number) => string
@@ -284,15 +284,26 @@ export interface QdpSliderProps {
   testId?: string
 }
 
+/** Hairline marks under the rail — 33 marks, one every 3.125 % of the field. */
+const SLIDER_RULER_MARKS = 33
+
 /**
- * Context-window slider: a thick filled rail with a narrow vertical grab handle
- * at the fill's edge (the Qoder model-settings look). With `snapTo` a pointer
- * drag moves the handle one tier at a time (it lands only on the offered
- * windows); without offers it follows the pointer quantized to `step`. Arrows,
- * PageUp/PageDown and Home/End keep it keyboard operable, with arrows walking
- * the offers one by one. Ticks mark the offers and the one in force carries the
- * high-contrast label. The component is fully controlled — it never writes
- * anything by itself.
+ * Context-window slider, replicating the Qoder model-settings control.
+ *
+ * Geometry follows the upstream component: a 56 px field whose 18 px rail sits
+ * on the vertical centre and whose 12 px label row hangs 40 px below the field's
+ * top, 33 hairlines along the rail (every eighth one taller and darker) and a
+ * 2×12 px grab tick at the fill's edge. The scale starts at zero — a window's
+ * position is `value / max`, so 200K sits at 20 % of a 1M axis exactly as in the
+ * official table — and the rail itself stops at the widest offered window. Only
+ * the offered windows carry a label (9 px, sitting on the field colour so the
+ * hairlines pass behind); the one in force is the dark, medium-weight label.
+ *
+ * With `snapTo` a pointer drag moves the grab tick one tier at a time (it lands
+ * only on the offered windows); without offers it follows the pointer quantized
+ * to `step`. Arrows, PageUp/PageDown and Home/End keep it keyboard operable,
+ * with arrows walking the offers one by one. The component is fully controlled —
+ * it never writes anything by itself.
  */
 export function QdpSlider({
   label,
@@ -311,10 +322,20 @@ export function QdpSlider({
   const formatValue = (raw: number): string => (
     format !== undefined ? format(raw) : (raw === value && valueText !== undefined ? valueText : String(raw))
   )
-  const percentOf = (raw: number): number => (span > 0 ? Math.min(100, Math.max(0, ((raw - min) / span) * 100)) : 0)
+  /**
+   * Position of a window on the field, in percent.
+   *
+   * The official control's axis starts at zero (`value / maxValue`), not at the
+   * smallest window, so a 200K window covers the first fifth of a 1M axis on
+   * every row and equal windows line up across rows.
+   */
+  const percentOf = (raw: number): number => (max > 0 ? Math.min(100, Math.max(0, (raw / max) * 100)) : 0)
+  /** Label/tick transforms that keep the end marks inside the field. */
+  const edgeTransform = (percent: number): string => (
+    percent >= 99.5 ? 'translate(-100%, -50%)' : percent <= 0.5 ? 'translate(0, -50%)' : 'translate(-50%, -50%)'
+  )
   const trackRef = useRef<HTMLDivElement | null>(null)
   const span = max > min ? max - min : 0
-  const ratio = span > 0 ? Math.min(1, Math.max(0, (value - min) / span)) : 0
   /** The offered values that actually fit the shared axis, ascending. */
   const anchors = useMemo(() => {
     if (snapTo === undefined || snapTo.length === 0) return undefined
@@ -324,6 +345,14 @@ export function QdpSlider({
       .sort((a, b) => a - b)
     return inRange.length > 0 ? inRange : undefined
   }, [max, min, snapTo])
+  /** Where the grab tick and the filled rail end. */
+  const fillPercent = percentOf(value)
+  /**
+   * The rail stops at the widest offered window, not at the axis end: a row that
+   * offers only 200K / 400K draws a shorter rail instead of empty track beyond
+   * its last tier (the official control behaves the same way).
+   */
+  const railPercent = percentOf(anchors === undefined ? max : anchors[anchors.length - 1] ?? max)
   const snap = useCallback(
     (raw: number): number => {
       const clamped = Math.min(max, Math.max(min, raw))
@@ -443,24 +472,42 @@ export function QdpSlider({
         onPointerCancel={release}
         onKeyDown={onKeyDown}
       >
+        {/* The rail sits on the field's vertical centre; the label row hangs
+            below it, both inside the focusable field like the upstream control. */}
         <div className="qdp-sliderTrack" ref={trackRef}>
-          <div className="qdp-sliderFill" style={{ width: `${(ratio * 100).toFixed(2)}%` }} />
-          <span className="qdp-sliderThumb" style={{ left: `${(ratio * 100).toFixed(2)}%` }} />
+          <div className="qdp-sliderRail" style={{ width: `${railPercent.toFixed(2)}%` }} />
+          <div className="qdp-sliderFill" style={{ width: `${fillPercent.toFixed(2)}%` }} />
+          <span className="qdp-sliderThumb" style={{ left: `calc(${fillPercent.toFixed(2)}% - 5px)` }} />
+        </div>
+        <div className="qdp-windowTicks">
+          {/* Hairline ruler: 33 marks along the rail, every eighth one taller and
+              darker, dropping off past the last offered window. */}
+          {Array.from({ length: SLIDER_RULER_MARKS }, (_, index) => {
+            const percent = (index / (SLIDER_RULER_MARKS - 1)) * 100
+            if (percent > railPercent + 0.01) return null
+            return (
+              <span
+                key={`mark-${index}`}
+                aria-hidden="true"
+                className={cx('qdp-windowTickMark', index % 8 === 0 && 'qdp-windowTickMarkMajor')}
+                style={{ left: `${percent.toFixed(2)}%` }}
+              />
+            )
+          })}
+          {(ticks ?? []).map(tick => {
+            const percent = percentOf(tick)
+            return (
+              <span
+                key={tick}
+                className={cx('qdp-windowTick', tick === value && 'qdp-windowTickActive')}
+                style={{ left: `${percent.toFixed(2)}%`, transform: edgeTransform(percent) }}
+              >
+                {formatValue(tick)}
+              </span>
+            )
+          })}
         </div>
       </div>
-      {ticks !== undefined && ticks.length > 0 && (
-        <div className="qdp-windowTicks">
-          {ticks.map(tick => (
-            <span
-              key={tick}
-              className={cx('qdp-windowTick', tick === value && 'qdp-windowTickActive')}
-              style={{ left: `${percentOf(tick).toFixed(2)}%` }}
-            >
-              {formatValue(tick)}
-            </span>
-          ))}
-        </div>
-      )}
     </div>
   )
 }
