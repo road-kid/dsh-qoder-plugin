@@ -12,7 +12,7 @@ import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'rea
 import { afterEach, describe, expect, it } from 'vitest'
 import { ModelsPane, type ModelsDraft, type ModelsPaneProps } from '../src/client/ModelsPane.tsx'
 import { QdpSlider } from '../src/client/controls.tsx'
-import { en } from '../src/client/locales.ts'
+import { en, zh } from '../src/client/locales.ts'
 import type { QoderCatalogModelSnapshot } from '../src/status-paths.ts'
 
 const t = (key: keyof typeof en, params: Record<string, unknown> = {}): string =>
@@ -120,6 +120,14 @@ describe('models pane', () => {
     return must(row(modelId).findAll(node => node.props.role === 'slider')[0], `slider for ${modelId}`)
   }
 
+  /** Tick labels under a row's track, active class included in `className`. */
+  function ticks(modelId: string): ReactTestInstance[] {
+    return row(modelId).findAll(node =>
+      typeof node.type === 'string'
+      && typeof node.props.className === 'string'
+      && node.props.className.split(' ').includes('qdp-windowTick'))
+  }
+
   function saveBar(): ReactTestInstance | undefined {
     return hosts(node => node.props.className === 'qdp-saveBar')[0]
   }
@@ -174,12 +182,29 @@ describe('models pane', () => {
       expect(slider(id).props['aria-valuenow']).toBe(200_000)
       expect(slider(id).props['aria-valuetext']).toBe('200K')
     }
-    // Ticks come from the model's declared windows plus both axis ends.
-    const ticks = row('auto').findAll(node => node.props.className === 'qdp-windowTick').map(node => text(node))
-    expect(ticks).toEqual(['200K', '400K', '1M'])
+    // Ticks are exactly the tiers the model offers — the shared axis ends are
+    // not added (that extra minimum label used to sit on top of a row whose
+    // narrowest offer was 272K) — and the tier in force is the dark one.
+    expect(ticks('auto').map(node => text(node))).toEqual(['200K', '400K', '1M'])
+    expect(ticks('auto').map(node => node.props.className.split(' ').includes('qdp-windowTickActive')))
+      .toEqual([true, false, false])
 
     expect(saveBar()).toBeUndefined()
     expect(saves).toHaveLength(0)
+  })
+
+  it('draws only the tiers a row offers, so a 272K row stays readable', async () => {
+    // The international roster's Performance model declares 272K / 400K / 1M
+    // while the shared minimum is 200K: drawing the axis minimum as an extra
+    // label put 「200K」 straight on top of the row's own 「272K」 label.
+    const globalPerformance = modelOf('performance', 'Qoder Performance', [272_000, 400_000, 1_000_000])
+    await mount({ models: [AUTO, globalPerformance] })
+
+    expect(ticks('performance').map(node => text(node))).toEqual(['272K', '400K', '1M'])
+    expect(slider('performance').props['aria-valuenow']).toBe(272_000)
+    expect(ticks('performance')[0]?.props.className).toContain('qdp-windowTickActive')
+    // The shared scale still spans the roster: its left end is the narrowest offer.
+    expect(slider('performance').props['aria-valuemin']).toBe(200_000)
   })
 
   it('labels each model’s reasoning efforts and calls out the upstream default', async () => {
@@ -194,8 +219,34 @@ describe('models pane', () => {
       levels: `${t('effortLow')} · ${t('effortMedium')} · ${t('effortXhigh')}`,
     }))
     expect(autoText).toContain(t('modelEffortsDefault', { name: t('effortMedium') }))
-    // A model that advertises no efforts draws no tag at all.
+    // The tag follows the id chip, so the tiers sit to the right of the model's
+    // name; a model that advertises no efforts says so instead of drawing
+    // nothing at all.
+    expect(autoText.indexOf('auto')).toBeLessThan(autoText.indexOf('Efforts:'))
+    expect(text(row('lite'))).toContain(en.effortsUnsupported)
     expect(text(row('lite'))).not.toContain('Efforts:')
+  })
+
+  it('keeps the effort vocabulary English in the Chinese UI', async () => {
+    /** Same substitution as the pane's `t`, but reading the Chinese dictionary. */
+    const tZh = (key: keyof typeof en, params: Record<string, unknown> = {}): string =>
+      Object.entries(params).reduce(
+        (value, [name, replacement]) => value.replace(`{${name}}`, String(replacement)),
+        zh[key] as string,
+      )
+    await mount({
+      models: [
+        { ...AUTO, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'max' },
+        LITE,
+      ],
+      t: tZh,
+    })
+    // Wire ids are model parameters, not translated UI words: the official
+    // Qoder app lists the same levels, and a translated tag read
+    // 「思考：高 · 最大（默认最大）」.
+    expect(text(row('auto'))).toContain('Efforts: high · max (default max)')
+    expect(text(row('auto'))).not.toMatch(/[\u4e00-\u9fff]/)
+    expect(text(row('lite'))).toContain('not supported')
   })
 
   it('bounds the roster in a scroll region with the sticky header inside it', async () => {
@@ -290,15 +341,12 @@ describe('models pane', () => {
     await act(async () => { button('qdp-models-save').props.onClick() })
     expect(saves).toEqual([{ disabled: [], windows: { auto: 400_000 } }])
 
-    // Without declared windows the 1000-token step remains the granularity.
-    const noDeclared: QoderCatalogModelSnapshot = { id: 'auto', name: 'Qoder Auto', contextWindow: 200_000 }
-    await mount({ models: [noDeclared, PERFORMANCE] })
-    const looseSlider = must(mustRenderer().root.findAllByType(QdpSlider)[0], 'auto slider')
-    expect(looseSlider.props.snapTo).toBeUndefined()
-    expect(slider('auto').props['aria-valuenow']).toBe(200_000)
-    await pressArrowRight('auto')
-    expect(slider('auto').props['aria-valuenow']).toBe(201_000)
-    expect(slider('auto').props['aria-valuetext']).toBe('201K')
+    // A single fixed window offers no alternative: the row shows the number
+    // instead of a slider, so no interpolated size can ever be staged.
+    const fixedWindow: QoderCatalogModelSnapshot = { id: 'auto', name: 'Qoder Auto', contextWindow: 200_000 }
+    await mount({ models: [fixedWindow, PERFORMANCE] })
+    expect(row('auto').findAll(node => node.props.role === 'slider')).toHaveLength(0)
+    expect(text(row('auto'))).toContain('200K')
   })
 
   it('returns a window dragged back to its baseline to the diff', async () => {

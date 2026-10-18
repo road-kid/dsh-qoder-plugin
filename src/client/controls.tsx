@@ -271,14 +271,13 @@ export interface QdpSliderProps {
   /** Tick/value formatter; defaults to `valueText` for the current value. */
   format?: (value: number) => string
   /**
-   * Values a drag settles on when the pointer is released (the catalog's
-   * declared context windows).
+   * Values a drag settles on (the catalog's declared context windows).
    *
-   * While dragging the handle follows the pointer freely (quantized to `step`,
-   * so the number on screen stays readable) — the "stepless" feel the model
-   * slider had before. Only on release does the value snap to the NEAREST of
-   * these offers, so the saved window is always one the upstream declares.
-   * Arrow keys keep stepping through the offers directly.
+   * With offers the pointer moves tier by tier: every drag tick reports the
+   * NEAREST offer, so the handle snaps between declared windows instead of
+   * sliding through interpolated sizes (one slide, one context size). Arrow
+   * keys step through the offers directly. Without offers the drag falls back
+   * to `step` granularity.
    */
   snapTo?: readonly number[]
   /** Root `data-testid`, for tests that need to find the control. */
@@ -287,12 +286,13 @@ export interface QdpSliderProps {
 
 /**
  * Context-window slider: a thick filled rail with a narrow vertical grab handle
- * at the fill's edge (the Qoder model-settings look). Pointer drags anywhere on
- * the surface jump and follow the pointer CONTINUOUSLY; arrows,
- * PageUp/PageDown and Home/End keep it keyboard operable. With `snapTo` the
- * value is snapped to the nearest offered window when the drag ENDS, so a
- * moving handle is a free position while a saved one is always an offer. The
- * component is fully controlled — it never writes anything by itself.
+ * at the fill's edge (the Qoder model-settings look). With `snapTo` a pointer
+ * drag moves the handle one tier at a time (it lands only on the offered
+ * windows); without offers it follows the pointer quantized to `step`. Arrows,
+ * PageUp/PageDown and Home/End keep it keyboard operable, with arrows walking
+ * the offers one by one. Ticks mark the offers and the one in force carries the
+ * high-contrast label. The component is fully controlled — it never writes
+ * anything by itself.
  */
 export function QdpSlider({
   label,
@@ -341,23 +341,25 @@ export function QdpSlider({
     [anchors, max, min, step],
   )
   /**
-   * The value a live drag reports: clamped, then quantized to `step` only.
+   * The value a live drag reports.
    *
-   * Deliberately NOT `snap`: dragging must not jump between the offered
-   * windows, or the handle feels ratcheted. `step` (1 000 tokens by default) is
-   * fine enough that the movement reads as continuous, while keeping the
-   * displayed number free of round-off noise.
+   * With `snapTo` the drag advances tier by tier: every pointer move reports the
+   * nearest offered window, so the handle is never parked between two tiers
+   * (one slide, one context size) and the number under it is always a window the
+   * upstream declares. Without offers the drag is quantized to `step`, keeping
+   * the displayed number free of round-off noise.
    */
   const free = useCallback(
     (raw: number): number => {
+      if (anchors !== undefined) return snap(raw)
       const clamped = Math.min(max, Math.max(min, raw))
       if (step <= 0) return clamped
       const stepped = min + Math.round((clamped - min) / step) * step
       return Math.min(max, Math.max(min, stepped))
     },
-    [max, min, step],
+    [anchors, max, min, snap, step],
   )
-  /** Continuous position of the drag in flight; the release handler snaps it. */
+  /** Pointer position of the drag in flight, kept for the release settle. */
   const lastRaw = useRef<number | undefined>(undefined)
   const fromClientX = useCallback(
     (clientX: number): void => {
@@ -366,7 +368,8 @@ export function QdpSlider({
       const rect = element.getBoundingClientRect()
       const share = rect.width > 0 ? (clientX - rect.left) / rect.width : 0
       const raw = min + Math.min(1, Math.max(0, share)) * span
-      // Remember the free position: the RELEASE handler is what snaps it.
+      // Remember the pointer position, not the reported one: the release uses
+      // it to settle on the offer the pointer ended nearest to.
       lastRaw.current = raw
       onChange(free(raw))
     },
@@ -383,12 +386,12 @@ export function QdpSlider({
     fromClientX(event.clientX)
   }
   /**
-   * End of drag: snap to the nearest offer.
+   * End of drag: settle on the offer nearest the pointer.
    *
-   * `lastRaw` is the continuous position the drag ended at, not `value` — the
-   * controlled parent may still be rendering the previous tick when the release
-   * lands, so reading the raw pointer position is what makes the snap land
-   * where the user let go.
+   * A drag that has offers already reports one on every move, so this only
+   * matters for the last finger position: `lastRaw` is the pointer position the
+   * drag ended at, not `value` — the controlled parent may still be rendering
+   * the previous tick when the release lands.
    */
   const release = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -448,7 +451,11 @@ export function QdpSlider({
       {ticks !== undefined && ticks.length > 0 && (
         <div className="qdp-windowTicks">
           {ticks.map(tick => (
-            <span key={tick} className="qdp-windowTick" style={{ left: `${percentOf(tick).toFixed(2)}%` }}>
+            <span
+              key={tick}
+              className={cx('qdp-windowTick', tick === value && 'qdp-windowTickActive')}
+              style={{ left: `${percentOf(tick).toFixed(2)}%` }}
+            >
               {formatValue(tick)}
             </span>
           ))}

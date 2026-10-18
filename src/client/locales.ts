@@ -205,6 +205,7 @@ export const en = {
   effortHigh: 'high',
   effortXhigh: 'xhigh',
   effortMax: 'max',
+  effortsUnsupported: 'not supported',
   accountCurrent: 'In use',
   creditsRemaining: 'Remaining credit',
   checkInStatus: 'Check-in',
@@ -411,14 +412,21 @@ export const zh: Record<QoderSettingsKey, string> = {
   quotaReadoutEnabledLabel: '在对话框显示积分',
   quotaReadoutEnabledDesc: '在输入框工具条上显示剩余积分标签，点击可展开明细面板。',
   checkInTime: '签到时间',
-  modelEfforts: '思考：{levels}',
-  modelEffortsDefault: '默认{name}',
-  effortMinimal: '最低',
-  effortLow: '低',
-  effortMedium: '中',
-  effortHigh: '高',
-  effortXhigh: '超高',
-  effortMax: '最大',
+  /*
+   * The reasoning-effort tag speaks the upstream's English vocabulary in every
+   * UI language, Chinese included: `high` / `xhigh` / `max` are model wire ids,
+   * not translated UI words, and the official Qoder app lists them untranslated
+   * too. Translating them made the pane read 「思考：高 · 最大（默认最大）」.
+   */
+  modelEfforts: 'Efforts: {levels}',
+  modelEffortsDefault: 'default {name}',
+  effortMinimal: 'minimal',
+  effortLow: 'low',
+  effortMedium: 'medium',
+  effortHigh: 'high',
+  effortXhigh: 'xhigh',
+  effortMax: 'max',
+  effortsUnsupported: 'not supported',
   accountCurrent: '当前使用',
   creditsRemaining: '剩余积分',
   checkInStatus: '签到状态',

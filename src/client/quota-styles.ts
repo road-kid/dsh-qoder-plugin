@@ -678,6 +678,13 @@ export const QUOTA_CSS = `
   color: var(--dsw-alias-label-caption);
   font-variant-numeric: tabular-nums;
 }
+/* A fixed context window: no slider, so the number itself is the control's
+   statement — the enabled value, hence the primary (dark) tone. */
+.qdp-modelWindow {
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
+}
 .qdp-modelRate {
   flex: 0 0 auto;
   font: var(--dsw-font-xxxs-11);
@@ -712,6 +719,11 @@ export const QUOTA_CSS = `
 }
 .qdp-windowTick:last-child {
   transform: translateX(-100%);
+}
+/* The window in force is the only dark number: the other tiers are offers the
+   user has not selected, so they keep the tertiary (grey) tone. */
+.qdp-windowTickActive {
+  color: var(--dsw-alias-label-primary);
 }
 
 /* --------------------------------------------------------------- save bar */

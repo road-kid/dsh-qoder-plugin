@@ -95,19 +95,20 @@ function formatRate(factor: number): string {
 }
 
 /**
- * The reasoning-effort tag's text, or `undefined` when the model advertises no
- * selectable efforts.
+ * The reasoning-effort tag's text: the levels the model can reason at, plus the
+ * upstream default.
  *
- * Wire ids are translated through the locale (unknown ids fall back to their
- * raw spelling), and the upstream's default effort is called out so the user
- * can see which level the model actually runs at until they change it.
+ * The tag speaks the upstream's English wire vocabulary (`low`, `high`,
+ * `xhigh`, `max`, …) in every UI language — the words are model parameters, and
+ * the official Qoder app lists them untranslated. A model that advertises no
+ * selectable effort says so instead of drawing an empty tag.
  */
 function effortsTagText(
   model: QoderCatalogModelSnapshot,
   t: QoderPluginCardInjected['t'],
-): string | undefined {
+): string {
   const efforts = (model.reasoningEfforts ?? []).filter(id => id !== '')
-  if (efforts.length === 0) return undefined
+  if (efforts.length === 0) return t('effortsUnsupported')
   const nameOf = (id: string): string =>
     id === 'low' ? t('effortLow')
       : id === 'medium' ? t('effortMedium')
@@ -118,7 +119,7 @@ function effortsTagText(
                 : id
   const levels = efforts.map(nameOf).join(' · ')
   const fallback = model.defaultReasoningEffort !== undefined && efforts.includes(model.defaultReasoningEffort)
-    ? `（${t('modelEffortsDefault', { name: nameOf(model.defaultReasoningEffort) })}）`
+    ? ` (${t('modelEffortsDefault', { name: nameOf(model.defaultReasoningEffort) })})`
     : ''
   return t('modelEfforts', { levels }) + fallback
 }
@@ -156,15 +157,17 @@ const clampWindow = (value: number, min: number, max: number): number => Math.mi
 const uniqueSorted = (ids: readonly string[]): string[] => [...new Set(ids)].sort((a, b) => a.localeCompare(b))
 
 /**
- * Marks under a row's track: the model's declared windows plus both axis ends,
- * so the shared scale stays readable (contract: min on the left, axisMax on the
- * right). The endpoint labels are the same on every row, which is what lets a
- * 400K on one row line up with a 400K on the next.
+ * The windows this row offers as tiers, clipped to the shared axis.
+ *
+ * These are exactly the values the slider lands on and the marks it draws; the
+ * shared axis ENDS are deliberately not added. On a row whose narrowest offer
+ * sits close to the global minimum (the international roster's Performance
+ * offers 272K while the shared minimum is 200K) the extra minimum label
+ * overlapped the row's own first label. The scale is still shared, so a 400K on
+ * one row keeps lining up with a 400K on the next.
  */
-function rowTicks(model: QoderCatalogModelSnapshot, min: number, max: number): number[] {
-  const declared = declaredWindows(model)
-  const marks = declared.length > 0 ? [min, ...declared, max] : [min, max]
-  return [...new Set(marks)].filter(value => value >= min && value <= max).sort((a, b) => a - b)
+function rowTiers(model: QoderCatalogModelSnapshot, min: number, max: number): number[] {
+  return declaredWindows(model).filter(value => value >= min && value <= max)
 }
 
 /**
@@ -283,6 +286,7 @@ export function ModelsPane({
             const value = staged ?? baseline
             const current = value === undefined ? undefined : clampWindow(value, minWindow, axisMax)
             const effortsText = effortsTagText(model, t)
+            const tiers = rowTiers(model, minWindow, axisMax)
             return (
               <div
                 key={model.id}
@@ -309,23 +313,27 @@ export function ModelsPane({
                       invented when it is unknown (a guessed 1x would claim the
                       model is baseline-priced). */}
                   {model.priceFactor === undefined ? null : <QdpTag>{formatRate(model.priceFactor)}</QdpTag>}
+                  {/* Wire id, right where the upstream GUI shows it. */}
+                  <span className="qdp-modelMeta">{model.id}</span>
                   {/* The effort levels the model can reason at, with the
                       upstream default called out — the same list the official
-                      GUI offers in its model detail view. */}
-                  {effortsText === undefined ? null : <QdpTag>{effortsText}</QdpTag>}
-                  <span className="qdp-modelMeta">{model.id}</span>
+                      GUI offers in its model detail view. Rendered to the RIGHT
+                      of the id so the tiers sit beside the model they belong
+                      to; a model without selectable effort says so. */}
+                  <QdpTag>{effortsText}</QdpTag>
                 </span>
                 <div className="qdp-modelAxis">
                   {current === undefined ? (
                     <span className="qdp-modelMeta">—</span>
+                  ) : tiers.length <= 1 ? (
+                    /* The catalogue offers this model no alternative window, so
+                       the size is fixed: a slider here could only invite values
+                       the upstream never declares. Show the number itself. */
+                    <span className="qdp-modelWindow">{formatTokens(current)}</span>
                   ) : (
-                    /* Snap to the sizes the catalogue offers when the drag
-                       ENDS: while dragging the handle follows the pointer
-                       freely (stepless), then settles on the nearest declared
-                       window so only an offered size is ever saved. Without
-                       declared windows the 1000-token step is used. `snapTo`
-                       is omitted (not undefined) when the catalogue does not
-                       advertise windows. */
+                    /* One slide, one offered size: a pointer move lands on the
+                       neighbouring tier instead of an interpolated window, and
+                       the label of the tier in force is the dark one. */
                     <QdpSlider
                       label={t('contextWindowAria')}
                       value={current}
@@ -335,10 +343,8 @@ export function ModelsPane({
                       disabled={controlsDisabled}
                       onChange={next => changeWindow(model, next)}
                       valueText={formatTokens(current)}
-                      {...(model.supportedContextWindows === undefined
-                        ? {}
-                        : { snapTo: model.supportedContextWindows })}
-                      ticks={rowTicks(model, minWindow, axisMax)}
+                      snapTo={tiers}
+                      ticks={tiers}
                       format={formatTokens}
                       testId={`qdp-window-${model.id}`}
                     />
