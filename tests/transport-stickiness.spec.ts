@@ -342,9 +342,21 @@ describe('QoderTransport session stickiness', () => {
 
   it('evicts the oldest session once the pin table is full', async () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
+    /*
+     * The transport's clock advances past any penalty window on every read.
+     *
+     * This test needs Alpha to keep being tried on every request (its subject
+     * is pin eviction, and the Alpha→Beta walk is what re-pins each session),
+     * while the T5 ledger would correctly retire Alpha for thirty minutes after
+     * three landed hard failures. Advancing the clock keeps the ledger's
+     * windows expired without touching the behaviour under test; a day per
+     * read outruns even the six-hour ceiling the ladder reaches.
+     */
+    let clock = 1_700_000_000_000
     const { transport, upstream } = harness({
       failover: poolState.hooks,
       stickiness: { rounds: () => 100, requests: () => 0, minutes: () => 0 },
+      now: () => (clock += 24 * 60 * 60 * 1000),
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
 

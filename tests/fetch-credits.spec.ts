@@ -123,6 +123,21 @@ describe('fetchCredits shapes', () => {
     expect(readAccount).toHaveBeenCalledWith({ force: true })
   })
 
+  it('forwards the caller\'s coalescing window without softening the force', async () => {
+    const readAccount = vi.fn(async () => account(undefined))
+    await clientFor(undefined, readAccount as never).fetchCredits(undefined, { maxAgeMs: 5_000 })
+    // Force still says "this is the read the user is looking at"; the window
+    // only lets the reader answer a same-credential burst from its last read.
+    expect(readAccount).toHaveBeenCalledWith({ force: true, minIntervalMs: 5_000 })
+  })
+
+  it('omits the window entirely when the caller did not ask for one', async () => {
+    const readAccount = vi.fn(async () => account(undefined))
+    const controller = new AbortController()
+    await clientFor(undefined, readAccount as never).fetchCredits(controller.signal)
+    expect(readAccount).toHaveBeenCalledWith({ force: true, signal: controller.signal })
+  })
+
   it('propagates an upstream failure for the status route to classify', async () => {
     const reader = vi.fn(async () => { throw new Error('AUTH 401') })
     await expect(clientFor(undefined, reader as never).fetchCredits()).rejects.toThrow('AUTH 401')

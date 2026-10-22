@@ -15,15 +15,31 @@ test('qoderHttpError maps HTTP status classes to DSH error codes', () => {
     [401, 'AUTH'],
     [403, 'AUTH'],
     [408, 'TIMEOUT'],
+    [418, 'TRANSIENT'],
     [429, 'RATE_LIMIT'],
     [500, 'SERVER'],
     [503, 'SERVER'],
+    [404, 'INVALID_REQUEST'],
+    [422, 'INVALID_REQUEST'],
   ] as const
   for (const [status, code] of cases) {
     const error = qoderHttpError(`HTTP ${status}`, new Response(null, { status }))
     assert.equal(error.code, code)
     assert.equal(error.failure.status, status)
   }
+})
+
+test('qoderHttpError reads 418 as a transient upstream fault, not a client error', () => {
+  // The reference gateway's TRANSIENT_HTTP_CODES lists 418 because Qoder wraps
+  // its own provider failure into that status. Classifying it INVALID_REQUEST
+  // (as any unlisted 4xx used to be) told the transport that switching cannot
+  // help, so the pool was never walked for a condition another account clears.
+  const error = qoderHttpError('Qoder upstream service returned HTTP 418.', new Response(null, { status: 418 }))
+  assert.equal(error.code, 'TRANSIENT')
+  assert.equal(error.failure.status, 418)
+  // Transient is not an authorization rejection: the same-account job-token
+  // self-heal must not spend an exchange on it.
+  assert.equal(isQoderAuthRejection(error), false)
 })
 
 test('retryAfterMs accepts delay-seconds and future HTTP dates', () => {

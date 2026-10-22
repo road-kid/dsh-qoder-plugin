@@ -8,8 +8,9 @@ export interface QoderLogger {
 
 const sensitiveKey = /(?:authorization|credential|password|secret|token)/iu
 const identifierKey = /^(?:accountId|id|uid|userId)$/iu
-const tokenValue = /\b(?:jrt|jt|pt)-[\w.-]+\b/giu
-const bearerValue = /Bearer\s+[^\s,;]+/giu
+/** Shared with the inner-error observer so the two redactors cannot drift. */
+export const tokenValue = /\b(?:jrt|jt|pt)-[\w.-]+\b/giu
+export const bearerValue = /Bearer\s+[^\s,;]+/giu
 const maxDepth = 4
 const maxEntries = 50
 const maxStringLength = 500

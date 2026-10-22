@@ -108,6 +108,42 @@ function deauthorizeDigits(message: string): string {
   return message.replace(/\b(?:401|403)\b/gu, 'throttled')
 }
 
+/**
+ * Upstream HTTP statuses that mean "the provider itself stumbled", not "the
+ * request is wrong".
+ *
+ * Taken from the reference gateway (`qoder2api-hub/qoder_proxy.py`:
+ * `TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)`), which treats exactly
+ * these as same-account retry candidates. The 5xx members already classify as
+ * `SERVER` here; 418 is the one that used to fall through to
+ * `INVALID_REQUEST`, the code that tells the transport switching cannot help.
+ * Observed upstream shape: Qoder answers a provider failure as HTTP 418
+ * wrapping `provider_error`, so retrying or trying another account CAN clear
+ * it — the opposite of the request-error contract `INVALID_REQUEST` carries.
+ *
+ * The 4xx statuses with no transient meaning (400, 404, 405, 422, ...) keep
+ * classifying as client errors: an identical request fails identically on
+ * every identity, and switching would only obscure the real answer. The
+ * reference also promotes some other 4xx to transient when the body carries
+ * `provider_error`; doing that here needs a body-inspection policy decision
+ * (which messages count, and what a localised or reworded body does), so it is
+ * deliberately left out and listed as pending confirmation in the task report.
+ */
+const transientHttpCodes: readonly number[] = [418]
+
+/**
+ * The last-resort code for an HTTP status the classifier did not name.
+ *
+ * `SERVER` would have accepted the 418 as well, but it would also have erased
+ * the one distinction later policies need: a 5xx is a gateway-side failure of
+ * the response, while a 418 is the upstream packaging its own provider fault
+ * into a non-5xx status. Both are switch- and retry-eligible today, yet the
+ * self-harm guard has to be able to say "this was an upstream transient, not a
+ * hard account failure" without re-deriving it from the number. A dedicated
+ * code costs one extra arm here and keeps that vocabulary honest.
+ */
+const transientCode = 'TRANSIENT'
+
 export function qoderHttpError(
   message: string,
   response: { status: number; headers?: Pick<Headers, 'get'> },
@@ -158,11 +194,13 @@ export function qoderHttpError(
       ? 'TIMEOUT'
       : status === 429
         ? 'RATE_LIMIT'
-        : status >= 500 && status <= 599
-          ? 'SERVER'
-          : status >= 400 && status <= 499
-            ? 'INVALID_REQUEST'
-            : 'PROVIDER_ERROR'
+        : transientHttpCodes.includes(status)
+          ? transientCode
+          : status >= 500 && status <= 599
+            ? 'SERVER'
+            : status >= 400 && status <= 499
+              ? 'INVALID_REQUEST'
+              : 'PROVIDER_ERROR'
   return new QoderLlmError(message, code, {
     status,
     ...headerRetryAfterMs === undefined ? {} : { providerRetryAfterMs: headerRetryAfterMs },

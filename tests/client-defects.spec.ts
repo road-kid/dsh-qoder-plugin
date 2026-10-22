@@ -2,6 +2,7 @@ import { createElement } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FALLBACK_QODER_MODELS } from '../src/catalog.ts'
+import { resetQuotaSignIn, resetQuotaStatusDocuments } from '../src/client/quota-settings-store.ts'
 import { QoderPluginCard } from '../src/client/QoderPluginCard.tsx'
 import { QoderProbeControl } from '../src/client/QoderProbeControl.tsx'
 import { ModelsPane } from '../src/client/ModelsPane.tsx'
@@ -153,6 +154,10 @@ beforeEach(() => {
 
 afterEach(() => {
   act(() => view?.unmount())
+  // The status documents are module state shared across tests in this file;
+  // a cached document would otherwise serve the previous case's mocked body.
+  resetQuotaStatusDocuments()
+  resetQuotaSignIn()
   vi.unstubAllGlobals()
 })
 

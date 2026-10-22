@@ -25,7 +25,7 @@ export interface QoderTransport {
    * can price every pooled account in one status document without switching the
    * active pointer — the read is a plain GET, it does not adopt the credential.
    */
-  readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; pat?: string | undefined }): Promise<QoderAccountInfo>
+  readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; pat?: string | undefined; minIntervalMs?: number | undefined }): Promise<QoderAccountInfo>
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>
 }
 
@@ -174,7 +174,13 @@ export interface QoderTransportOptions {
    * the live settings of each request instead of freezing them at construction.
    */
   queueWait?: {
-    /** How many times one attempt may wait a queue answer out. */
+    /**
+     * How many times one REQUEST may wait a queue answer out.
+     *
+     * The budget is spent on the request, not refreshed per account: a request
+     * that walks the pool is still one caller waiting, and resetting the budget
+     * on a switch would multiply the caller's wait by the pool size.
+     */
     attempts: () => number
     /**
      * Fallback wait in seconds, used only when the queue answer advertises no
@@ -226,6 +232,13 @@ export interface QoderTransportOptions {
    * out without waiting for real minutes, and so the host can share one clock.
    */
   now?: () => number
+  /**
+   * Randomness for the queue wait's jitter.
+   *
+   * Injectable so a test can pin the spread instead of asserting on a
+   * distribution; production leaves it to `Math.random`.
+   */
+  random?: () => number
 }
 
 export function createQoderTransport(options: QoderTransportOptions): QoderTransport {

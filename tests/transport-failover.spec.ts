@@ -300,6 +300,61 @@ describe('QoderTransport account failover', () => {
     expect(refreshed).not.toHaveBeenCalled()
   }, 15_000)
 
+  it('switches and retries on a transient 418 that wraps an upstream provider fault', async () => {
+    const poolState = pool({ accounts: [ALPHA, BETA] })
+    const { transport, upstream: fake } = harness({
+      failover: poolState.hooks,
+      chat: pat => pat === ALPHA.pat ? new Response('', { status: 418 }) : sseChat('from-b'),
+    })
+
+    const chunks = await drain(transport)
+
+    // 418 is the upstream packaging its own provider fault, not a request
+    // error: another identity can clear it, so it must walk the pool. Before
+    // the T1 fix every unlisted 4xx coded INVALID_REQUEST, which the transport
+    // treats as "switching cannot help", so the second account was never tried.
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat])
+    expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'from-b')).toBe(true)
+    expect(poolState.switches).toHaveLength(1)
+    expect(poolState.switches[0]).toMatchObject({ fromId: ALPHA.id, toId: BETA.id })
+    expect(poolState.switches[0]?.reason).toBe('upstream TRANSIENT (HTTP 418)')
+  })
+
+  it('surfaces a persistently transient 418 without self-healing or leaking a token', async () => {
+    // A realistic PAT length on purpose: the logger masks identifiers by
+    // keeping their last four characters, which for a short fixture token would
+    // reveal the whole secret and make the leak assertion meaningless.
+    const secret = account('acct-secret', 'pt-very-secret-token-123456')
+    const poolState = pool({ accounts: [secret] })
+    const logger = { debug: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const { transport, upstream: fake } = harness({
+      failover: poolState.hooks,
+      options: { logger },
+      // The body is echoed verbatim into the diagnostic path when it is read;
+      // nothing built from this failure may carry the job token that signed it.
+      chat: () => new Response(`{"code":"provider_error","message":"Error in upstream response","token":"jt-${secret.pat}"}`, {
+        status: 418,
+        headers: { 'content-type': 'application/json' },
+      }),
+    })
+
+    const error = await drainError(transport)
+
+    expect(error).toBeInstanceOf(QoderLlmError)
+    expect((error as QoderLlmError).code).toBe('TRANSIENT')
+    expect((error as QoderLlmError).failure.status).toBe(418)
+    // A transient fault is not an authorization rejection, so no job-token
+    // exchange is spent on it: one strategy per failure class.
+    expect(fake.exchanges).toEqual([secret.pat])
+    expect(fake.chatPats).toEqual([secret.pat])
+    // Single-account pool: the walk has nowhere to go, so the honest status is
+    // thrown as-is rather than turned into a synthetic wait.
+    expect(poolState.switches).toEqual([])
+    expect((error as QoderLlmError).message).not.toContain(secret.pat)
+    const logs = JSON.stringify([...logger.debug.mock.calls, ...logger.warn.mock.calls, ...logger.error.mock.calls])
+    expect(logs).not.toContain(secret.pat)
+  })
+
   it('switches on a rate-limit rejection, which the self-heal never claims', async () => {
     const poolState = pool({ accounts: [ALPHA, BETA] })
     const { transport, upstream: fake } = harness({
@@ -489,5 +544,100 @@ describe('QoderTransport account failover', () => {
     expect(disabledPool.switches).toEqual([])
     expect((disabledError as QoderLlmError).code).toBe((absentError as QoderLlmError).code)
     expect((disabledError as QoderLlmError).message).toBe((absentError as QoderLlmError).message)
+  })
+})
+
+describe('QoderTransport account penalties (blame deferred)', () => {
+  it('cools the failing account once another account serves the request', async () => {
+    const poolState = pool({ accounts: [ALPHA, BETA] })
+    const { transport, upstream: fake } = harness({
+      failover: poolState.hooks,
+      // A soft rate limit is a penalty on the first offence: the account was
+      // throttled while another identity served the same request, so there is
+      // no need to collect three failures before cooling it.
+      chat: pat => pat === ALPHA.pat ? new Response('', { status: 429 }) : sseChat('from-b'),
+    })
+
+    const chunks = await drain(transport)
+    expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'from-b')).toBe(true)
+
+    // Beta serving the very same request is the evidence that Alpha's failure
+    // was Alpha's problem, so the walk that just ended is allowed to blame it.
+    // The next request must not start on the account the ledger is cooling down.
+    await drain(transport)
+
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat, BETA.pat])
+    expect(poolState.switches.map(info => [info.fromId, info.toId, info.reason])).toEqual([
+      [ALPHA.id, BETA.id, 'upstream RATE_LIMIT (HTTP 429)'],
+      [ALPHA.id, BETA.id, 'account cooling down after repeated failures'],
+    ])
+  })
+
+  it('punishes nobody when the whole pool fails', async () => {
+    const poolState = pool({ accounts: [ALPHA, BETA] })
+    const { transport, upstream: fake } = harness({
+      failover: poolState.hooks,
+      chat: () => new Response('', { status: 503 }),
+    })
+
+    const firstError = await drainError(transport)
+    expect((firstError as QoderLlmError).code).toBe('SERVER')
+    // No account served the request, so neither failure has been exonerated:
+    // the pending blame is discarded rather than burning both accounts.
+    const secondError = await drainError(transport)
+    expect((secondError as QoderLlmError).code).toBe('SERVER')
+
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
+    // No proactive "cooling" switch: the second walk starts on Alpha exactly as
+    // the first one did.
+    expect(poolState.switches.map(info => info.reason)).toEqual([
+      'upstream SERVER (HTTP 503)',
+      'upstream SERVER (HTTP 503)',
+    ])
+  })
+
+  it('clears the penalty once the account serves a request again', async () => {
+    const switches: Array<{ fromId: string; toId: string; reason: string }> = []
+    let accounts: Array<{ id: string; pat: string }> = [ALPHA, BETA]
+    let active: { id: string; pat: string } = ALPHA
+    // A small host stand-in that adopts the switch like the real one does, and
+    // whose pool the test can reshape between requests.
+    const failover: QoderFailoverHooks = {
+      enabled: () => true,
+      async activeAccount() {
+        return active
+      },
+      async nextAccount(id) {
+        const index = accounts.findIndex(candidate => candidate.id === id)
+        if (index === -1) return undefined
+        return accounts[index + 1]
+      },
+      async switched(info) {
+        switches.push(info)
+        active = accounts.find(candidate => candidate.id === info.toId) ?? active
+      },
+    }
+    const { transport, upstream: fake } = harness({
+      failover,
+      // Alpha is refused on the first request, then serves the later ones.
+      chat: (pat, call) => pat === ALPHA.pat && call === 1
+        ? new Response('', { status: 429 })
+        : sseChat(`from-${pat}`),
+    })
+
+    await drain(transport)
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat])
+
+    // Alpha is left alone in the pool, so the cooling skip has no alternative:
+    // the request runs on Alpha anyway, its success clears the ledger, and the
+    // following two-account request must start on it again.
+    accounts = [ALPHA]
+    active = ALPHA
+    await drain(transport)
+    accounts = [ALPHA, BETA]
+    await drain(transport)
+
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, ALPHA.pat])
+    expect(switches).toHaveLength(1)
   })
 })

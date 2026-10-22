@@ -11,6 +11,7 @@ import {
   type CheckInRecord,
 } from '../src/checkin-scheduler.ts'
 import { QoderLlmError } from '../src/qoder/errors.ts'
+import { metadataCosyVersion } from '../src/qoder/transport/wire/version.ts'
 
 describe('QoderCheckInService', () => {
   function createMockAuth(token = 'mock-job-token'): QoderAuthService {
@@ -676,6 +677,15 @@ describe('QoderCheckInService risk identity', () => {
     expect(headers['cosy-machinecode']).toBe('code-1')
     expect(headers['cosy-machinetype']).toBe('type-1')
     expect(headers['cosy-clienttype']).toBe('10')
+    // The campaign family presents the DESKTOP build, not the CLI one: the
+    // reference implementation pins its Cosy-Version to the desktop client
+    // version, and the measured header set depends on it.
+    expect(headers['cosy-version']).toBe(metadataCosyVersion)
+    // The per-account derived device id/hostname of the inference path must
+    // never appear here: the campaign upstream only honours the real client
+    // identity, so substituting a derived one would silently empty the list.
+    expect(headers).not.toHaveProperty('Cosy-Machineid')
+    expect(headers).not.toHaveProperty('Cosy-Machinehostname')
   })
 
   it('reports a missing client instead of claiming the account has no campaign', async () => {

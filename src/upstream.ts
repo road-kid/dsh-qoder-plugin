@@ -869,11 +869,21 @@ export class QoderUpstreamClient {
    * to is the one staleness the card must not show. The per-account pool read
    * ({@link fetchAccountBilling}) is the opposite case and uses the cache.
    *
+   * `maxAgeMs` is the caller's coalescing window, not a cache: the status route
+   * hands a document to a page that mounts, prefetches, and polls, and each of
+   * those used to spend its own billing round trip. Reusing an answer younger
+   * than that window collapses the burst; the per-token cache key keeps the
+   * window from ever spanning two credentials.
+   *
    * The mapping itself lives in {@link creditsFromUsage}, shared with the pool
    * read so both price an account identically.
    */
-  async fetchCredits(signal?: AbortSignal): Promise<QoderCredits> {
-    const account: QoderAccountInfo = await this.transport.readAccount({ force: true, ...signal === undefined ? {} : { signal } })
+  async fetchCredits(signal?: AbortSignal, options?: { maxAgeMs?: number | undefined }): Promise<QoderCredits> {
+    const account: QoderAccountInfo = await this.transport.readAccount({
+      force: true,
+      ...options?.maxAgeMs === undefined ? {} : { minIntervalMs: options.maxAgeMs },
+      ...signal === undefined ? {} : { signal },
+    })
     // Record WHO this billing answer belongs to; the name rides the next
     // status document and the PAT box shows it beside the token tail.
     this.accountName = account.profile.name === '' ? undefined : account.profile.name

@@ -7,6 +7,10 @@ import { QoderCredentialStore, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL } from '..
 import { type QoderModelInfo } from '../src/catalog.ts'
 import { qoderStatusHandler, qoderWebStatus, QODER_STATUS_PATH, type QoderStatusRouteOptions } from '../src/web-status.ts'
 import { CHINA_VARIANT } from '../src/variants.ts'
+import {
+  recordQoderInnerError,
+  resetQoderInnerErrors,
+} from '../src/qoder/transport/wire/inner-errors.ts'
 
 /**
  * The same-origin status route on its Qoder shape: the signed-in document
@@ -107,6 +111,84 @@ async function startStatusServer(overrides: Partial<QoderStatusRouteOptions> = {
 }
 
 describe('signed-in document assembly', () => {
+  it('asks for the credits with a coalescing window, not a bare forced read', async () => {
+    const own = join(await tempDir(), '.qoder-auth.json')
+    await writePatDoc(own)
+    const fetchCredits = vi.fn(async (_signal?: AbortSignal, _options?: { maxAgeMs?: number }) => ({
+      total: 7,
+      accounts: [],
+    }))
+    const doc = await qoderWebStatus({ ...baseDeps(own), client: { fetchCredits } })
+    expect(doc.status).toBe('signed-in')
+    if (doc.status !== 'signed-in') return
+    expect(doc.credits).toMatchObject({ total: 7 })
+    expect(fetchCredits).toHaveBeenCalledTimes(1)
+    const [, options] = fetchCredits.mock.calls[0]!
+    // A window in milliseconds, small enough to stay a burst coalescer: the
+    // page mounts and prefetches within it, the poll interval outlives it.
+    expect(options?.maxAgeMs).toBeGreaterThan(0)
+    expect(options?.maxAgeMs).toBeLessThanOrEqual(60_000)
+  })
+
+  it('exposes the inner-stream error counters as a read-only snapshot', async () => {
+    const own = join(await tempDir(), '.qoder-auth.json')
+    await writePatDoc(own)
+    resetQoderInnerErrors()
+    recordQoderInnerError('rate_limit')
+    recordQoderInnerError('rate_limit')
+    recordQoderInnerError('content_policy')
+    const doc = await qoderWebStatus(baseDeps(own))
+    expect(doc.status).toBe('signed-in')
+    if (doc.status !== 'signed-in') return
+    // The health/status channel is where an inner failure becomes visible;
+    // counts are per process and the document only reads them.
+    expect(doc.innerErrors?.rate_limit).toBe(2)
+    expect(doc.innerErrors?.content_policy).toBe(1)
+    expect(doc.innerErrors?.auth).toBe(0)
+  })
+
+  it('reports zeroed counters when no inner error was observed', async () => {
+    const own = join(await tempDir(), '.qoder-auth.json')
+    await writePatDoc(own)
+    resetQoderInnerErrors()
+    const doc = await qoderWebStatus(baseDeps(own))
+    expect(doc.status).toBe('signed-in')
+    if (doc.status !== 'signed-in') return
+    expect(doc.innerErrors).toEqual({
+      content_policy: 0,
+      rate_limit: 0,
+      invalid_request: 0,
+      auth: 0,
+      other: 0,
+    })
+  })
+
+  it('starts the pool read and the credit read together instead of queueing them', async () => {
+    const own = join(await tempDir(), '.qoder-auth.json')
+    await writePatDoc(own)
+    const started: string[] = []
+    const fetchCredits = async (): Promise<{ total: number; accounts: never[] }> => {
+      started.push('credits')
+      return { total: 3, accounts: [] }
+    }
+    const doc = await qoderWebStatus({
+      ...baseDeps(own),
+      client: { fetchCredits },
+      accounts: async () => {
+        started.push('accounts')
+        return { entries: [], autoFailover: false }
+      },
+    })
+    // Both reads were STARTED before either was awaited: the local pool read no
+    // longer waits behind the cross-border billing round trip.
+    expect(started).toEqual(['credits', 'accounts'])
+    expect(doc.status).toBe('signed-in')
+    if (doc.status !== 'signed-in') return
+    // ...and the one document still carries both facts.
+    expect(doc.credits).toMatchObject({ total: 3 })
+    expect(doc.accounts).toEqual({ entries: [], autoFailover: false })
+  })
+
   it('reports the redacted PAT summary, region, and credits', async () => {
     const own = join(await tempDir(), '.qoder-auth.json')
     await writePatDoc(own, 'pt-secret-abcd')

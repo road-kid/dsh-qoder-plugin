@@ -144,6 +144,7 @@ interface QueueObservation {
 function harness(spec: UpstreamSpec & {
   failover?: QoderFailoverHooks
   queueWait?: QoderTransportOptions['queueWait']
+  random?: () => number
 }): { transport: QoderTransport; upstream: FakeUpstream; notices: QueueObservation[] } {
   const upstream = fakeUpstream(spec)
   const notices: QueueObservation[] = []
@@ -154,6 +155,7 @@ function harness(spec: UpstreamSpec & {
     fetch: upstream.fetch,
     ...spec.failover === undefined ? {} : { failover: spec.failover },
     ...spec.queueWait === undefined ? {} : { queueWait: spec.queueWait },
+    ...spec.random === undefined ? {} : { random: spec.random },
     onUpstreamQueue: (facts, accountId) => {
       notices.push({ facts: { isQueued: facts.isQueued, ...facts.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: facts.retryAfterSeconds } }, accountId })
     },
@@ -234,6 +236,10 @@ describe('QoderTransport queue waiting', () => {
     const { transport, upstream, notices } = harness({
       failover: poolState.hooks,
       queueWait: { attempts: () => 2, seconds: () => 0.01 },
+      // Pin the jitter to its floor: each wait is then the 1000ms margin plus
+      // 10ms of configured fallback, keeping two waits inside the test timeout
+      // instead of straddling it at random.
+      random: () => 0,
       chat: () => queued(0),
     })
 
@@ -309,6 +315,9 @@ describe('QoderTransport queue waiting', () => {
       fetch: upstream.fetch,
       failover: poolState.hooks,
       queueWait: { attempts: () => 2, seconds: () => 0.01 },
+      // Same as above: the margin is real, so pin the spread and keep the two
+      // waits comfortably inside the timeout.
+      random: () => 0,
       logger,
     })
 

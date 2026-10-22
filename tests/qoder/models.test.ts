@@ -214,6 +214,8 @@ test('fetchQoderModels calls the encoded Global catalog with COSY authentication
     name: 'Subscriber',
     email: 'subscriber@example.com',
     machineID: 'machine-1',
+    derivedMachineID: 'derived-machine-1',
+    machineHostname: 'DESKTOP-ABC1234',
   }, {
     logger: {
       debug: (message, details) => { logs.push({ message, details }) },
@@ -230,6 +232,11 @@ test('fetchQoderModels calls the encoded Global catalog with COSY authentication
   const headers = request?.init?.headers as Record<string, string>
   assert.match(headers.Authorization!, /^Bearer COSY\./u)
   assert.equal(headers['Cosy-Sigpath'], '/api/v2/model/list')
+  // The catalog belongs to the account's derived device identity (not the
+  // shared host id), and the inference-only hostname must never leak into a
+  // metadata request.
+  assert.equal(headers['Cosy-Machineid'], 'derived-machine-1')
+  assert.equal(headers['Cosy-Machinehostname'], undefined)
   assert.equal(typeof (logs[1]?.details as { durationMs?: unknown }).durationMs, 'number')
   assert.deepEqual(logs.map((entry) => {
     if (entry.message !== '[Qoder Models] Catalog request completed') return entry

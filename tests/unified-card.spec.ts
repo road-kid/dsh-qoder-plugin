@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QoderPluginCard, type QoderPluginCardProps } from '../src/client/QoderPluginCard.tsx'
 import { en } from '../src/client/locales.ts'
 import type { QoderSettingsKey } from '../src/client/locales.ts'
-import { noteQuotaSignIn, quotaReadout, setQuotaReadout } from '../src/client/quota-settings-store.ts'
-import { QODER_GLOBAL_STATUS_PATH, QODER_STATUS_PATH } from '../src/status-paths.ts'
+import { noteQuotaStatus, quotaReadout, resetQuotaSignIn, resetQuotaStatusDocuments, setQuotaReadout } from '../src/client/quota-settings-store.ts'
+import { QODER_GLOBAL_STATUS_PATH, QODER_STATUS_PATH, type QoderWebStatus } from '../src/status-paths.ts'
 
 const t = (key: QoderSettingsKey, params: Record<string, unknown> = {}): string =>
   Object.entries(params).reduce(
@@ -74,8 +74,8 @@ describe('Unified Qoder Plugin Card', () => {
 
   afterEach(() => {
     act(() => view?.unmount())
-    noteQuotaSignIn('qoder', false)
-    noteQuotaSignIn('qoder-global', false)
+    resetQuotaSignIn()
+    resetQuotaStatusDocuments()
     // The readout switches are a client preference in the shared store, not a
     // field of the settings face; reset them between tests.
     setQuotaReadout(true)
@@ -110,10 +110,13 @@ describe('Unified Qoder Plugin Card', () => {
   interface MountOptions {
     scope?: ReturnType<typeof fakeScope>
     /** Omit to let the card derive sign-in from its own reads/store. */
-    reported?: { cn: boolean, global: boolean }
+    reported?: { cn: boolean | undefined, global: boolean | undefined }
   }
 
   async function mountUnified(options: MountOptions = {}): Promise<void> {
+    // Replace any instance a case already mounted, so no stale subscription
+    // keeps re-rendering behind the next assertion.
+    act(() => view?.unmount())
     const props = {
       t: t as QoderPluginCardProps['t'],
       // The card is the Plugins page's configuration PAGE, not a collapsed row:
@@ -468,5 +471,91 @@ describe('Unified Qoder Plugin Card', () => {
     expect(hostParts('hour')[0]!.props.disabled).toBe(false)
     expect(hostParts('minute')[0]!.props.disabled).toBe(false)
     expect(hostParts('hour')[0]!.props.value).toBe('14')
+  })
+
+  // ---- stale-while-revalidate: instant paint, background truth -------------
+
+  /** A status body shaped like the host's, for seeding the shared store. */
+  const doc = (patTail: string, region: 'china' | 'global'): QoderWebStatus => ({
+    status: 'signed-in',
+    region,
+    authKey: region === 'china' ? 'cn-auth-key' : 'global-auth-key',
+    pat: { source: 'card', patTail },
+  } as unknown as QoderWebStatus)
+
+  it('paints the document it already has and revalidates it in the background', async () => {
+    noteQuotaStatus('qoder', doc('cached', 'china'))
+    let release: () => void = () => {}
+    const held = new Promise<void>(resolve => { release = resolve })
+    request.mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => ({ ok: true, status: 'saved' }) }
+      await held
+      return { ok: true, status: 200, json: async () => doc('fresh', 'china') }
+    })
+
+    await mountUnified()
+    // The cached account is on screen at once — no spinner, no blank document.
+    expect(json()).toContain(t('patTail', { tail: '****cached' }))
+    expect(json()).not.toContain(en.loading)
+    // The cache is a head start, not a freeze: the mount read was still issued.
+    expect(request.mock.calls.filter(call => call[0] === QODER_STATUS_PATH)).toHaveLength(1)
+
+    await act(async () => {
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    expect(json()).toContain(t('patTail', { tail: '****fresh' }))
+    expect(json()).not.toContain(t('patTail', { tail: '****cached' }))
+  })
+
+  it('prefetches the other variant so its tab opens on an account, not a spinner', async () => {
+    let globalReads = 0
+    request.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => ({ ok: true, status: 'saved' }) }
+      if (String(url) === QODER_GLOBAL_STATUS_PATH) {
+        globalReads += 1
+        // First answer is the prefetch; the tab's own revalidation never lands,
+        // so anything on screen after the switch came from the cache.
+        return globalReads === 1
+          ? { ok: true, status: 200, json: async () => doc('7777', 'global') }
+          : { ok: true, status: 200, json: () => new Promise(() => {}) }
+      }
+      return { ok: true, status: 200, json: async () => doc('1111', 'china') }
+    })
+
+    await mountUnified()
+    // Mount reads the active variant AND warms the sibling.
+    expect(globalReads).toBe(1)
+
+    await act(async () => { tabButtons()[1]!.props.onClick() })
+    expect(json()).toContain(t('patTail', { tail: '****7777' }))
+    expect(json()).not.toContain(en.loading)
+    // The switch revalidated in the background; it did not blank the tab first.
+    expect(globalReads).toBe(2)
+  })
+
+  it('shows an unknown variant as in progress instead of a grey signed-out dot', async () => {
+    await mountUnified({ reported: { cn: true, global: undefined } })
+    const tabDot = (index: number) => tabButtons()[index]!
+      .findAll(node => typeof node.type === 'string' && String(node.props.className ?? '').startsWith('qdp-dot'))
+      .map(node => String(node.props.className))
+      .join(' ')
+    // Known signed-in: the solid dot.
+    expect(tabDot(0)).toContain('qdp-dotDone')
+    // Never read: the spinner, NOT the idle grey that claimed "signed out".
+    expect(tabDot(1)).toContain('qdp-dotOngoing')
+    expect(tabDot(1)).not.toContain('qdp-dotDone')
+  })
+
+  it('keeps the last good document when a revalidation fails', async () => {
+    noteQuotaStatus('qoder', doc('kept', 'china'))
+    request.mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => ({ ok: true, status: 'saved' }) }
+      throw new Error('network down')
+    })
+    await mountUnified()
+    expect(json()).toContain(t('patTail', { tail: '****kept' }))
+    // The failure is reported without replacing the account body with an error.
+    expect(json()).toContain(t('statusRefreshFailed', { message: 'network down' }))
   })
 })

@@ -222,7 +222,7 @@ export class QoderUsageReader {
   private readonly timeoutMs: number
   private readonly region: QoderRegion
   private readonly logger: QoderLogger | undefined
-  private readonly cache = new Map<string, { info: QoderAccountInfo; expiresAt: number }>()
+  private readonly cache = new Map<string, { info: QoderAccountInfo; expiresAt: number; fetchedAtMs: number }>()
   private readonly flights = new SingleFlight<QoderAccountInfo>()
 
   constructor(options: QoderUsageReaderOptions) {
@@ -236,7 +236,7 @@ export class QoderUsageReader {
 
   async readAccount(
     pat: string,
-    options?: { force?: boolean | undefined; signal?: AbortSignal | undefined },
+    options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; minIntervalMs?: number | undefined },
   ): Promise<QoderAccountInfo> {
     if (!pat || typeof pat !== 'string') {
       throw new QoderLlmError(
@@ -246,12 +246,25 @@ export class QoderUsageReader {
     }
 
     const cacheKey = `${this.region}:${opaqueCredentialKey(pat)}`
+    const cached = this.cache.get(cacheKey)
+    const now = Date.now()
 
     if (!options?.force) {
-      const cached = this.cache.get(cacheKey)
-      if (cached && cached.expiresAt > Date.now()) {
+      if (cached && cached.expiresAt > now) {
         return cached.info
       }
+    } else if (options?.minIntervalMs !== undefined && cached !== undefined
+      && now - cached.fetchedAtMs < options.minIntervalMs) {
+      /*
+       * A forced read that is already this recent is reused.
+       *
+       * The status route is read by a page that mounts, prefetches the other
+       * variant, and polls; forcing every one of those reads spent a billing
+       * round trip each, and the page then painted identical numbers. The
+       * cache key carries the credential, so an account switch never reuses
+       * the previous account's answer — only a burst of the same read does.
+       */
+      return cached.info
     }
 
     return this.flights.run(
@@ -313,6 +326,7 @@ export class QoderUsageReader {
     this.cache.set(cacheKey, {
       info: accountInfo,
       expiresAt: Date.now() + this.ttlMs,
+      fetchedAtMs: Date.now(),
     })
 
     return accountInfo

@@ -30,7 +30,7 @@ import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ComposerQuotaChip, type ComposerQuotaInjected } from '../src/client/ComposerQuota.tsx'
 import { en } from '../src/client/locales.ts'
-import { noteQuotaStatus, setQuotaReadout } from '../src/client/quota-settings-store.ts'
+import { noteQuotaStatus, resetQuotaSignIn, resetQuotaStatusDocuments, setQuotaReadout } from '../src/client/quota-settings-store.ts'
 import {
   QODER_AUTH_PATH,
   QODER_STATUS_PATH,
@@ -314,6 +314,8 @@ afterEach(() => {
   })
   view = null
   setQuotaReadout(true)
+  resetQuotaStatusDocuments()
+  resetQuotaSignIn()
   vi.unstubAllGlobals()
 })
 

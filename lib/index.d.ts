@@ -468,6 +468,17 @@ type QoderWebStatus = {
    */
   jobTokenRefreshedAt?: number;
   /**
+   * Inner-stream error counts observed by this process, per class.
+   *
+   * A 200 stream can still fail with the upstream's real reason inside an
+   * inner chunk (content policy, queue/throttle, auth, invalid request).
+   * Those failures are counted by the wire decoder and surfaced here through
+   * the status channel, which is the existing read-only health view; no card
+   * renders them yet (that lands with RISK_STATS). Counters are per process
+   * and reset on restart.
+   */
+  innerErrors?: Partial<Record<'content_policy' | 'rate_limit' | 'invalid_request' | 'auth' | 'other', number>>;
+  /**
    * In-process key authorizing probe control writes. Handed to the card with
    * the status document (the card is same-origin and already had to pass the
    * loopback guard); it is never persisted and rotates per process.
@@ -1174,6 +1185,7 @@ interface QoderTransport {
     force?: boolean | undefined;
     signal?: AbortSignal | undefined;
     pat?: string | undefined;
+    minIntervalMs?: number | undefined;
   }): Promise<QoderAccountInfo>;
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>;
 }
@@ -1370,10 +1382,18 @@ declare class QoderUpstreamClient {
    * to is the one staleness the card must not show. The per-account pool read
    * ({@link fetchAccountBilling}) is the opposite case and uses the cache.
    *
+   * `maxAgeMs` is the caller's coalescing window, not a cache: the status route
+   * hands a document to a page that mounts, prefetches, and polls, and each of
+   * those used to spend its own billing round trip. Reusing an answer younger
+   * than that window collapses the burst; the per-token cache key keeps the
+   * window from ever spanning two credentials.
+   *
    * The mapping itself lives in {@link creditsFromUsage}, shared with the pool
    * read so both price an account identically.
    */
-  fetchCredits(signal?: AbortSignal): Promise<QoderCredits>;
+  fetchCredits(signal?: AbortSignal, options?: {
+    maxAgeMs?: number | undefined;
+  }): Promise<QoderCredits>;
   /**
    * Run daily benefit check-in for this client's variant.
    */

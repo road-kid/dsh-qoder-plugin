@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { QoderAuthService } from '../../src/qoder/transport/auth.ts'
 import { QoderLlmError } from '../../src/qoder/errors.ts'
 import { QoderUsageReader } from '../../src/qoder/transport/account-reader.ts'
+import { qoderUserAgent } from '../../src/qoder/transport/wire/version.ts'
 
 test('QoderUsageReader reads subscriber profile and quota usage, and caches within TTL', async () => {
   let quotaCalls = 0
@@ -309,9 +310,9 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
   assert.equal(statusHeaders?.authorization, 'Bearer jt-plan-test')
   assert.equal(statusHeaders?.['Cosy-MachineToken'], 'umid-fingerprint-test')
   assert.equal(statusHeaders?.['Cosy-MachineType'], 'host')
-  assert.equal(planHeaders?.['user-agent'], 'qoder/1.1.47')
-  assert.equal(statusHeaders?.['user-agent'], 'qoder/1.1.47')
-  assert.equal(quotaHeaders?.['user-agent'], 'qoder/1.1.47')
+  assert.equal(planHeaders?.['user-agent'], qoderUserAgent)
+  assert.equal(statusHeaders?.['user-agent'], qoderUserAgent)
+  assert.equal(quotaHeaders?.['user-agent'], qoderUserAgent)
   assert.equal(planHeaders?.['cosy-clienttype'], '5')
   assert.equal(statusHeaders?.['cosy-clienttype'], '5')
   assert.equal(quotaHeaders?.['cosy-clienttype'], '5')
@@ -352,4 +353,66 @@ test('QoderUsageReader degrades gracefully when plan or status endpoint returns 
   assert.equal(account.usage?.userQuota?.remaining, 40)
   assert.equal(account.plan, undefined)
   assert.equal(account.status, undefined)
+})
+
+test('QoderUsageReader coalesces a burst of forced reads inside minIntervalMs and re-reads after it', async () => {
+  let quotaCalls = 0
+  const fetchMock = async (input: URL | Request): Promise<Response> => {
+    const url = String(input)
+    if (url.includes('/jobToken/exchange')) {
+      return new Response(JSON.stringify({ token: 'jt-coalesce', expires_in: 3_600_000 }), { status: 200 })
+    }
+    if (url.includes('/userinfo')) {
+      return new Response(JSON.stringify({ id: 'user-burst', name: 'Burst Dev' }))
+    }
+    if (url.includes('/quota/usage')) {
+      quotaCalls++
+      return new Response(JSON.stringify({
+        userQuota: { total: 100, used: quotaCalls, remaining: 100 - quotaCalls, unit: 'credits' },
+      }), { status: 200 })
+    }
+    throw new Error(`unexpected URL: ${url}`)
+  }
+
+  const authService = new QoderAuthService({
+    fetch: fetchMock as typeof fetch,
+    resolveMachineId: () => 'machine-burst',
+  })
+  const reader = new QoderUsageReader({
+    authService,
+    fetch: fetchMock as typeof fetch,
+    ttlMs: 60_000,
+  })
+
+  // A controllable clock: the window is a time comparison, so make time explicit.
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    const first = await reader.readAccount('pt-burst', { force: true, minIntervalMs: 10_000 })
+    assert.equal(quotaCalls, 1)
+
+    // Inside the window a forced read is answered from the last read: the page
+    // mounts, prefetches, and polls; none of those may cost a billing round trip.
+    now += 2_000
+    const second = await reader.readAccount('pt-burst', { force: true, minIntervalMs: 10_000 })
+    assert.equal(quotaCalls, 1)
+    assert.equal(second, first)
+
+    // A different credential never reuses the previous account's answer.
+    now += 1_000
+    await reader.readAccount('pt-other-burst', { force: true, minIntervalMs: 10_000 })
+    assert.equal(quotaCalls, 2)
+
+    // Past the window the forced read is a real read again.
+    now += 20_000
+    await reader.readAccount('pt-burst', { force: true, minIntervalMs: 10_000 })
+    assert.equal(quotaCalls, 3)
+
+    // Without a window, force keeps its old meaning: always read now.
+    await reader.readAccount('pt-burst', { force: true })
+    assert.equal(quotaCalls, 4)
+  } finally {
+    Date.now = realNow
+  }
 })

@@ -11,6 +11,7 @@ import {
   type QoderPluginCardProps,
 } from '../src/client/QoderPluginCard.tsx'
 import { en, zh } from '../src/client/locales.ts'
+import { resetQuotaSignIn, resetQuotaStatusDocuments } from '../src/client/quota-settings-store.ts'
 import type { QoderSettingsKey } from '../src/client/locales.ts'
 import {
   QODER_AUTH_PATH,
@@ -225,6 +226,10 @@ describe('plugin card per variant', () => {
 
   afterEach(() => {
     act(() => view?.unmount())
+    resetQuotaStatusDocuments()
+    resetQuotaSignIn()
+    resetQuotaStatusDocuments()
+    resetQuotaSignIn()
     vi.unstubAllGlobals()
   })
 

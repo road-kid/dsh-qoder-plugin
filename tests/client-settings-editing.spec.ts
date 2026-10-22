@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QoderPluginCard, type QoderPluginCardProps } from '../src/client/QoderPluginCard.tsx'
 import { en } from '../src/client/locales.ts'
 import type { QoderSettingsKey } from '../src/client/locales.ts'
-import { noteQuotaSignIn, setQuotaReadout } from '../src/client/quota-settings-store.ts'
+import { resetQuotaSignIn, resetQuotaStatusDocuments, setQuotaReadout } from '../src/client/quota-settings-store.ts'
 import { QODER_GLOBAL_STATUS_PATH, QODER_STATUS_PATH } from '../src/status-paths.ts'
 import { QdpNumberField } from '../src/client/controls.tsx'
 import { OwnQuotaSettingsScope } from '../src/client/http-settings-scope.ts'
@@ -124,8 +124,8 @@ describe('Advanced settings editing', () => {
 
   afterEach(() => {
     act(() => view?.unmount())
-    noteQuotaSignIn('qoder', false)
-    noteQuotaSignIn('qoder-global', false)
+    resetQuotaSignIn()
+    resetQuotaStatusDocuments()
     setQuotaReadout(true)
     vi.unstubAllGlobals()
   })
@@ -396,7 +396,7 @@ describe('OwnQuotaSettingsScope', () => {
 
   const document = (key: string, value: Record<string, unknown>) => ({ key, value, base: {}, user: {} })
 
-  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); resetQuotaStatusDocuments(); resetQuotaSignIn() })
 
   it('retries a read that raced the host mount instead of staying on defaults', async () => {
     vi.useFakeTimers()

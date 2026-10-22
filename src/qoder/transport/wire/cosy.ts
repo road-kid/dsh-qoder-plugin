@@ -9,6 +9,7 @@
 
 import crypto from 'node:crypto'
 import { getMachineId } from '../machine-id.ts'
+import { qoderIdeVersion } from './version.ts'
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
@@ -17,7 +18,6 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`
 
-export const qoderIdeVersion = '1.1.47'
 export const qoderClientType = '5'
 /**
  * The desktop client identifier the campaign endpoints require.
@@ -31,7 +31,6 @@ export const qoderClientType = '5'
  * paths must send this one explicitly.
  */
 export const qoderDesktopClientType = '10'
-export const defaultUserAgent = `qoder/${qoderIdeVersion}`
 const qoderDataPolicy = 'disagree'
 const qoderLoginVersion = 'v2'
 const qoderMachineOs = process.platform === 'win32'
@@ -48,7 +47,35 @@ export interface CosyCredentials {
   authToken: string
   name: string
   email: string
+  /**
+   * This host's real, install-wide machine id. Metadata requests (status/plan)
+   * send it as `Cosy-MachineToken`; it is NOT the id the COSY client requests
+   * present, because a shared host id is what makes several accounts look like
+   * one device.
+   */
   machineID?: string
+  /**
+   * Per-account device id derived from the user id. COSY-authenticated client
+   * requests use it for `Cosy-Machineid`/`Cosy-Machinetoken`; when absent (for
+   * example a hand-built credential in a test) the real {@link machineID} is
+   * used so the header is never dropped.
+   */
+  derivedMachineID?: string
+  /**
+   * Per-account hostname label. Only the inference request may carry it, so it
+   * is passed through to {@link buildAuthHeaders}' options rather than being
+   * emitted on every request.
+   */
+  machineHostname?: string
+}
+
+export interface BuildAuthHeadersOptions {
+  /**
+   * Emit `Cosy-Machinehostname`. The official desktop client sends it on the
+   * inference SSE request only; the model list and the metadata/status
+   * endpoints must not receive it, so this is opt-in per call site.
+   */
+  includeMachineHostname?: boolean
 }
 
 interface UserInfo {
@@ -96,6 +123,7 @@ export function buildAuthHeaders(
   body: Buffer | string | null,
   requestURL: string,
   creds: CosyCredentials,
+  options: BuildAuthHeadersOptions = {},
 ): Record<string, string> {
   if (!creds.userID) {
     throw new Error('cosy: user id is empty')
@@ -140,7 +168,18 @@ export function buildAuthHeaders(
     .digest('hex')
   const bodyLen = body ? (Buffer.isBuffer(body) ? body.length : Buffer.from(body).length).toString() : '0'
 
-  const machineID = creds.machineID || getMachineId()
+  /*
+   * COSY-authenticated client requests present the account-derived id on BOTH
+   * machine headers, in pairs: the reference CLI derives machineid and
+   * machinetoken together from the account (qoder_sign.py:595/661-662), and a
+   * request whose id and token disagree would look inconsistent.
+   *
+   * The boundary is deliberate: this module is the chat/inference/model-list
+   * wire only. The metadata requests (status/plan/quota) keep sending this
+   * host's real UMID as `Cosy-MachineToken`, and the campaign path resolves
+   * its own real machine identity — do not move the derivation there.
+   */
+  const machineID = creds.derivedMachineID || creds.machineID || getMachineId()
 
   return {
     Authorization: `Bearer COSY.${payloadB64}.${sig}`,
@@ -152,6 +191,9 @@ export function buildAuthHeaders(
     'Cosy-Machinetoken': machineID,
     'Cosy-Machinetype': qoderMachineTypeMagic,
     'Cosy-Machineos': qoderMachineOs,
+    ...options.includeMachineHostname === true && creds.machineHostname
+      ? { 'Cosy-Machinehostname': creds.machineHostname }
+      : {},
     'Cosy-Clienttype': qoderClientType,
     'Cosy-Clientip': '127.0.0.1',
     'Cosy-Bodyhash': bodyHash,

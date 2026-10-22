@@ -16,12 +16,24 @@ import type { QoderSubscriberPlan } from './qoder/account.ts'
 import { normalizeCredits } from './upstream.ts'
 import type { QoderModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import { qoderInnerErrorSnapshot } from './qoder/transport/wire/inner-errors.ts'
 import { getClaimWindowDateString } from './claim-window.ts'
 import { QODER_STATUS_PATH } from './status-paths.ts'
 import type { QoderCatalogModelSnapshot, QoderPatSummary, QoderWebAccounts, QoderWebCatalog, QoderWebPlan, QoderWebProbeSection, QoderWebStatus, QoderWebUpstreamNotice } from './status-paths.ts'
 
 export { QODER_STATUS_PATH } from './status-paths.ts'
 export type { QoderWebStatus } from './status-paths.ts'
+
+/**
+ * How long a status document may reuse the billing answer it just read.
+ *
+ * Not a cache lifetime — the card's own poll interval decides freshness. This
+ * only collapses a burst the page itself creates (mount, the sibling-variant
+ * prefetch, a tab switch) into one upstream billing read, which is the slowest
+ * part of the document. An account switch changes the cache key, so the window
+ * never serves the previous account's numbers.
+ */
+const STATUS_CREDITS_REUSE_MS = 10_000
 
 /**
  * Project a subscriber plan onto the fields the card renders.
@@ -293,8 +305,17 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
    * the active marker, and the switch buttons from the same response it already
    * polls — a second endpoint would be a second thing to keep in step, and the
    * card must never show a stale "active" row.
+   *
+   * Both facts are collected CONCURRENTLY: the pool is a local read while the
+   * credit figure is the route's one upstream call, and queuing the local read
+   * behind a cross-border billing round trip only delayed the document. The
+   * credit read also carries a coalescing window (see `fetchCredits`), so the
+   * page's mount + prefetch + poll burst does not spend one billing read each.
    */
-  const accountsSection = await deps.accounts?.()
+  const creditsResult = deps.client
+    .fetchCredits(undefined, { maxAgeMs: STATUS_CREDITS_REUSE_MS })
+    .then(credits => ({ ok: true as const, credits }), (error: unknown) => ({ ok: false as const, error }))
+  const [accountsSection, credits] = await Promise.all([Promise.resolve(deps.accounts?.()), creditsResult])
   const withAccounts: QoderWebStatus = accountsSection === undefined
     ? withCheckIn
     : { ...withCheckIn, accounts: accountsSection }
@@ -311,15 +332,19 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
   const withNotice: QoderWebStatus = upstreamNotice === undefined
     ? withAccounts
     : { ...withAccounts, upstreamNotice }
-  try {
-    const credits = await deps.client.fetchCredits()
-    // `unlimited` and `cycleResetTime` ride along as-is: the card must see
-    // "no cap" as its own state, and the fetch only sets them when the
-    // upstream actually reported them.
-    return { ...withNotice, credits }
-  } catch (error: unknown) {
-    return { ...withNotice, creditsError: safeMessage(error) }
-  }
+  /*
+   * Inner-stream errors ride the same document as everything else this route
+   * already reports. A stream that fails inside a 200 used to leave no trace,
+   * so the only honest place to expose the counters is the health/status view
+   * the card and other observers already read; it is a snapshot, not a state
+   * the route acts on.
+   */
+  const withInnerErrors: QoderWebStatus = { ...withNotice, innerErrors: qoderInnerErrorSnapshot() }
+  if (!credits.ok) return { ...withInnerErrors, creditsError: safeMessage(credits.error) }
+  // `unlimited` and `cycleResetTime` ride along as-is: the card must see "no
+  // cap" as its own state, and the fetch only sets them when the upstream
+  // actually reported them.
+  return { ...withInnerErrors, credits: credits.credits }
 }
 
 /** The status route's request handler, extracted so tests can mount it on a bare server. */

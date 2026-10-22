@@ -3,7 +3,8 @@
 import { createHash } from 'node:crypto'
 import { QoderLlmError, qoderHttpError, qoderRequestId } from '../errors.ts'
 import { logParsedResponse, redactLogPayload, type QoderLogger } from './logging.ts'
-import { defaultUserAgent, qoderClientType } from './wire/cosy.ts'
+import { metadataCosyVersion, qoderUserAgent } from './wire/version.ts'
+import { qoderClientType } from './wire/cosy.ts'
 
 export const defaultMetadataTimeoutMs = 15_000
 export const defaultResponseHeaderTimeoutMs = 60_000
@@ -184,10 +185,17 @@ export async function openApiJsonRequest<T>(
   options.logger?.debug?.(`[Qoder ${options.operation}] Requesting`, { url: options.url, method })
 
   try {
+    /*
+     * Metadata requests present the DESKTOP client fingerprint, so their
+     * `cosy-version` is the desktop build while `user-agent` carries the CLI
+     * build. The reference implementation sends the same split (campaign
+     * headers use the desktop version, inference the CLI one), so the two
+     * values intentionally come from different constants in `wire/version.ts`.
+     */
     const headers: Record<string, string> = {
       accept: 'application/json',
-      'user-agent': options.userAgent ?? defaultUserAgent,
-      'cosy-version': '1.0.1',
+      'user-agent': options.userAgent ?? qoderUserAgent,
+      'cosy-version': metadataCosyVersion,
       'cosy-clienttype': qoderClientType,
       ...options.headers,
     }

@@ -46,9 +46,12 @@ import {
   noteQuotaSignIn,
   noteQuotaStatus,
   onQuotaSettingsChange,
+  quotaPollMs,
   quotaReadout,
+  quotaSettingsRevision,
   quotaSignInState,
   quotaStatus,
+  quotaStatusIsFresh,
   setQuotaReadout,
 } from './quota-settings-store.ts'
 
@@ -57,8 +60,11 @@ export interface QoderPluginCardInjected {
   t: (key: QoderSettingsKey, params?: Record<string, unknown>) => string
   /** The bound quota settings face, when the host serves one. */
   scope?: QuotaSettingsScope<QuotaSection> | undefined
-  /** Sign-in state per variant; a toggle is disabled when its variant is out. */
-  signedIn?: () => { cn: boolean; global: boolean }
+  /**
+   * Sign-in state per variant; a toggle is disabled when its variant is out.
+   * `undefined` means no status read has landed yet — not signed out.
+   */
+  signedIn?: () => { cn: boolean | undefined; global: boolean | undefined }
   /**
    * Which product variant this card instance renders.
    */
@@ -963,6 +969,15 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    * the card never asks the host for a variant the user is not looking at.
    */
   const routing = useSyncExternalStore(onQuotaSettingsChange, routingFacts)
+  /*
+   * Re-render whenever ANY surface publishes a status document.
+   *
+   * The card reads the shared documents through {@link quotaStatus}; another
+   * surface (the composer chip, the sidebar card) can publish one for the
+   * variant this card is not showing, and the switcher's dot and tab body must
+   * follow that write. The revision is the subscription's only job here.
+   */
+  useSyncExternalStore(onQuotaSettingsChange, quotaSettingsRevision, quotaSettingsRevision)
   /** The check-in half of the settings face, as a stable projection string. */
   const settingsSubscribe = useCallback((onStoreChange: () => void) => {
     return scope?.subscribe(onStoreChange) ?? (() => {})
@@ -984,9 +999,31 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     ? (activeVariantId === 'qoder' ? QODER_CN_CARD : QODER_GLOBAL_CARD)
     : (variant ?? QODER_CN_CARD)
 
-  const [status, setStatus] = useState<QoderWebStatus>()
-  const [signedInState, setSignedInState] = useState<boolean>()
-  const [readFailure, setReadFailure] = useState<string>()
+  /**
+   * The last known sign-in fact for one variant, from the host injection when
+   * it supplies one (the settings integration does) and from the shared store
+   * otherwise. `undefined` = never read, which is NOT the same as signed out.
+   */
+  const reported = signedIn?.()
+  const knownSignIn = (variantId: QoderVariantId): boolean | undefined => {
+    const key = variantId === 'qoder' ? 'cn' : 'global'
+    return reported !== undefined ? reported[key] : liveSignIn[key]
+  }
+
+  /**
+   * Last status document PER VARIANT, plus the last read failure per variant.
+   *
+   * A single `status` cleared on every switch made the card blank and start
+   * over: even a variant whose document was already cached on this page fell
+   * back to the spinner, and a variant never read fell back to the grey
+   * "signed out" dot — which is exactly what made the Global tab look disabled
+   * on entry. Keyed per variant, the switcher paints the last read at once and
+   * revalidates it in the background.
+   */
+  const [documents, setDocuments] = useState<Partial<Record<QoderVariantId, QoderWebStatus>>>({})
+  const [readFailures, setReadFailures] = useState<Partial<Record<QoderVariantId, string>>>({})
+  const status = documents[currentVariant.id] ?? quotaStatus(currentVariant.id)
+  const readFailure = readFailures[currentVariant.id]
   const [busy, setBusy] = useState(false)
   const [patDraft, setPatDraft] = useState('')
   const [replacing, setReplacing] = useState(false)
@@ -1024,7 +1061,6 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaveError, setModelsSaveError] = useState<string>()
   const mounted = useRef(true)
-  const readSeq = useRef(0)
   const manualControllers = useRef(new Set<AbortController>())
 
   useEffect(() => {
@@ -1044,11 +1080,35 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
 
   const authKey = status === undefined || status.status === 'error' ? undefined : status.authKey
 
-  const refresh = useCallback(async (signal?: AbortSignal): Promise<boolean> => {
-    const seq = ++readSeq.current
-    const current = (): boolean => mounted.current && signal?.aborted !== true && seq === readSeq.current
+  // A per-variant read counter: the prefetch for the inactive variant runs
+  // alongside the active variant's read, and one shared counter would let the
+  // slower prefetch discard the other's newer answer.
+  const readSeq = useRef<Partial<Record<QoderVariantId, number>>>({})
+
+  /**
+   * Read one variant's status document.
+   *
+   * With `force: false` (the sibling prefetch) the shared cache decides first:
+   * a document younger than the configured poll interval is reused, so warming
+   * the other tab costs no upstream call — the configured interval is a cache
+   * lifetime, not a metronome. Mount, tab switches, every explicit gesture
+   * (refresh, a write's follow-up) and the interval tick force: they paint the
+   * cached document at once and revalidate it, so a stale cache never sticks.
+   */
+  const readVariant = useCallback(async (
+    target: QoderCardVariant,
+    options: { force?: boolean },
+    signal?: AbortSignal,
+  ): Promise<boolean> => {
+    const variantId = target.id
+    if (options.force !== true && quotaStatusIsFresh(variantId, quotaPollMs())) return false
+    const seq = (readSeq.current[variantId] ?? 0) + 1
+    readSeq.current[variantId] = seq
+    const current = (): boolean => mounted.current
+      && signal?.aborted !== true
+      && readSeq.current[variantId] === seq
     try {
-      const response = await fetch(currentVariant.statusPath, {
+      const response = await fetch(target.statusPath, {
         headers: { accept: 'application/json' },
         credentials: 'same-origin',
         ...signal === undefined ? {} : { signal },
@@ -1057,33 +1117,45 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       if (!isQoderWebStatus(value)) throw new Error(t('statusResponseInvalid'))
       if (!current()) return false
-      setStatus(value)
-      if (value.status === 'signed-in') {
-        setSignedInState(true)
-        noteQuotaStatus(currentVariant.id, value)
-      } else if (value.status === 'signed-out') {
-        setSignedInState(false)
-        noteQuotaStatus(currentVariant.id, value)
-      }
-      setReadFailure(undefined)
+      // The local copy renders a body with no sign-in meaning (the host's own
+      // `error` status); only real sign-in documents reach the shared store,
+      // whose cache the other surfaces gate their own reads on.
+      setDocuments(previous => previous[variantId] === value ? previous : { ...previous, [variantId]: value })
+      setReadFailures(previous => previous[variantId] === undefined ? previous : { ...previous, [variantId]: undefined })
+      if (value.status === 'signed-in' || value.status === 'signed-out') noteQuotaStatus(variantId, value)
       return true
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : t('requestFailed')
-      if (current()) {
-        setReadFailure(message)
-        setStatus(previous => previous === undefined ? { status: 'error', message } : previous)
-      }
+      if (!current()) return false
+      const message = error instanceof Error && error.message !== '' ? error.message : t('requestFailed')
+      setReadFailures(previous => ({ ...previous, [variantId]: message }))
+      // Keep the last good document on screen — a failed revalidation is not a
+      // reason to forget the account. Only a variant with nothing to show gets
+      // the error body, and its message stays attached to its own tab.
+      setDocuments(previous => previous[variantId] !== undefined || quotaStatus(variantId) !== undefined
+        ? previous
+        : { ...previous, [variantId]: { status: 'error', message } })
       return false
     }
-  }, [currentVariant.statusPath, t])
+  }, [t])
+
+  /** A deliberate re-read: user refresh, a write's follow-up, the poll tick. */
+  const refresh = useCallback(
+    (signal?: AbortSignal): Promise<boolean> => readVariant(currentVariant, { force: true }, signal),
+    [currentVariant, readVariant],
+  )
+
+  /** Record (or clear) the read failure a variant's tab shows. */
+  const noteReadFailure = useCallback((variantId: QoderVariantId, message: string | undefined): void => {
+    setReadFailures(previous => previous[variantId] === message
+      ? previous
+      : { ...previous, [variantId]: message })
+  }, [])
 
   // The card IS the page now: the owner mounts it only while its detail page is
-  // open, so there is no `open` flag to gate the first read on. It still reads
-  // once per variant switch, and re-reads when the variant changes.
+  // open, so there is no `open` flag to gate the first read on. Switching
+  // variants no longer blanks the document: the cached one paints immediately
+  // and the forced read below revalidates it in the background.
   useEffect(() => {
-    setStatus(undefined)
-    setSignedInState(undefined)
-    setReadFailure(undefined)
     setPatDraft('')
     setReplacing(false)
     setPatError(undefined)
@@ -1096,24 +1168,50 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     setConfirmingRemoveId(undefined)
     setConfirmingClear(false)
     setCheckInNotice(undefined)
-    setCheckInNotice(undefined)
     const controller = new AbortController()
-    void refresh(controller.signal)
+    void readVariant(currentVariant, { force: true }, controller.signal)
     return () => { controller.abort() }
-  }, [currentVariant.statusPath, refresh])
+  }, [currentVariant.statusPath, readVariant])
 
-  // The 60s poll. Also ungated: a mounted page is a page the user is looking at,
-  // which is exactly when the poll is wanted (the tab is hidden only while the
-  // user is away, and `refresh` already tolerates a hidden document elsewhere).
+  /*
+   * Prefetch the sibling variant once, on mount.
+   *
+   * The Global status route is the slow one (a cross-border read), and the
+   * switcher used to start from nothing for it: clicking it showed a spinner
+   * until that read finished, even though the answer was needed one click
+   * later anyway. Reading both variants up front makes the switch instant; a
+   * document that is already cache-fresh is skipped.
+   */
+  const prefetched = useRef(false)
   useEffect(() => {
-    if (signedInState === false) return
+    if (!isUnified || prefetched.current) return
+    prefetched.current = true
     const controller = new AbortController()
-    const timer = window.setInterval(() => { void refresh(controller.signal) }, POLL_INTERVAL_MS)
+    for (const candidate of QODER_CARD_VARIANTS) {
+      if (candidate.id === currentVariant.id) continue
+      if (quotaStatusIsFresh(candidate.id, quotaPollMs())) continue
+      void readVariant(candidate, {}, controller.signal)
+    }
+    return () => { controller.abort() }
+  }, [currentVariant.id, isUnified, readVariant])
+
+  // The 60s poll. Also ungated: a mounted page is a page the user is looking at.
+  // A variant known to be signed out is not polled — there is nothing to learn
+  // from a status route with no PAT (an unknown variant keeps polling until its
+  // first answer lands).
+  const currentSignIn = knownSignIn(currentVariant.id)
+  useEffect(() => {
+    if (currentSignIn === false) return
+    const controller = new AbortController()
+    const timer = window.setInterval(
+      () => { void readVariant(currentVariant, { force: true }, controller.signal) },
+      POLL_INTERVAL_MS,
+    )
     return () => {
       window.clearInterval(timer)
       controller.abort()
     }
-  }, [refresh, signedInState])
+  }, [currentSignIn, currentVariant, readVariant])
 
   const manualRefresh = async (): Promise<void> => {
     setBusy(true)
@@ -1161,7 +1259,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
       result = await response.json() as { state?: string; reason?: string }
     } catch (error: unknown) {
       if (mounted.current && controller.signal.aborted !== true) {
-        setReadFailure(error instanceof Error ? error.message : t('requestFailed'))
+        noteReadFailure(currentVariant.id, error instanceof Error ? error.message : t('requestFailed'))
       }
       manualControllers.current.delete(controller)
       return
@@ -1175,17 +1273,17 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
      * an older host) falls through and re-reads as before.
      */
     if (result.state === 'failed') {
-      if (mounted.current) setReadFailure(result.reason ?? t('requestFailed'))
+      if (mounted.current) noteReadFailure(currentVariant.id, result.reason ?? t('requestFailed'))
       manualControllers.current.delete(controller)
       return
     }
-    if (result.state === 'refreshed' && mounted.current) setReadFailure(undefined)
+    if (result.state === 'refreshed' && mounted.current) noteReadFailure(currentVariant.id, undefined)
     try {
       await refresh(controller.signal)
     } finally {
       manualControllers.current.delete(controller)
     }
-  }, [currentVariant.probePath, refresh, status, t, trackController])
+  }, [currentVariant.id, currentVariant.probePath, noteReadFailure, refresh, status, t, trackController])
 
   /**
    * 「一键签到」: claim today's benefit for EVERY signed-in variant in one click.
@@ -1434,8 +1532,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
       }
       setPatDraft('')
       const signedOutDoc: QoderWebStatus = { status: 'signed-out', authKey: key }
-      setStatus(signedOutDoc)
-      setSignedInState(false)
+      setDocuments(previous => ({ ...previous, [currentVariant.id]: signedOutDoc }))
       noteQuotaStatus(currentVariant.id, signedOutDoc)
       noteQuotaSignIn(currentVariant.id, false)
       await refresh(controller.signal)
@@ -1616,24 +1713,24 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     ? t('accountSignedInAs', { name: status.pat.accountName })
     : label
 
-  // Per-variant state dots for the segmented switcher: the variant being read
-  // shows the live document state, the other one its last known sign-in state.
+  // Per-variant state dots for the segmented switcher: the variant being shown
+  // renders its live document state, the other one its last known sign-in fact.
   // A variant switched OFF (its checkbox unchecked) is grey regardless of its
   // account: the switcher describes what is offered, and a disabled variant
-  // offers nothing — signed in or not.
-  const reported = signedIn?.()
-  const cnSignedIn = reported !== undefined ? reported.cn : liveSignIn.cn
-  const globalSignedIn = reported !== undefined ? reported.global : liveSignIn.global
-  const cnDotState = settings.variantCN === false
-    ? 'idle'
-    : dotStateOf(isUnified && activeVariantId === 'qoder'
-      ? (status === undefined ? 'loading' : status.status)
-      : (cnSignedIn ? 'signed-in' : 'signed-out'))
-  const globalDotState = settings.variantGlobal === false
-    ? 'idle'
-    : dotStateOf(isUnified && activeVariantId === 'qoder-global'
-      ? (status === undefined ? 'loading' : status.status)
-      : (globalSignedIn ? 'signed-in' : 'signed-out'))
+  // offers nothing — signed in or not. A variant nobody has read yet is NOT
+  // grey either: "not looked" and "signed out" are different facts, so it keeps
+  // the neutral working state until its first answer lands.
+  const dotFor = (target: QoderCardVariant, enabled: boolean): QdpDotState => {
+    if (!enabled) return 'idle'
+    if (isUnified && activeVariantId === target.id) {
+      const document = documents[target.id] ?? quotaStatus(target.id)
+      return dotStateOf(document === undefined ? 'loading' : document.status)
+    }
+    const known = knownSignIn(target.id)
+    return known === undefined ? 'ongoing' : dotStateOf(known ? 'signed-in' : 'signed-out')
+  }
+  const cnDotState = dotFor(QODER_CN_CARD, settings.variantCN !== false)
+  const globalDotState = dotFor(QODER_GLOBAL_CARD, settings.variantGlobal !== false)
   const planTag = status?.status === 'signed-in' && status.plan !== undefined
     ? t('planTier', { name: status.plan.planTierName })
     : undefined
@@ -1655,11 +1752,9 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     ? (activeVariantId === 'qoder' ? 'cn' : 'global')
     : (currentVariant.id === 'qoder' ? 'cn' : 'global')
   const signedInDoc = status?.status === 'signed-in' ? status : undefined
-  const settingsSignedIn = reported !== undefined
-    ? Boolean(reported[settingsVariant])
-    : Boolean(liveSignIn[settingsVariant])
+  const settingsSignedIn = Boolean(knownSignIn(settingsVariant === 'cn' ? 'qoder' : 'qoder-global'))
   /** Whether EITHER account is signed in — the shared check-in time needs one. */
-  const anySignedIn = Boolean(cnSignedIn || globalSignedIn)
+  const anySignedIn = Boolean(knownSignIn('qoder') || knownSignIn('qoder-global'))
   const autoCheckInOn = settingsVariant === 'cn' ? settings.autoCN : settings.autoGlobal
   /** One moment for both variants: the card edits a single shared setting. */
   const checkInMinute = settings.minute
@@ -2181,7 +2276,10 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
           {signedInDoc !== undefined && signedInDoc.jobTokenRefreshedAt !== undefined ? (
             <p className="qdp-caption">{t('jobTokenRefreshed', { time: formatTime(signedInDoc.jobTokenRefreshedAt) })}</p>
           ) : null}
-          {readFailure === undefined || signedInState === undefined ? null : (
+          {/* A failed revalidation keeps the last document on screen, so its
+              reason is shown here; when the card has nothing but the failure
+              (no document at all) the error body below already carries it. */}
+          {readFailure === undefined || status?.status === 'error' ? null : (
             <div className="qdp-alert qdp-alertError" role="alert">
               <span>{t('statusRefreshFailed', { message: readFailure })}</span>
               <div className="qdp-actions">

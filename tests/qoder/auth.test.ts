@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { QoderAuthService } from '../../src/qoder/transport/auth.ts'
+import { deriveMachineHostname, deriveMachineId } from '../../src/qoder/transport/device-identity.ts'
+import { buildAuthHeaders } from '../../src/qoder/transport/wire/cosy.ts'
 import { QoderLlmError } from '../../src/qoder/errors.ts'
+import { qoderUserAgent } from '../../src/qoder/transport/wire/version.ts'
 
 test('QoderAuthService exchanges once, resolves identity, and caches credentials', async () => {
   let exchangeCalls = 0
@@ -32,13 +35,49 @@ test('QoderAuthService exchanges once, resolves identity, and caches credentials
   const second = await service.getCredentials('pt-test-token')
   assert.equal(first.authToken, 'jt-token')
   assert.equal(first.userID, 'user-999')
+  // The real host id stays on the credentials for the metadata requests
+  // (status sends it as Cosy-MachineToken), while the COSY client requests get
+  // an id derived from THIS account instead of the shared host-wide one.
+  assert.equal(first.machineID, 'machine-test')
+  assert.equal(first.derivedMachineID, deriveMachineId('user-999'))
+  assert.equal(first.machineHostname, deriveMachineHostname('user-999'))
   assert.equal(second, first)
   assert.equal(exchangeCalls, 1)
   assert.equal(userInfoCalls, 1)
-  assert.equal(exchangeHeaders?.['user-agent'], 'qoder/1.1.47')
+  assert.equal(exchangeHeaders?.['user-agent'], qoderUserAgent)
   assert.equal(exchangeHeaders?.['cosy-clienttype'], '5')
-  assert.equal(userInfoHeaders?.['user-agent'], 'qoder/1.1.47')
+  assert.equal(userInfoHeaders?.['user-agent'], qoderUserAgent)
   assert.equal(userInfoHeaders?.['cosy-clienttype'], '5')
+})
+
+test('QoderAuthService gives two accounts on this host different device identities', async () => {
+  // One host, one `resolveMachineId`, two accounts: the real id is shared by
+  // necessity, so the COSY client identity has to be derived per account —
+  // otherwise both accounts present as the same device upstream.
+  const accounts = ['account-a', 'account-b'] as const
+  const services = accounts.map((account) => new QoderAuthService({
+    fetch: (async (input: URL | Request) => String(input).includes('/jobToken/exchange')
+      ? new Response(JSON.stringify({ token: `jt-${account}`, expires_in: 3_600_000 }))
+      : new Response(JSON.stringify({ id: account, name: account }))) as typeof fetch,
+    resolveMachineId: () => 'shared-host-machine-id',
+  }))
+  const [first, second] = await Promise.all(accounts.map(
+    (account, index) => services[index]!.getCredentials(`pt-${account}`),
+  ))
+
+  assert.equal(first!.machineID, 'shared-host-machine-id')
+  assert.equal(second!.machineID, 'shared-host-machine-id')
+  assert.equal(first!.derivedMachineID, deriveMachineId('account-a'))
+  assert.equal(second!.derivedMachineID, deriveMachineId('account-b'))
+  assert.notEqual(first!.derivedMachineID, second!.derivedMachineID)
+  assert.equal(first!.machineHostname, deriveMachineHostname('account-a'))
+  assert.notEqual(first!.machineHostname, second!.machineHostname)
+
+  // The chat/inference request is where the derived values must actually land.
+  const firstChat = buildAuthHeaders(null, 'https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation', first!)
+  const secondChat = buildAuthHeaders(null, 'https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation', second!)
+  assert.equal(firstChat['Cosy-Machineid'], deriveMachineId('account-a'))
+  assert.notEqual(firstChat['Cosy-Machineid'], secondChat['Cosy-Machineid'])
 })
 
 test('QoderAuthService shares one exchange between concurrent callers', async () => {

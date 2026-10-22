@@ -10,6 +10,7 @@ import {
 import { ModelsPane } from '../src/client/ModelsPane.tsx'
 import { en } from '../src/client/locales.ts'
 import { noteQuotaStatus, quotaReadout, setQuotaReadout } from '../src/client/quota-settings-store.ts'
+import { resetQuotaSignIn, resetQuotaStatusDocuments } from '../src/client/quota-settings-store.ts'
 import type { QoderWebStatus } from '../src/status-paths.ts'
 
 /**
@@ -139,6 +140,10 @@ describe('Qoder plugin card', () => {
     // The readout switch is a CARD-owned client preference (the host does not
     // own the field), so its store is module state shared across tests.
     setQuotaReadout(true)
+    // The status documents are module state too: drop them so the next case's
+    // mount reads its own mocked body instead of this one's cached answer.
+    resetQuotaStatusDocuments()
+    resetQuotaSignIn()
     vi.unstubAllGlobals()
   })
 
@@ -179,6 +184,10 @@ describe('Qoder plugin card', () => {
   type SettingsScope = ReturnType<typeof fakeSettingsScope>
 
   async function mount(variant?: QoderCardVariant, scope?: SettingsScope, unified = false): Promise<void> {
+    // A case that mounts twice to show a changed document replaces the previous
+    // instance: a leaked card stays subscribed to the shared store and would
+    // re-create its poll timer when a later case publishes a document.
+    act(() => view?.unmount())
     const props = {
       t,
       ...variant === undefined ? {} : { variant },

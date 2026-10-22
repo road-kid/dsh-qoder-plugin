@@ -113,6 +113,17 @@ export interface QoderSseEnvelope {
 export interface QoderInnerChunk {
   id?: string
   model?: string
+  /**
+   * In-stream failure fields. A 200 envelope can carry the real answer as an
+   * error chunk (content policy, queue/throttle, auth, invalid request); the
+   * decoder observes them instead of dropping them.
+   */
+  error?: unknown
+  errorCode?: string | number
+  code?: string | number
+  message?: string
+  msg?: string
+  error_msg?: string
   choices?: Array<{
     index?: number
     delta?: {

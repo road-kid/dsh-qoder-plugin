@@ -8,6 +8,12 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { QoderLlmError, qoderHttpError } from '../../errors.ts'
 import { QoderThinkingParser, type QoderContentSegment } from './thinking.ts'
+import {
+  detectQoderInnerError,
+  recordQoderInnerError,
+  type QoderInnerErrorClass,
+  type QoderInnerErrorReport,
+} from './inner-errors.ts'
 import type { QoderInnerChunk, QoderSseEnvelope } from './wire-types.ts'
 
 const doneMarker = '[DONE]'
@@ -16,6 +22,12 @@ export const defaultMaxSseBufferChars = 2 * 1024 * 1024
 export interface QoderSseOptions {
   onActivity?: () => void
   maxBufferChars?: number
+  /**
+   * Called once per error class per stream, with an already sanitized report,
+   * so the caller can log it. Every occurrence is still counted by the ledger;
+   * this callback only exists to keep repeated identical errors out of the log.
+   */
+  onInnerError?: (report: QoderInnerErrorReport) => void
 }
 
 interface TextualBlockState {
@@ -136,6 +148,9 @@ export async function* parseQoderSse(
   let terminalKind: SuccessfulFinishKind = 'stop'
   let sawContent = false
   const maxBufferChars = options.maxBufferChars ?? defaultMaxSseBufferChars
+  // Per stream, not per process: one repetition of the same failure inside one
+  // answer is still one story to tell; a later request deserves its own WARN.
+  const warnedInnerErrorClasses = new Set<QoderInnerErrorClass>()
 
   const closeTextual = (): StreamChunk[] => {
     if (activeTextual === undefined) return []
@@ -223,6 +238,24 @@ export async function* parseQoderSse(
           break
         }
         const innerChunk = parseInner(body)
+        const innerError = detectQoderInnerError(innerChunk as unknown as Record<string, unknown>)
+        if (innerError !== undefined) {
+          // Count every occurrence, but warn once per class per stream. The
+          // stream keeps flowing: bytes may already have been handed to the
+          // host, so this observation must never turn into a retry decision.
+          recordQoderInnerError(innerError.classification)
+          if (!warnedInnerErrorClasses.has(innerError.classification)) {
+            warnedInnerErrorClasses.add(innerError.classification)
+            // An observer must never break the stream: this runs on the read
+            // path of a live response, and a throwing logger would reject a
+            // clean 200 body and hand it to the retry policy.
+            try {
+              options.onInnerError?.(innerError)
+            } catch {
+              // A broken observer loses this one warning; counting continues.
+            }
+          }
+        }
         pendingUsage = tokenUsage(innerChunk) ?? pendingUsage
 
         for (const choice of innerChunk.choices ?? []) {

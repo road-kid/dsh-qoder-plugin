@@ -22,10 +22,18 @@
 
 import type { QoderVariantId, QoderWebStatus } from '../status-paths.ts'
 
-/** Whether each variant has a usable PAT, as far as the last status poll knows. */
+/**
+ * Whether each variant has a usable PAT, as far as the last status poll knows.
+ *
+ * `undefined` means NOT READ YET: no status document has landed for that
+ * variant since the page loaded. It is deliberately different from `false`,
+ * because a surface that has not looked must not paint the variant grey — the
+ * Global tab used to look disabled until its first (slow) cross-border read
+ * returned, even for an account that was signed in all along.
+ */
 export interface QuotaSignInState {
-  cn: boolean
-  global: boolean
+  cn: boolean | undefined
+  global: boolean | undefined
 }
 
 let pollIntervalMs = 300_000
@@ -64,14 +72,33 @@ function readoutFlag(stored: unknown): boolean {
 }
 
 /**
+ * The piece of `window.localStorage` this module needs.
+ *
+ * Declared structurally instead of using the DOM `Storage` type because the
+ * non-browser tsconfig (which compiles this file through a spec import) has no
+ * DOM lib; `globalThis` exists in both configs, so one lookup serves both.
+ */
+interface BrowserStorage {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+}
+
+/**
  * The browser storage, or undefined when there is none or access is blocked
  * (non-browser runtime, private mode, disabled site data). Every access is
- * wrapped: `window.localStorage` itself can throw when storage is disabled.
+ * wrapped: touching `globalThis.localStorage` itself can throw when storage is
+ * disabled.
  */
-function readoutStorage(): Storage | undefined {
+function browserStorage(): BrowserStorage | undefined {
   try {
-    if (typeof window === 'undefined' || window.localStorage === undefined) return undefined
-    return window.localStorage
+    // A real browser has window === globalThis, so the first lookup wins; the
+    // second one serves tests (and exotic runtimes) that stub `window` only.
+    const scope = globalThis as {
+      localStorage?: BrowserStorage
+      window?: { localStorage?: BrowserStorage } | undefined
+    }
+    const storage = scope.localStorage ?? scope.window?.localStorage
+    return storage === undefined ? undefined : storage
   } catch {
     return undefined
   }
@@ -79,7 +106,7 @@ function readoutStorage(): Storage | undefined {
 
 /** Read the persisted switches once; missing/invalid storage means all-on. */
 function loadQuotaReadout(): QuotaReadoutState {
-  const storage = readoutStorage()
+  const storage = browserStorage()
   if (storage === undefined) return defaultQuotaReadout()
   try {
     const raw = storage.getItem(READOUT_STORAGE_KEY)
@@ -99,7 +126,7 @@ function loadQuotaReadout(): QuotaReadoutState {
 
 /** Persist the switches; a blocked/full store only costs the preference. */
 function persistQuotaReadout(state: QuotaReadoutState): void {
-  const storage = readoutStorage()
+  const storage = browserStorage()
   if (storage === undefined) return
   try {
     storage.setItem(READOUT_STORAGE_KEY, JSON.stringify(state))
@@ -110,10 +137,55 @@ function persistQuotaReadout(state: QuotaReadoutState): void {
 
 let readout: QuotaReadoutState = loadQuotaReadout()
 let readoutSnapshot: QuotaReadoutState = { ...readout }
+
+/**
+ * localStorage key holding the last known sign-in fact per variant.
+ *
+ * The cards' grey dot is only honest when it means "the host says this variant
+ * has no PAT". Every page load used to start from `false` for both variants,
+ * so a signed-in Global account was painted grey until its status route (a
+ * cross-border call) answered. Remembering the last answer keeps the switcher
+ * truthful across reloads; the first read still corrects it.
+ */
+const SIGN_IN_STORAGE_KEY = 'dsh-qoder-plugin:sign-in'
+
+/** Read the remembered sign-in facts; anything unreadable means "not read". */
+function loadQuotaSignIn(): QuotaSignInState {
+  const unknownState: QuotaSignInState = { cn: undefined, global: undefined }
+  const storage = browserStorage()
+  if (storage === undefined) return unknownState
+  try {
+    const raw = storage.getItem(SIGN_IN_STORAGE_KEY)
+    if (raw === null) return unknownState
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return unknownState
+    const stored = parsed as { cn?: unknown; global?: unknown }
+    return {
+      cn: typeof stored.cn === 'boolean' ? stored.cn : undefined,
+      global: typeof stored.global === 'boolean' ? stored.global : undefined,
+    }
+  } catch {
+    return unknownState
+  }
+}
+
+/** Persist the sign-in facts; blocked storage only costs the remembered dot. */
+function persistQuotaSignIn(): void {
+  const storage = browserStorage()
+  if (storage === undefined) return
+  try {
+    // JSON drops the `undefined` halves, so "not read" stays absent instead of
+    // being resurrected as a signed-out fact on the next load.
+    storage.setItem(SIGN_IN_STORAGE_KEY, JSON.stringify({ cn: signIn.cn, global: signIn.global }))
+  } catch {
+    // Ignored: memory still carries the state.
+  }
+}
+
 const toggles = { cn: false, global: false }
 let togglesSnapshot: QuotaSignInState = { cn: false, global: false }
-const signIn: QuotaSignInState = { cn: false, global: false }
-let signInSnapshot: QuotaSignInState = { cn: false, global: false }
+const signIn: QuotaSignInState = loadQuotaSignIn()
+let signInSnapshot: QuotaSignInState = { ...signIn }
 let revision = 0
 const listeners = new Set<() => void>()
 
@@ -176,10 +248,12 @@ export function noteQuotaSignIn(variantId: string, signedIn: boolean): void {
   if (variantId === 'qoder' && signIn.cn !== signedIn) {
     signIn.cn = signedIn
     signInSnapshot = { ...signIn }
+    persistQuotaSignIn()
     bump()
   } else if (variantId === 'qoder-global' && signIn.global !== signedIn) {
     signIn.global = signedIn
     signInSnapshot = { ...signIn }
+    persistQuotaSignIn()
     bump()
   }
 }
@@ -187,6 +261,21 @@ export function noteQuotaSignIn(variantId: string, signedIn: boolean): void {
 /** Read the cached sign-in state. */
 export function quotaSignInState(): QuotaSignInState {
   return signInSnapshot
+}
+
+/**
+ * Forget the last known sign-in facts — back to "not read yet".
+ *
+ * Test isolation uses this; production has no reason to: the first status read
+ * of a session overwrites both halves anyway.
+ */
+export function resetQuotaSignIn(): void {
+  if (signIn.cn === undefined && signIn.global === undefined) return
+  signIn.cn = undefined
+  signIn.global = undefined
+  signInSnapshot = { ...signIn }
+  persistQuotaSignIn()
+  bump()
 }
 
 /** Subscribe to any flag change; returns the disposer. */
@@ -246,6 +335,26 @@ export function noteQuotaStatus(variantId: string, status: QoderWebStatus): void
 /** Read one variant's latest status document. */
 export function quotaStatus(variantId: QoderVariantId): QoderWebStatus | undefined {
   return variantId === 'qoder' ? statusDocuments.cn : statusDocuments.global
+}
+
+/**
+ * Drop every cached status document — the next mount/click has to read again.
+ *
+ * Test isolation uses this so one spec's mocked body does not leak into the
+ * next; the card itself never resets the cache.
+ */
+export function resetQuotaStatusDocuments(): void {
+  if (
+    statusDocuments.cn === undefined
+    && statusDocuments.global === undefined
+    && statusFetchedAt.cn === undefined
+    && statusFetchedAt.global === undefined
+  ) return
+  statusDocuments.cn = undefined
+  statusDocuments.global = undefined
+  statusFetchedAt.cn = undefined
+  statusFetchedAt.global = undefined
+  bump()
 }
 
 /** When each variant's document was last fetched (per publish, not per read). */

@@ -75,7 +75,9 @@ export async function* streamQoderChat(
         'x-model-key': options.model || 'cmodel',
         'x-model-source': model?.source || 'system',
         ...attributionHeaders(),
-        ...buildAuthHeaders(encodedBytes, chatUrl, credentials),
+        // The inference stream is the one request the official desktop client
+        // tags with `Cosy-Machinehostname`; every other COSY request must not.
+        ...buildAuthHeaders(encodedBytes, chatUrl, credentials, { includeMachineHostname: true }),
       },
       body: encodedBytes,
       signal: requestController.signal,
@@ -115,7 +117,18 @@ export async function* streamQoderChat(
     let finishReason: string | undefined
     const streamStartedAt = performance.now()
 
-    for await (const chunk of parseQoderSse(response.body, { onActivity: resetIdleTimer })) {
+    for await (const chunk of parseQoderSse(response.body, {
+      onActivity: resetIdleTimer,
+      // A 200 stream can still carry the upstream's real complaint as an inner
+      // chunk. The decoder counts them; logging only the first per class keeps
+      // one broken answer from repeating the same line hundreds of times.
+      onInnerError: report => {
+        dependencies.logger?.warn?.('[Qoder Stream] Inner error in stream', redactLogValue({
+          ...report,
+          ...reqId === undefined ? {} : { requestId: reqId },
+        }))
+      },
+    })) {
       chunkCount++
       if (firstChunkDurationMs === undefined) {
         firstChunkDurationMs = Math.round(performance.now() - startedAt)

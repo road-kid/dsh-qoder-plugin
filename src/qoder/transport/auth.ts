@@ -4,6 +4,7 @@ import type { CosyCredentials } from './wire/cosy.ts'
 import { getQoderExchangeUrl, getQoderUserInfoUrl, type QoderRegion } from './endpoints.ts'
 import { QoderLlmError } from '../errors.ts'
 import type { QoderLogger } from './logging.ts'
+import { deriveMachineHostname, deriveMachineId } from './device-identity.ts'
 import { getMachineId } from './machine-id.ts'
 import {
   opaqueCredentialKey,
@@ -203,12 +204,36 @@ export class QoderAuthService {
     }
 
     const userInfo = await retryMetadataRead(signal, () => this.fetchUserInfo(jobToken, signal))
+    /*
+     * Two device identities live on the credentials, and they answer different
+     * questions:
+     *
+     * - `machineID` is this host's real, install-wide UMID. The status/plan/
+     *   quota metadata requests send it as `Cosy-MachineToken`, and the
+     *   campaign path resolves its own real UMID, so preserving it keeps those
+     *   measured request shapes intact.
+     * - `derivedMachineID`/`machineHostname` are minted per ACCOUNT from the
+     *   user id. The COSY-authenticated client requests (inference, model list)
+     *   present them instead of the shared host id; otherwise every account
+     *   driven from this host looks like one device, which is exactly the
+     *   pattern the upstream groups on.
+     *
+     * `fetchUserInfo` already rejects an empty id, so the derivation is always
+     * possible; the fallback covers a future upstream that answers without one
+     * rather than inventing a device for no account.
+     */
     const creds: CosyCredentials = {
       userID: userInfo.userID,
       authToken: jobToken,
       name: userInfo.name || 'Qoder User',
       email: userInfo.email,
       machineID: this.resolveMachineId(),
+      ...userInfo.userID
+        ? {
+            derivedMachineID: deriveMachineId(userInfo.userID),
+            machineHostname: deriveMachineHostname(userInfo.userID),
+          }
+        : {},
     }
     const cacheKey = `${this.region}:${opaqueCredentialKey(pat)}`
     this.cache.set(cacheKey, { creds, expiresAt })
