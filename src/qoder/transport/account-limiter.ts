@@ -197,8 +197,21 @@ export class QoderAccountTrafficLimiter {
     }
   }
 
-  private gateFor(accountId: string): AccountGate {
-    const existing = this.accounts.get(accountId)
+  /**
+   * Whether this account already has an attempt in flight or requests queued
+   * for it.
+   *
+   * The transport uses this as its only dispatch gate (T7): "busy" means the
+   * guard is pacing this identity right now, so a free account is preferred for
+   * a new request, and a busy account is only used as the last resort — where
+   * the request queues behind this gate instead of failing.
+   */
+  isBusy(accountId: string): boolean {
+    const gate = this.accounts.get(accountId)
+    return gate !== undefined && (gate.held || gate.waiters.length > 0)
+  }
+
+  private gateFor(accountId: string): AccountGate {    const existing = this.accounts.get(accountId)
     if (existing !== undefined) return existing
     const gate: AccountGate = { waiters: [], held: false, lastStartMs: undefined }
     this.accounts.set(accountId, gate)

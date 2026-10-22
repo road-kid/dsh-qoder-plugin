@@ -391,12 +391,16 @@ function AccountRow({ entry, busy, canSwitch, onActivate, t }: {
         {figures?.planName === undefined ? null : <QdpTag>{figures.planName}</QdpTag>}
         {/*
           The account's observed service state, on the same terms as the card's
-          account list: `undefined` is "nothing observed", which renders
-          nothing rather than an invented 正常.
+          account list: `undefined` is "nothing observed", rendered as the
+          neutral 「尚未观测」 rather than an invented 正常. A parked seat shows
+          no state at all — it is out of the walk, so calling it healthy would be
+          a promise this popover will not keep.
         */}
-        {entry.health === undefined ? null : (
+        {parked ? null : (
           <span className="qdp-popAccountHealth" title={t('accountHealthAria')}>
-            <QdpTag tone={entry.health === 'normal' ? 'success' : 'warn'}>
+            <QdpTag
+              tone={entry.health === undefined ? 'neutral' : entry.health === 'normal' ? 'success' : 'warn'}
+            >
               {accountHealthLabel(entry.health, t)}
             </QdpTag>
           </span>

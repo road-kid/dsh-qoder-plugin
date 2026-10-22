@@ -264,16 +264,6 @@ export class DefaultQoderTransport implements QoderTransport {
    */
   private readonly traffic: QoderAccountTrafficLimiter
   /**
-   * Accounts a request has claimed for dispatch but not yet finished with.
-   *
-   * Two requests that both start on the active account would otherwise land on
-   * the same credential in the same instant — the pool walk only runs after a
-   * failure, so nothing before it knows another request is already there. The
-   * reservation makes "who is already serving" visible to the walk's account
-   * choice, exactly the way a cooldown already is.
-   */
-  private readonly reservedAccounts = new Set<string>()
-  /**
    * What repeated failures have cost each pooled account (T5).
    *
    * Per transport, hence per variant and per process, and never persisted: a
@@ -616,33 +606,56 @@ export class DefaultQoderTransport implements QoderTransport {
     let first = pinned ?? active
     /*
      * Do not spend the request on an account the ledger is cooling down (T5) or
-     * that a concurrent request is already serving (T7) — but do it SILENTLY.
+     * that the traffic guard is already serving (T7) — but do it SILENTLY, and
+     * adopt the move when it is a verdict on the account rather than a transient
+     * collision.
      *
      * Both are dispatch facts about THIS request, not failures of the request:
      * a cooldown is the transport's own conclusion that the account kept
-     * failing while another served the same traffic, and a reservation simply
+     * failing while another served the same traffic, and a busy guard simply
      * means a concurrent request got there first (the DSH host always fires a
      * title request alongside the first message of a new session). Reporting
      * either through `switched` made the host treat a healthy skip as a
      * connection failure: it persisted a new active account, armed the
      * credential file for a rewrite, and told the user "已自动切换到下一个账号
      * 重试" 218ms into a request that never failed. So this branch only changes
-     * where this request starts; it does not touch the active pointer, the
-     * session pin, or any other request. When nothing else is selectable the
-     * account is kept as the only option: the pool being all-cooling or all-busy
-     * is not a reason to invent a wait or to refuse a request that account may
-     * well serve now.
+     * where this request starts; it does not touch the session pin.
+     *
+     * A cooldown IS a verdict on the account, though, and the host's metadata
+     * reads (catalog, billing) sign with the store's active account. Leaving the
+     * cooling credential active would move the chat path off it while the status
+     * card kept reading through it, so the skip is adopted silently: `adopted`
+     * changes the active pointer without a notice or a failover time. A busy
+     * account must NOT be adopted — another request is just using it this
+     * second. When nothing else is selectable the account is kept as the only
+     * option: the pool being all-cooling or all-busy is not a reason to invent a
+     * wait or to refuse a request that account may well serve now.
      */
     const firstCooling = this.penalties.isCooling(first.id)
-    const firstReserved = this.reservedAccounts.has(first.id)
+    const firstBusy = this.traffic.isBusy(first.id)
     let rerouted = false
-    if (firstCooling || firstReserved) {
+    if (firstCooling || firstBusy) {
       const alternative = await this.nextWalkAccount(failover, first.id, new Set([first.id]))
       if (alternative !== undefined) {
+        if (firstCooling) {
+          try {
+            // Awaiting is load-bearing: the adoption has to land before any
+            // other path resolves the store's active account.
+            await failover.adopted?.({ fromId: first.id, toId: alternative.id, reason: 'cooling' })
+          } catch (error: unknown) {
+            // Adoption only steers the host's metadata reads; a failing hook
+            // must not cost this request its account selection.
+            this.logger?.warn?.('[Qoder Stream] Could not adopt the account chosen after a cooldown', {
+              fromId: first.id,
+              toId: alternative.id,
+              message: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
         this.logger?.warn?.('[Qoder Stream] Starting this request on another account without failing over', {
           fromId: first.id,
           toId: alternative.id,
-          cause: firstCooling ? 'cooling' : 'reserved',
+          cause: firstCooling ? 'cooling' : 'busy',
         })
         first = alternative
         rerouted = true
@@ -702,11 +715,11 @@ export class DefaultQoderTransport implements QoderTransport {
       } catch (error: unknown) {
         if (options.signal?.aborted || state.emitted) throw error
         if (!isAccountFailure(error)) throw error
-        const next = await this.walkAfterFailure(failover, account.id, tried)
+        const next = await this.nextWalkAccount(failover, account.id, tried, true)
         // `undefined` is the end of the pool — every remaining candidate is
-        // either tried, cooling or reserved. The failure in hand is the honest
-        // answer, and the pending blame dies with the walk: nobody is punished
-        // for a request that no account could serve.
+        // either tried or cooling. The failure in hand is the honest answer,
+        // and the pending blame dies with the walk: nobody is punished for a
+        // request that no account could serve.
         if (next === undefined || tried.has(next.id)) throw error
         tried.add(next.id)
         // Report the account that failed before announcing the switch: the host
@@ -760,29 +773,19 @@ export class DefaultQoderTransport implements QoderTransport {
      * nothing to protect or coordinate there.
      */
     /*
-     * Claim the account before anything else.
-     *
-     * This is the dispatch-time half of T7: `nextWalkAccount` skips accounts
-     * someone else reserved, and taking the reservation here makes that check
-     * true for the whole time this attempt is being served. When the claim
-     * fails — a race with another request, or a pool in which every account is
-     * already serving — the attempt proceeds WITHOUT the claim rather than
-     * refusing a request the user made: the traffic guard below still paces it,
-     * so the fallback is a slower request instead of a failed one.
-     *
-     * The release closure is defined BEFORE `traffic.acquire` because the
-     * acquire can throw (its documented contract is "never rejects", but a
-     * failing guard or a test double can), and a claim leaked on that path
-     * would make the account look busy forever. `release` is idempotent, so the
-     * early definition costs nothing on the normal path.
+     * The traffic guard is the only gate between two concurrent requests and
+     * one credential (T7): an account is busy exactly while this slot is held or
+     * somebody is queued for it. The release closure is defined BEFORE
+     * `traffic.acquire` because the acquire can throw (its documented contract
+     * is "never rejects", but a failing guard or a test double can), and a slot
+     * leaked on that path would make the account look busy forever. `release` is
+     * idempotent, so the early definition costs nothing on the normal path.
      */
-    const reserved = accountId === undefined ? false : this.reserveAccount(accountId)
     let lease: QoderAccountLease | undefined
     let released = false
     const release = (): void => {
       if (released) return
       released = true
-      if (reserved && accountId !== undefined) this.releaseAccount(accountId)
       lease?.release()
     }
     try {
@@ -953,49 +956,37 @@ export class DefaultQoderTransport implements QoderTransport {
     }
   }
 
-  /** Claim an account for dispatch; `false` means someone else holds it. */
-  private reserveAccount(accountId: string): boolean {
-    if (this.reservedAccounts.has(accountId)) return false
-    this.reservedAccounts.add(accountId)
-    return true
-  }
-
-  private releaseAccount(accountId: string): void {
-    this.reservedAccounts.delete(accountId)
-  }
-
   /**
-   * The account the walk should visit next, skipping cooling accounts (T5) and,
-   * unless `allowReserved` asks for them, accounts another request is already
-   * serving (T7).
+   * The account the walk should visit next: cooling accounts (T5) are skipped
+   * entirely, busy accounts (T7, the traffic guard is serving them) and
+   * deprioritised accounts are collected as fallbacks, and a free candidate is
+   * preferred over both.
    *
    * "Skip" is a statement about this request, not about the pool: cooling
    * accounts are left untried so a known-bad guess cannot spend the request,
    * but they stay in the walk order for when the ledger forgets them. Accounts
    * that are merely deprioritised are collected and used as a fallback — the
-   * whole point of a downweight is "prefer others", not "refuse" — and only a
-   * walk with no un-cooled candidate at all returns `undefined`, which ends the
-   * walk and lets the original failure surface.
+   * whole point of a downweight is "prefer others", not "refuse". A busy
+   * account is the last resort, and only when `allowBusy` asks for it: a request
+   * that would otherwise fail is better served by queueing behind the traffic
+   * guard than by refusing the user, and the guard paces the two requests on
+   * that identity. Dispatch-time selection (the cooling skip) leaves it out —
+   * waiting for a busy account is worse than taking a merely cooling one now.
    *
-   * `allowReserved` is the last-resort mode used by the failure walk: a busy
-   * account is better than a hard failure, because the traffic guard paces the
-   * two requests on that account instead of refusing one of them. Reserved
-   * accounts are collected separately and returned only when no ordinary
-   * candidate exists, so a reservation is preferred over an outage but never
-   * over a free account.
-   *
-   * The search is bounded and never revisits an id, so a host `nextAccount`
-   * that wraps the pool cannot make selection loop.
+   * Only a walk with no candidate at all returns `undefined`, which ends the
+   * walk and lets the original failure surface. The search is bounded and never
+   * revisits an id, so a host `nextAccount` that wraps the pool cannot make
+   * selection loop.
    */
   private async nextWalkAccount(
     failover: NonNullable<QoderTransportOptions['failover']>,
     currentId: string,
     tried: ReadonlySet<string>,
-    allowReserved = false,
+    allowBusy = false,
   ): Promise<{ id: string; pat: string } | undefined> {
     const considered = new Set<string>([currentId])
     const deprioritized: Array<{ id: string; pat: string }> = []
-    const reservedFallback: Array<{ id: string; pat: string }> = []
+    const busy: Array<{ id: string; pat: string }> = []
     let id = currentId
     for (let step = 0; step < maxWalkSearchSteps; step++) {
       const candidate = await this.nextAccount(failover, id, tried)
@@ -1005,13 +996,8 @@ export class DefaultQoderTransport implements QoderTransport {
         id = candidate.id
         continue
       }
-      // Another request is already dispensing this account: walking onto it
-      // would hand two concurrent conversations the same identity, which is
-      // the duplicate selection the reservation exists to prevent. In
-      // last-resort mode it is remembered instead, so that a request that
-      // would otherwise fail can still be served (paced by the traffic guard).
-      if (this.reservedAccounts.has(candidate.id)) {
-        if (allowReserved) reservedFallback.push(candidate)
+      if (this.traffic.isBusy(candidate.id)) {
+        if (allowBusy) busy.push(candidate)
         id = candidate.id
         continue
       }
@@ -1022,35 +1008,8 @@ export class DefaultQoderTransport implements QoderTransport {
       }
       return candidate
     }
-    return deprioritized[0] ?? reservedFallback[0]
-  }
-
-  /**
-   * Where the failure walk goes after `currentId`.
-   *
-   * The ordinary selection skips accounts another request is already serving,
-   * because two concurrent conversations on one identity is the duplicate
-   * selection T7 exists to prevent. A request that would otherwise FAIL is the
-   * exception: when every remaining account is busy, the traffic guard still
-   * paces the two requests on that identity, so a paced retry is strictly
-   * better than a hard failure (observed as "主账号被并发抢走 → 备用 PAT 失效 →
-   * 整请求报错"). Hence the second pass with `allowReserved`; reservations are
-   * returned only when no ordinary candidate exists.
-   */
-  private async walkAfterFailure(
-    failover: NonNullable<QoderTransportOptions['failover']>,
-    currentId: string,
-    tried: ReadonlySet<string>,
-  ): Promise<{ id: string; pat: string } | undefined> {
-    const next = await this.nextWalkAccount(failover, currentId, tried)
-    if (next !== undefined && !tried.has(next.id)) return next
-    // Only a reservation can make the first pass look empty while a usable
-    // account remains, so the second pass is skipped when nobody holds one:
-    // this keeps the ordinary "walk the pool once" bound intact (a single
-    // consultation per account) and reserves the extra search for the case it
-    // exists for.
-    if (this.reservedAccounts.size === 0) return undefined
-    return await this.nextWalkAccount(failover, currentId, tried, true)
+    // A deprioritised but free account still beats queueing behind a busy one.
+    return deprioritized[0] ?? (allowBusy ? busy[0] : undefined)
   }
 
   /**

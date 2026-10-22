@@ -11,15 +11,15 @@ import {
 } from '../src/qoder/transport/index.ts'
 
 /**
- * Offline tests for per-request account reservations.
+ * Offline tests for the single dispatch gate: the per-account traffic guard.
  *
  * The transport only walks the account pool after a failure, so two requests
  * that start in the same instant both read the same active account and land on
- * the same credential — even though the pool has capacity. The reservation is
- * the dispatch-time claim that makes "this account is already serving someone"
- * visible to the walk's account choice. These cases pin the whole contract: a
- * concurrent request is steered elsewhere, claims are released after success,
- * failure and abort, and a one-account pool keeps behaving exactly as before.
+ * the same credential — even though the pool has capacity. The traffic guard is
+ * the ONE gate that makes "this account is already serving someone" visible to
+ * the walk's account choice: `isBusy` steers a concurrent request elsewhere,
+ * the guard's lease is released after success, failure and abort, and a
+ * one-account pool queues behind the guard instead of refusing the request.
  */
 
 const ALPHA = { id: 'acct-a', pat: 'pt-a' }
@@ -109,6 +109,7 @@ function pool(
   accounts: Array<{ id: string; pat: string }>,
   switches: Array<{ fromId: string; toId: string; reason: string }>,
   wrap = false,
+  adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }> = [],
 ): QoderFailoverHooks {
   return {
     enabled: () => true,
@@ -121,6 +122,9 @@ function pool(
     },
     switched: async (info) => {
       switches.push(info)
+    },
+    adopted: async (info) => {
+      adopted.push(info)
     },
   }
 }
@@ -165,10 +169,11 @@ describe('QoderTransport account reservations', () => {
   it('steers a second concurrent request away from the account already serving, silently', async () => {
     const upstream = fakeUpstream({ [ALPHA.pat]: ['hold'] })
     const switches: Array<{ fromId: string; toId: string; reason: string }> = []
-    const transport = transportWith(upstream, pool([ALPHA, BETA], switches))
+    const adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }> = []
+    const transport = transportWith(upstream, pool([ALPHA, BETA], switches, false, adopted))
 
-    // First request: pinned to Alpha and visibly in flight, so its reservation
-    // is held for the whole time the test stage matters.
+    // First request: starts on Alpha and visibly stays in flight, so the traffic
+    // guard holds its slot for the whole time the test stage matters.
     const first = drain(transport)
     await waitFor(() => upstream.chats.length === 1, 'the first chat to start')
 
@@ -177,7 +182,7 @@ describe('QoderTransport account reservations', () => {
 
     const firstChat = upstream.chats[0]!
     const secondChat = upstream.chats[1]!
-    // The reserved account is skipped exactly like a cooling one is: the second
+    // A busy account is skipped exactly like a cooling one is: the second
     // request is answered by the next pool account, not by the same credential.
     expect(firstChat.pat).toBe(ALPHA.pat)
     expect(secondChat.pat).toBe(BETA.pat)
@@ -188,9 +193,12 @@ describe('QoderTransport account reservations', () => {
      * active account (a credential-file write) and tells the user "已自动切换
      * 到下一个账号重试" with an error row. Nothing failed here, so announcing
      * the skip would fabricate an outage for a request that never had one. The
-     * reserve-and-skip must therefore be invisible outside this request.
+     * busy skip must therefore be invisible outside this request — and unlike a
+     * cooling skip it must not even be adopted: another request is just using
+     * the account this second.
      */
     expect(switches).toEqual([])
+    expect(adopted).toEqual([])
 
     upstream.releaseAll()
     const [firstChunks, secondChunks] = await Promise.all([first, second])
@@ -198,18 +206,21 @@ describe('QoderTransport account reservations', () => {
     expect(secondChunks.some((chunk) => chunk.type === 'text-delta')).toBe(true)
   })
 
-  it('skips a cooling account silently too, instead of reporting a switch', async () => {
+  it('adopts a cooling account silently, without reporting a switch', async () => {
     // Alpha is cooled down by a real failure that Beta then rescued. The very
     // next request starts on Alpha (the host's active pointer never moved in
-    // this fixture), and the cooling skip must be just as invisible as the
-    // reservation skip: otherwise every later request would re-announce the
-    // same old failure as a fresh failover.
+    // this fixture), and the cooling skip must be just as silent as the busy
+    // skip: otherwise every later request would re-announce the same old
+    // failure as a fresh failover. It IS adopted, though — the host's metadata
+    // reads sign with the stored active account, so leaving the cooling
+    // credential active would keep the status card reading through it.
     const upstream = fakeUpstream({
       [ALPHA.pat]: ['rate'],
       [BETA.pat]: ['ok'],
     })
     const switches: Array<{ fromId: string; toId: string; reason: string }> = []
-    const transport = transportWith(upstream, pool([ALPHA, BETA], switches))
+    const adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }> = []
+    const transport = transportWith(upstream, pool([ALPHA, BETA], switches, false, adopted))
 
     await drain(transport)
     expect(switches.map((row) => row.reason)).toEqual(['upstream RATE_LIMIT (HTTP 429)'])
@@ -219,11 +230,12 @@ describe('QoderTransport account reservations', () => {
     expect(chunks.some((chunk) => chunk.type === 'text-delta')).toBe(true)
     // Only the original failure switch: no "account cooling down" row.
     expect(switches.map((row) => row.reason)).toEqual(['upstream RATE_LIMIT (HTTP 429)'])
+    expect(adopted).toEqual([{ fromId: ALPHA.id, toId: BETA.id, reason: 'cooling' }])
   })
 
-  it('releases the claim when a failed attempt moves the walk on', async () => {
+  it('releases the traffic slot when a failed attempt moves the walk on', async () => {
     // r1 fails on Alpha and on Beta, then streams from Gamma while it is held.
-    // By then Alpha's failed attempt must have released its claim: r2 has to be
+    // By then Alpha's failed attempt must have released its slot: r2 has to be
     // able to start on Alpha instead of walking past it.
     const upstream = fakeUpstream({
       [ALPHA.pat]: ['fail', 'ok'],
@@ -251,7 +263,7 @@ describe('QoderTransport account reservations', () => {
     expect(secondChunks.some((chunk) => chunk.type === 'text-delta')).toBe(true)
   })
 
-  it('releases the claim when the request is aborted mid-stream', async () => {
+  it('releases the traffic slot when the request is aborted mid-stream', async () => {
     const upstream = fakeUpstream({ [ALPHA.pat]: ['hold', 'ok'] })
     const switches: Array<{ fromId: string; toId: string; reason: string }> = []
     const transport = transportWith(upstream, pool([ALPHA, BETA], switches))
@@ -263,7 +275,7 @@ describe('QoderTransport account reservations', () => {
     controller.abort()
     await expect(first).rejects.toBeDefined()
 
-    // The aborted request must not keep Alpha claimed: a fresh request starts
+    // The aborted request must not keep Alpha's slot: a fresh request starts
     // there again, with no "already serving" switch in between.
     const second = await drain(transport)
     expect(upstream.chats[1]!.pat).toBe(ALPHA.pat)
@@ -272,8 +284,8 @@ describe('QoderTransport account reservations', () => {
   })
 
   it('leaves a single-account pool unchanged: both requests still use that account', async () => {
-    // With nowhere else to go the reservation falls back to today's behaviour:
-    // the request is queued behind the traffic guard rather than refused.
+    // With nowhere else to go the busy account is the only option: the request
+    // queues behind the traffic guard rather than being refused.
     const upstream = fakeUpstream({ [ALPHA.pat]: ['hold', 'ok'] })
     const switches: Array<{ fromId: string; toId: string; reason: string }> = []
     const transport = transportWith(upstream, pool([ALPHA], switches))
@@ -294,12 +306,12 @@ describe('QoderTransport account reservations', () => {
     expect(secondChunks.some((chunk) => chunk.type === 'text-delta')).toBe(true)
   })
 
-  it('falls back to a reserved account when every free account is unusable', async () => {
+  it('falls back to a busy account when every free account is unusable', async () => {
     // The reported outage: a concurrent request (the host's title call) holds
-    // Alpha while Beta's PAT is dead (AUTH). Refusing to reuse the reserved
-    // account turned "the healthy account is busy" into "调用不了模型". The
-    // walk must therefore come back around to Alpha as a LAST resort, paced
-    // behind the concurrent request by the traffic guard.
+    // Alpha while Beta's PAT is dead (AUTH). Refusing to reuse the busy account
+    // turned "the healthy account is busy" into "调用不了模型". The walk must
+    // therefore come back around to Alpha as a LAST resort, paced behind the
+    // concurrent request by the traffic guard.
     const upstream = fakeUpstream({
       [ALPHA.pat]: ['hold', 'ok'],
       [BETA.pat]: ['auth', 'auth', 'auth'],
@@ -311,8 +323,8 @@ describe('QoderTransport account reservations', () => {
     await waitFor(() => upstream.chats.length === 1, 'the first chat to start')
 
     const second = drain(transport)
-    // Alpha is reserved, so the second request starts on Beta and has its dead
-    // PAT rejected; only then does the walk have to reconsider Alpha.
+    // Alpha is busy, so the second request starts on Beta and has its dead PAT
+    // rejected; only then does the walk have to reconsider Alpha.
     await waitFor(
       () => upstream.chats.some((chat) => chat.pat === BETA.pat),
       'the second request to try Beta',
@@ -332,15 +344,14 @@ describe('QoderTransport account reservations', () => {
     ])
   }, 20_000)
 
-  it('releases the account claim when the traffic guard throws before a lease exists', async () => {
+  it('leaks no traffic slot when the guard throws before a lease exists', async () => {
     const upstream = fakeUpstream()
     const switches: Array<{ fromId: string; toId: string; reason: string }> = []
     const transport = transportWith(upstream, pool([ALPHA, BETA], switches))
-    // The guard is documented never to reject, but a claim leaked on that path
+    // The guard is documented never to reject, but a slot leaked on that path
     // would mark the account busy for the life of the process. Patch it once.
     const internals = transport as unknown as {
-      traffic: { acquire: (accountId: string) => Promise<{ release(): void }> }
-      reservedAccounts: Set<string>
+      traffic: { acquire: (accountId: string) => Promise<{ release(): void }>; isBusy(accountId: string): boolean }
     }
     const original = internals.traffic.acquire.bind(internals.traffic)
     let acquireCalls = 0
@@ -351,9 +362,10 @@ describe('QoderTransport account reservations', () => {
     }
 
     await expect(drain(transport)).rejects.toThrow('guard exploded')
-    expect(internals.reservedAccounts.has(ALPHA.id)).toBe(false)
+    // No claim to leak: the gate was never held, so the account is free.
+    expect(internals.traffic.isBusy(ALPHA.id)).toBe(false)
 
-    // The account is usable by the next request instead of looking reserved.
+    // The account is usable by the next request instead of looking busy.
     const chunks = await drain(transport)
     expect(upstream.chats.map((chat) => chat.pat)).toEqual([ALPHA.pat])
     expect(chunks.some((chunk) => chunk.type === 'text-delta')).toBe(true)

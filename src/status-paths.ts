@@ -150,11 +150,11 @@ export interface QoderAccountSummary {
   /**
    * This account's observed service state, from its own request outcomes.
    *
-   * `normal`: nothing wrong was seen. `queued`: the last thing the upstream
-   * said about this account was its per-model queue answer. `limited`: the
-   * account keeps queueing or keeps failing to connect — two queue answers at
-   * least an hour apart, or repeated connection failures — which is what the
-   * card shows as 限流. Absent when the plugin has observed nothing yet.
+   * `normal`: the last state was a successful connection. `queued`: the last
+   * upstream answer was its per-model queue notice, still fresh (the queue is a
+   * per-model fact, so this is a short-lived observation, not a verdict about
+   * the credential). `limited`: repeated connection failures cooled the account
+   * down. Absent when the plugin has observed nothing yet.
    */
   health?: QoderAccountHealth
 }
@@ -466,9 +466,10 @@ export type QoderWebStatus =
      * A 200 stream can still fail with the upstream's real reason inside an
      * inner chunk (content policy, queue/throttle, auth, invalid request).
      * Those failures are counted by the wire decoder and surfaced here through
-     * the status channel, which is the existing read-only health view; no card
-     * renders them yet (that lands with RISK_STATS). Counters are per process
-     * and reset on restart.
+     * the status channel, which is the existing read-only health view; the
+     * card's account-pool section renders the non-zero classes as a caption,
+     * so a failure that never reached the status code is still visible to the
+     * user. Counters are per process and reset on restart.
      */
     innerErrors?: Partial<Record<
       'content_policy' | 'rate_limit' | 'invalid_request' | 'auth' | 'other',

@@ -70,6 +70,23 @@ export interface QoderFailoverHooks {
    */
   switched(info: { fromId: string; toId: string; reason: string }): void | Promise<void>
   /**
+   * Adopt a dispatch decision that moved this request to another account for a
+   * reason that is NOT a failure of the request (today: the active account is
+   * cooling down after repeated failures).
+   *
+   * This must stay silent — no user-visible notice and no "last failover"
+   * timestamp, because nothing about the request failed. It exists because the
+   * host persists whichever account is active, and the host's metadata reads
+   * (catalog, billing) sign with that account: leaving a cooling credential
+   * active would move the chat path off it while the status card kept reading
+   * through it. A merely busy account is never adopted; another request is just
+   * using it this second.
+   *
+   * Awaiting is load-bearing for the same reason as `switched`: the adoption has
+   * to have landed before another path resolves the active account.
+   */
+  adopted?(info: { fromId: string; toId: string; reason: 'cooling' }): void | Promise<void>
+  /**
    * Report that one pooled account could not serve a request at all.
    *
    * Fired for the failures that advance the walk (a connection-level failure

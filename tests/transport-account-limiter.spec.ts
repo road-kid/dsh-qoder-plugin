@@ -154,6 +154,27 @@ describe('QoderAccountTrafficLimiter', () => {
     third.release()
   })
 
+  it('reports an account busy only while it is held or someone is queued', async () => {
+    // `isBusy` is the transport's single dispatch gate (T7): it must be true
+    // for exactly the window in which a second attempt would overlap this one,
+    // and false once the lease is released so the walk can come back around.
+    const limiter = new QoderAccountTrafficLimiter({ random: () => 0 })
+    expect(limiter.isBusy(ALPHA.id)).toBe(false)
+
+    const lease = await limiter.acquire(ALPHA.id)
+    expect(limiter.isBusy(ALPHA.id)).toBe(true)
+
+    // A queued request also counts: an account with waiters is still serving.
+    const queued = limiter.acquire(ALPHA.id)
+    expect(limiter.isBusy(ALPHA.id)).toBe(true)
+
+    lease.release()
+    const next = await queued
+    expect(limiter.isBusy(ALPHA.id)).toBe(true)
+    next.release()
+    expect(limiter.isBusy(ALPHA.id)).toBe(false)
+  })
+
   it('never makes one account wait for another', async () => {
     // A paused clock with a recording sleep: any cross-account wait would show
     // up as a sleep call.

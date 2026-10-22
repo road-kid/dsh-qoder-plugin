@@ -1084,6 +1084,59 @@ describe('Qoder plugin card', () => {
     expect(rendered()).not.toContain(en.accountHealthNormal)
   })
 
+  it('separates a standby automatic switch from one the user turned off', async () => {
+    // A single seat with the preference still on: the pool cannot fail over, but
+    // that is not the user's choice — saying 已关闭 would claim a decision the
+    // user never made, and the settings switch beside it still reads 开.
+    withPool({
+      accounts: {
+        entries: [
+          { id: 'pat:aaaa', source: 'card', active: true, order: 1, patTail: 'aaaa' },
+        ],
+        autoFailover: false,
+        autoFailoverEnabled: true,
+      },
+    })
+    await mount()
+    const text = rendered()
+    expect(text).toContain(en.accountsFailoverIdle)
+    expect(text).not.toContain(en.accountsFailoverOff)
+  })
+
+  it('says 自动切换已关闭 only when the preference itself is off', async () => {
+    withPool({
+      accounts: {
+        entries: [
+          { id: 'pat:aaaa', source: 'card', active: true, order: 1, patTail: 'aaaa' },
+          { id: 'pat:bbbb', source: 'card', active: false, order: 2, patTail: 'bbbb' },
+        ],
+        autoFailover: false,
+        autoFailoverEnabled: false,
+      },
+    })
+    await mount()
+    const text = rendered()
+    expect(text).toContain(en.accountsFailoverOff)
+    expect(text).not.toContain(en.accountsFailoverIdle)
+  })
+
+  it('lists the in-stream error counters the host observed, and hides zeroes', async () => {
+    withPool({ innerErrors: { rate_limit: 2, content_policy: 1, auth: 0 } })
+    await mount()
+    const text = rendered()
+    expect(text).toContain(en.innerErrorsHeading)
+    expect(text).toContain('Rate limit 2')
+    expect(text).toContain('Content policy 1')
+    // A class that never occurred is noise, not a fact worth a row.
+    expect(text).not.toContain('Auth 0')
+  })
+
+  it('renders no in-stream error caption when the process observed none', async () => {
+    withPool({ innerErrors: { rate_limit: 0, content_policy: 0, auth: 0 } })
+    await mount()
+    expect(rendered()).not.toContain(en.innerErrorsHeading)
+  })
+
   it('writes all three stickiness bounds on commit and clamps one outside them', async () => {
     const scope = fakeSettingsScope()
     await mountWithSettings(scope)

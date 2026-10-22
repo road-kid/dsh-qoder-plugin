@@ -57,6 +57,20 @@ const CN_STATUS: QoderWebStatus = {
   },
 }
 
+/** CN variant with a pool: two usable seats (one active) and one parked seat. */
+const POOL_CN_STATUS: QoderWebStatus = {
+  ...CN_STATUS,
+  accounts: {
+    entries: [
+      { id: 'pat:aaaa', source: 'card', active: true, order: 1, patTail: 'aaaa', accountName: 'Alice' },
+      { id: 'pat:bbbb', source: 'card', active: false, order: 2, patTail: 'bbbb' },
+      { id: 'pat:cccc', source: 'card', active: false, order: 3, patTail: 'cccc', enabled: false },
+    ],
+    autoFailover: true,
+    autoFailoverEnabled: true,
+  },
+}
+
 /**
  * The live CN document that used to read "Unlimited": the upstream marks the
  * credits unlimited while the gift package still carries 1,933 of 2,400.
@@ -365,6 +379,32 @@ describe('ComposerQuotaChip', () => {
     expect(hostsByClass('qdp-popVariant')).toHaveLength(1)
     expect(treeText()).toContain(en.quotaNotSignedIn)
     expect(treeText()).not.toContain(en.quotaUnlimited)
+  })
+
+  it('states a pooled seat with no observed outcome as 尚未观测, and parked seats not at all', async () => {
+    request.mockImplementation(async (): Promise<Response> => ({
+      ok: true,
+      status: 200,
+      json: async () => POOL_CN_STATUS,
+    } as unknown as Response))
+    await mount('qoder')
+    await flush()
+    await open()
+
+    // Two enabled seats and neither has a recorded outcome: absence is
+    // "nothing observed yet", the same word the card's account list uses. The
+    // composer used to stay silent about that gap, which read as a claim.
+    const chips = view!.root.findAll(node => (
+      node.props['className'] === 'qdp-tag' && node.children.join('') === en.accountHealthUnknown
+    ))
+    expect(chips).toHaveLength(2)
+    expect(treeText()).not.toContain(en.accountHealthNormal)
+
+    // A parked seat is out of the walk, so it carries no service state at all.
+    const parked = hostsByClass('qdp-popAccountParked')
+    expect(parked).toHaveLength(1)
+    expect(textOf(parked[0]!)).toContain(en.accountParked)
+    expect(textOf(parked[0]!)).not.toContain(en.accountHealthUnknown)
   })
 
   it('reads real credit even when the upstream flags the account unlimited', async () => {

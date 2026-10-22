@@ -20,15 +20,17 @@
 import type { QoderAccountHealth } from './status-paths.ts'
 
 /**
- * How far apart two queue answers must be before they describe a pattern.
+ * How long a queue answer keeps describing an account as "queued".
  *
- * The user's own rule: two queued answers more than an hour apart mean the
- * account is not merely waiting out one saturated model, it keeps coming back
- * to a queue. One hour is short enough that a genuinely rate-limited
- * subscription shows up within a working session, and long enough that a single
- * burst of retries inside one outage cannot produce it.
+ * A queue answer is a fact about one saturated MODEL, not a verdict on the
+ * subscription: the same account may be waiting on one model while it serves
+ * another perfectly well, and the queue drains on its own. The label therefore
+ * describes a fresh observation only — five minutes covers the waits the
+ * transport itself performs (its queue-wait ceiling is five minutes) and stops
+ * accusing an account once its model drained. An account is never promoted to
+ * `limited` from queue answers; only consecutive connection failures earn that.
  */
-export const limitedQueueGapMs = 60 * 60 * 1000
+export const queuedHealthTtlMs = 5 * 60 * 1000
 
 /**
  * Consecutive connection failures that read as "this account is rate-limited".
@@ -43,12 +45,8 @@ export const limitedFailureStreak = 3
 
 /** What one account has shown, as the tracker remembers it. */
 interface AccountObservation {
-  /** First queue answer of the current streak. */
-  firstQueueAtMs?: number | undefined
-  /** Most recent queue answer. */
+  /** Most recent queue answer, describing that observation for a short while. */
   lastQueueAtMs?: number | undefined
-  /** Queue answers seen in the current streak. */
-  queueCount: number
   /** Consecutive connection failures since the last accepted request. */
   failureStreak: number
   /** Whether the observations have described this account as limited. */
@@ -70,33 +68,16 @@ export class QoderAccountHealthTracker {
   /**
    * Record one upstream "model not serviceable" (queued) answer.
    *
-   * The second answer an hour or more after the first promotes the account to
-   * `limited` and keeps it there until something shows the account works — the
-   * point of the label is to outlast the queue it was inferred from.
+   * The answer describes the MODEL's queue at that instant, not the account's
+   * health, so it only keeps the account labelled `queued` for
+   * {@link queuedHealthTtlMs}. It never promotes the account to `limited`: a
+   * queue is the upstream pacing a saturated model, and a plugin that turned
+   * that into "this account is throttled" would keep accusing it long after the
+   * queue drained.
    */
   noteQueue(accountId: string, atMs: number): void {
     const observation = this.observations.get(accountId) ?? this.fresh()
-    if (observation.firstQueueAtMs === undefined) {
-      observation.firstQueueAtMs = atMs
-      observation.queueCount = 1
-    } else {
-      observation.queueCount += 1
-    }
     observation.lastQueueAtMs = atMs
-    /*
-     * The promotion rule, stated exactly: a SECOND queue answer that lands at
-     * least an hour after the first one in this streak. The first answer alone
-     * is one saturated model; two an hour apart is an account that keeps
-     * arriving at a queue. `queueCount >= 2` is what keeps a single answer that
-     * merely happens to arrive an hour after an old one from qualifying.
-     */
-    if (
-      !observation.limited
-      && observation.queueCount >= 2
-      && atMs - (observation.firstQueueAtMs ?? atMs) >= limitedQueueGapMs
-    ) {
-      observation.limited = true
-    }
     this.observations.set(accountId, observation)
   }
 
@@ -115,8 +96,6 @@ export class QoderAccountHealthTracker {
       return
     }
     observation.failureStreak = 0
-    observation.queueCount = 0
-    observation.firstQueueAtMs = undefined
     observation.lastQueueAtMs = undefined
     observation.limited = false
     observation.lastConnectedAtMs = atMs
@@ -139,12 +118,17 @@ export class QoderAccountHealthTracker {
     this.observations.set(accountId, observation)
   }
 
-  /** What this account has shown, or `undefined` when it has shown nothing. */
-  healthOf(accountId: string): QoderAccountHealth | undefined {
+  /**
+   * What this account has shown at `nowMs`, or `undefined` when it has shown
+   * nothing (or only an observation too old to still describe it).
+   */
+  healthOf(accountId: string, nowMs: number): QoderAccountHealth | undefined {
     const observation = this.observations.get(accountId)
     if (observation === undefined) return undefined
     if (observation.limited) return 'limited'
-    if (observation.lastQueueAtMs !== undefined && observation.queueCount > 0) return 'queued'
+    if (observation.lastQueueAtMs !== undefined && nowMs - observation.lastQueueAtMs <= queuedHealthTtlMs) {
+      return 'queued'
+    }
     if (observation.lastConnectedAtMs !== undefined) return 'normal'
     return undefined
   }
@@ -160,7 +144,7 @@ export class QoderAccountHealthTracker {
   }
 
   private fresh(): AccountObservation {
-    return { queueCount: 0, failureStreak: 0, limited: false }
+    return { failureStreak: 0, limited: false }
   }
 }
 

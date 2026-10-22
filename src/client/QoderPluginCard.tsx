@@ -1983,6 +1983,30 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const pool = servedAccounts !== undefined && poolEntries.length > 0
     ? { ...servedAccounts, entries: poolEntries }
     : undefined
+  /**
+   * The host's in-process count of upstream errors that arrived INSIDE a 200
+   * stream (a refused chat, a rate-limit page) and that the transport had to
+   * classify after the status code said "fine".
+   *
+   * Rendered only when at least one has happened: zero is the normal case and
+   * needs no row. The counts are per process, so they reset on restart — the
+   * caption says so rather than pretending to be a lifetime statistic.
+   */
+  const innerErrorsSummary = (() => {
+    const counters = signedInDoc?.innerErrors
+    if (counters === undefined) return undefined
+    const parts = ([
+      ['content_policy', t('innerErrorsContentPolicy')],
+      ['rate_limit', t('innerErrorsRateLimit')],
+      ['invalid_request', t('innerErrorsInvalidRequest')],
+      ['auth', t('innerErrorsAuth')],
+      ['other', t('innerErrorsOther')],
+    ] as const)
+      .map(([kind, label]) => ({ label, count: counters[kind] ?? 0 }))
+      .filter(item => item.count > 0)
+      .map(item => `${item.label} ${item.count}`)
+    return parts.length === 0 ? undefined : parts.join(' · ')
+  })()
   const upstreamNotice = signedInDoc?.upstreamNotice
 
   return (
@@ -2100,7 +2124,9 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                   <span className="qdp-rowTitle">
                     <span>{t('accountsHeading')}</span>
                     <QdpTag tone={pool.autoFailover ? 'success' : 'neutral'}>
-                      {pool.autoFailover ? t('accountsFailoverOn') : t('accountsFailoverOff')}
+                      {pool.autoFailover
+                        ? t('accountsFailoverOn')
+                        : pool.autoFailoverEnabled === false ? t('accountsFailoverOff') : t('accountsFailoverIdle')}
                     </QdpTag>
                   </span>
                   <span className="qdp-rowDesc">{t('accountsHint')}</span>
@@ -2229,6 +2255,9 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                   )
                 })}
               </ul>
+              {innerErrorsSummary === undefined ? null : (
+                <p className="qdp-caption">{t('innerErrorsHeading')} · {innerErrorsSummary}</p>
+              )}
               {pool.lastFailoverAt === undefined ? null : (
                 <p className="qdp-caption">
                   {t('accountsLastFailover', { time: formatTime(pool.lastFailoverAt) })}

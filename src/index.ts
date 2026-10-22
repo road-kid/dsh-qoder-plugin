@@ -964,6 +964,19 @@ function createVariantRuntime(
         if (found === undefined || found.enabled === false) return undefined
         return { id: found.id, pat: found.pat }
       },
+      adopted: async info => {
+        // A quiet move, not a failover: the account kept failing, so the chat
+        // path starts elsewhere while nothing in this request failed. The store
+        // still has to move — the catalog, credits and the card resolve the
+        // active account, and leaving the cooling one active would keep those
+        // reads on the credential the transport just decided to avoid. No
+        // notice and no `failoverAt`/`failoverReason`: there is nothing to
+        // announce and the card's "last switched" time must not lie.
+        await adoptFailoverAccount(store, info.toId, message => { ctx.logger.warn(message) })
+        ctx.logger.warn(
+          `dsh-qoder-plugin: ${variant.displayName} adopted ${info.toId} after the previous account entered a cooldown (${info.reason})`,
+        )
+      },
       failed: info => {
         // The card's 限流 label. Only connection-level failures reach here
         // (the transport filters out refused requests and queue answers), so
@@ -1195,7 +1208,7 @@ function createVariantRuntime(
     },
     failoverAt: () => failoverAt,
     failoverReason: () => failoverReason,
-    healthOf: accountId => health.healthOf(accountId),
+    healthOf: accountId => health.healthOf(accountId, Date.now()),
     forgetHealth: accountId => { health.forget(accountId) },
     checkIn: (signal?: AbortSignal) => transport.checkIn(signal),
   }
