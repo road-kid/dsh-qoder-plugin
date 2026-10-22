@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto'
 import { QoderLlmError, qoderHttpError, qoderRequestId } from '../errors.ts'
 import { logParsedResponse, redactLogPayload, type QoderLogger } from './logging.ts'
-import { metadataCosyVersion, qoderUserAgent } from './wire/version.ts'
+import { campaignCosyVersion, campaignUserAgent, metadataCosyVersion, qoderUserAgent } from './wire/version.ts'
 import { qoderClientType } from './wire/cosy.ts'
 
 export const defaultMetadataTimeoutMs = 15_000
@@ -168,6 +168,14 @@ export interface OpenApiJsonRequestOptions {
   operation: string
   logCategory?: string | undefined
   userAgent?: string | undefined
+  /**
+   * Which client fingerprint the request presents.
+   *
+   * `'campaign'` pins the byte-identical 1.0.0 check-in header pair (see
+   * `wire/version.ts`): that family is risk-gated and must not follow the
+   * inference build. Omitted = the aligned metadata fingerprint.
+   */
+  fingerprint?: 'campaign' | undefined
 }
 
 export async function openApiJsonRequest<T>(
@@ -191,11 +199,16 @@ export async function openApiJsonRequest<T>(
      * build. The reference implementation sends the same split (campaign
      * headers use the desktop version, inference the CLI one), so the two
      * values intentionally come from different constants in `wire/version.ts`.
+     *
+     * The campaign/check-in family is the exception: its headers must stay
+     * byte-identical to the 1.0.0 wire format (rot-guard T3), so it pins the
+     * legacy pair instead of following either build above.
      */
+    const campaign = options.fingerprint === 'campaign'
     const headers: Record<string, string> = {
       accept: 'application/json',
-      'user-agent': options.userAgent ?? qoderUserAgent,
-      'cosy-version': metadataCosyVersion,
+      'user-agent': options.userAgent ?? (campaign ? campaignUserAgent : qoderUserAgent),
+      'cosy-version': campaign ? campaignCosyVersion : metadataCosyVersion,
       'cosy-clienttype': qoderClientType,
       ...options.headers,
     }

@@ -6,7 +6,7 @@ import type { QoderAccountInfo } from '../account.ts'
 import type { QoderCatalogModel } from '../catalog.ts'
 import type { QoderRegion } from '../region.ts'
 import type { QoderCheckInResult } from './checkin.ts'
-import type { QoderQueueFacts } from '../queue-notice.ts'
+import type { QoderQueueFacts, QoderQueueWaitProgress } from '../queue-notice.ts'
 import { DefaultQoderTransport, defaultStreamIdleTimeoutMs } from './default-transport.ts'
 import { defaultResponseHeaderTimeoutMs } from './request.ts'
 import type { QoderLogger } from './logging.ts'
@@ -128,6 +128,25 @@ export interface QoderTransportOptions {
    *   blamed on another request's account.
    */
   onUpstreamQueue?: (facts: QoderQueueFacts, accountId?: string) => void
+  /**
+   * Called right before this transport waits out a queue answer, once per wait.
+   *
+   * `onUpstreamQueue` only fires on the request's FINAL failure, so a request
+   * that waited one or two advise windows used to sit silent until it either
+   * recovered or gave up — a 30–90 second empty conversation that looked like a
+   * hang. This hook reports the wait as it starts (its duration and its place in
+   * the request's budget), which is what lets the host show progress instead of
+   * explaining the queue only after the retry has already failed.
+   *
+   * Not fired when `queueWait.attempts` is 0: no wait happens then, and the
+   * final-failure notice already covers the terminal answer.
+   *
+   * @param accountId - The account the waiting attempt signs with, `undefined`
+   *   for the ambient credential.
+   * @param wait - The wait about to start; see
+   *   {@link QoderQueueWaitProgress}.
+   */
+  onQueueWait?: (facts: QoderQueueFacts, accountId: string | undefined, wait: QoderQueueWaitProgress) => void
   /**
    * Called when the upstream accepted a chat — its first chunk is about to be
    * forwarded — so any condition an earlier failure notice described is over.

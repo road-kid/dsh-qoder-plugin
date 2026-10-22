@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { metadataCosyVersion, qoderIdeVersion, qoderUserAgent } from '../../src/qoder/transport/wire/version.ts'
+import {
+  campaignCosyVersion,
+  campaignUserAgent,
+  metadataCosyVersion,
+  qoderIdeVersion,
+  qoderUserAgent,
+} from '../../src/qoder/transport/wire/version.ts'
 import { buildAuthHeaders, qoderDesktopClientType, qoderClientType } from '../../src/qoder/transport/wire/cosy.ts'
 import { openApiJsonRequest } from '../../src/qoder/transport/request.ts'
 
@@ -32,6 +38,32 @@ test('client versions are the ones the reference implementation confirms', () =>
   // The user agent is derived from the same constant, so UA and cosy-version
   // cannot disagree on the inference path.
   assert.equal(qoderUserAgent, `qoder/${qoderIdeVersion}`)
+  // The campaign/check-in family is pinned to the 1.0.0 wire values instead
+  // (rot-guard T3: byte-identical check-in headers), so it must NOT follow the
+  // inference build above.
+  assert.equal(campaignUserAgent, 'qoder/1.1.47')
+  assert.equal(campaignCosyVersion, '1.0.1')
+})
+
+test('the campaign fingerprint keeps the legacy header pair byte-identical', async () => {
+  let headers: Record<string, string> | undefined
+  await openApiJsonRequest((async (_input: URL | Request, init?: RequestInit) => {
+    headers = init?.headers as Record<string, string>
+    return new Response('{"campaigns":[]}')
+  }) as typeof fetch, {
+    url: 'https://api3.qoder.sh/algo/api/v2/campaigns',
+    token: 'jt-token',
+    fingerprint: 'campaign',
+    operation: 'Campaigns',
+    logCategory: 'campaigns.list',
+  })
+  assert.equal(headers?.['user-agent'], campaignUserAgent)
+  assert.equal(headers?.['cosy-version'], campaignCosyVersion)
+  // The old values, spelled out: a future bump of the inference build must not
+  // leak into this family even if both constants are edited at once.
+  assert.equal(headers?.['user-agent'], 'qoder/1.1.47')
+  assert.equal(headers?.['cosy-version'], '1.0.1')
+  assert.notEqual(headers?.['user-agent'], qoderUserAgent)
 })
 
 test('the COSY wire signs and labels requests with the CLI version', () => {
@@ -77,6 +109,11 @@ test('environment overrides let a roll-out pin another build', async () => {
     assert.equal(version.qoderIdeVersion, '9.9.9')
     assert.equal(version.qoderUserAgent, 'qoder/9.9.9')
     assert.equal(version.metadataCosyVersion, '8.8.8')
+    // The campaign family is pinned by design: an env roll-out of the
+    // inference build must not silently move the byte-identical check-in
+    // fingerprint.
+    assert.equal(version.campaignUserAgent, 'qoder/1.1.47')
+    assert.equal(version.campaignCosyVersion, '1.0.1')
   } finally {
     if (previousIde === undefined) delete process.env.QODER_IDE_VERSION
     else process.env.QODER_IDE_VERSION = previousIde

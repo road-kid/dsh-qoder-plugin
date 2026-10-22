@@ -141,13 +141,21 @@ interface QueueObservation {
   accountId: string | undefined
 }
 
+interface WaitObservation {
+  waitMs: number
+  attempt: number
+  remaining: number
+  accountId: string | undefined
+}
+
 function harness(spec: UpstreamSpec & {
   failover?: QoderFailoverHooks
   queueWait?: QoderTransportOptions['queueWait']
   random?: () => number
-}): { transport: QoderTransport; upstream: FakeUpstream; notices: QueueObservation[] } {
+}): { transport: QoderTransport; upstream: FakeUpstream; notices: QueueObservation[]; waits: WaitObservation[] } {
   const upstream = fakeUpstream(spec)
   const notices: QueueObservation[] = []
+  const waits: WaitObservation[] = []
   const options: QoderTransportOptions = {
     region: 'global',
     resolvePat: async () => AMBIENT_PAT,
@@ -159,8 +167,11 @@ function harness(spec: UpstreamSpec & {
     onUpstreamQueue: (facts, accountId) => {
       notices.push({ facts: { isQueued: facts.isQueued, ...facts.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: facts.retryAfterSeconds } }, accountId })
     },
+    onQueueWait: (_facts, accountId, wait) => {
+      waits.push({ waitMs: wait.waitMs, attempt: wait.attempt, remaining: wait.remaining, accountId })
+    },
   }
-  return { transport: createQoderTransport(options), upstream, notices }
+  return { transport: createQoderTransport(options), upstream, notices, waits }
 }
 
 function request(signal?: AbortSignal): GenerateOptions {
@@ -254,6 +265,44 @@ describe('QoderTransport queue waiting', () => {
     expect(poolState.switches).toEqual([])
     expect(poolState.nextCalls).toEqual([])
     expect((error as QoderLlmError).code).toBe('RATE_LIMIT')
+  })
+
+  it('reports each wait as it starts, with its place in the request budget', async () => {
+    const poolState = pool()
+    const { transport, waits } = harness({
+      failover: poolState.hooks,
+      queueWait: { attempts: () => 2, seconds: () => 0.01 },
+      // Jitter floor: each wait is exactly the 1000ms margin + 10ms fallback.
+      random: () => 0,
+      chat: () => queued(0),
+    })
+
+    const error = await drainError(transport)
+
+    expect((error as QoderLlmError).code).toBe('RATE_LIMIT')
+    // Two waits are announced, numbered, and the budget visibly drains — the
+    // host prints a row per wait, so the conversation shows progress instead
+    // of the silence the final-failure notice left behind.
+    expect(waits.map(wait => [wait.attempt, wait.remaining])).toEqual([[1, 1], [2, 0]])
+    // The duration is the one actually slept, not the upstream's raw advice:
+    // a progress row may never name a window the request will not sit out.
+    expect(waits.map(wait => wait.waitMs)).toEqual([1010, 1010])
+    expect(waits.every(wait => wait.accountId === ALPHA.id)).toBe(true)
+  })
+
+  it('announces no wait when waiting is disabled', async () => {
+    const poolState = pool()
+    const { transport, waits } = harness({
+      failover: poolState.hooks,
+      queueWait: { attempts: () => 0, seconds: () => 0.01 },
+      chat: () => queued(30),
+    })
+
+    await drainError(transport)
+
+    // Terminal on the first answer: no sleep, so no progress row — the
+    // final-failure notice is the only thing that should be printed.
+    expect(waits).toEqual([])
   })
 
   it("prefers the upstream's own window over the configured fallback", async () => {

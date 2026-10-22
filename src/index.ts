@@ -38,7 +38,7 @@ import type { QoderAccountHealth, QoderWebCatalog, QoderWebProbeSection, QoderWe
 import { QODER_SETTINGS_FACE_PATH } from './status-paths.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 import { emitJobTokenHint, emitJobTokenRefreshFailedHint, emitUpstreamNotice, installJobTokenHint } from './job-token-hint.ts'
-import { formatQueueNotice } from './qoder/queue-notice.ts'
+import { formatQueueNotice, formatQueueWaitNotice } from './qoder/queue-notice.ts'
 import { QoderAccountHealthTracker } from './account-health.ts'
 import { SettingsStore } from './settings-store.ts'
 import { QODER_CONNECT_VERSION } from './version.ts'
@@ -1039,6 +1039,16 @@ function createVariantRuntime(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
       )
       emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }))
+    },
+    onQueueWait: (facts, accountId, wait) => {
+      // Progress, not the explanation: this row is printed when the wait
+      // starts, so a request that waits out one or two windows is visibly
+      // working instead of indistinguishable from a hang. The final-failure
+      // row (`onUpstreamQueue`) still follows if the retries never succeed.
+      ctx.logger.warn(
+        `dsh-qoder-plugin: ${variant.displayName} upstream model is queued; waiting ${Math.round(wait.waitMs / 1000)}s before retry ${wait.attempt}/${wait.attempt + wait.remaining} (account ${accountId ?? 'ambient'})`,
+      )
+      emitUpstreamNotice(formatQueueWaitNotice(facts, wait))
     },
     onChatAccepted: accountId => {
       // The upstream took a chat, so the condition the last notice described is

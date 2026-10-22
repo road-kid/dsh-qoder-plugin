@@ -245,6 +245,7 @@ export class DefaultQoderTransport implements QoderTransport {
   private readonly chatAccepted: QoderTransportOptions['onChatAccepted']
   private readonly onJobTokenRefreshed: QoderTransportOptions['onJobTokenRefreshed']
   private readonly onJobTokenRefreshFailed: QoderTransportOptions['onJobTokenRefreshFailed']
+  private readonly onQueueWait: QoderTransportOptions['onQueueWait']
   private readonly queueWait: QoderTransportOptions['queueWait']
   private readonly stickiness: QoderTransportOptions['stickiness']
   private readonly routing: QoderTransportOptions['routing']
@@ -326,6 +327,7 @@ export class DefaultQoderTransport implements QoderTransport {
     this.chatAccepted = options.onChatAccepted
     this.onJobTokenRefreshed = options.onJobTokenRefreshed
     this.onJobTokenRefreshFailed = options.onJobTokenRefreshFailed
+    this.onQueueWait = options.onQueueWait
     this.queueWait = options.queueWait
     this.stickiness = options.stickiness
     this.routing = options.routing
@@ -588,7 +590,8 @@ export class DefaultQoderTransport implements QoderTransport {
      * accounts must not hand the same caller a second full budget — see
      * `queueWaitBudget`.
      */
-    const queueBudget = { waitsLeft: this.queueWaitBudget() }
+    const totalWaits = this.queueWaitBudget()
+    const queueBudget = { waitsLeft: totalWaits, total: totalWaits }
     const failover = this.failover
     if (failover === undefined || !failover.enabled()) {
       // No pool to walk, or the user turned switching off: resolve the ambient
@@ -745,7 +748,7 @@ export class DefaultQoderTransport implements QoderTransport {
     pat: string,
     state: { emitted: boolean } = { emitted: false },
     accountId?: string,
-    queueBudget: { waitsLeft: number } = { waitsLeft: 0 },
+    queueBudget: { waitsLeft: number; total: number } = { waitsLeft: 0, total: 0 },
   ): AsyncGenerator<StreamChunk> {
     /*
      * Hold one account's traffic slot for the whole attempt.
@@ -812,7 +815,7 @@ export class DefaultQoderTransport implements QoderTransport {
     pat: string,
     state: { emitted: boolean },
     accountId: string | undefined,
-    queueBudget: { waitsLeft: number },
+    queueBudget: { waitsLeft: number; total: number },
   ): AsyncGenerator<StreamChunk> {
     // Phase 2: credentials, which the center image exchange must be able to sign with.
     const credentials = await this.auth.getCredentials(pat, options.signal)
@@ -856,10 +859,22 @@ export class DefaultQoderTransport implements QoderTransport {
           const waitMs = this.queueWaitMs(error)
           if (waitMs !== undefined) {
             queueBudget.waitsLeft -= 1
+            const attempt = queueBudget.total - queueBudget.waitsLeft
             this.logger?.warn?.('[Qoder Stream] Upstream queue is saturated; waiting before retrying the same account', {
               waitMs,
+              attempt,
               attemptsLeft: queueBudget.waitsLeft,
             })
+            /*
+             * Report the wait BEFORE it starts, so the host can print a
+             * progress row while the request would otherwise sit silent for
+             * the whole advise window. A queue answer is the only evidence
+             * that a wait is happening, and it rides this error.
+             */
+            const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
+            if (facts !== undefined) {
+              this.onQueueWait?.(facts, accountId, { waitMs, attempt, remaining: queueBudget.waitsLeft })
+            }
             await this.waitOutQueue(waitMs, options.signal)
             continue
           }

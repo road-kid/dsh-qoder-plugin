@@ -144,6 +144,42 @@ export function formatQueueNotice(
   return `${head}：这不是登录态或额度问题，${wait}${risk}${source}`
 }
 
+/** The wait about to start, as reported by the transport's `onQueueWait`. */
+export interface QoderQueueWaitProgress {
+  /** How long this wait will last, in milliseconds. */
+  waitMs: number
+  /** 1-based index of this wait within the request's budget. */
+  attempt: number
+  /** Waits left after this one; 0 means this is the last one. */
+  remaining: number
+}
+
+/**
+ * Render the visible "we are actually waiting now" row.
+ *
+ * The final-failure notice ({@link formatQueueNotice}) could only ever appear
+ * AFTER a request gave up, so a request that waited out one or two advise
+ * windows looked indistinguishable from a hang: the user watched an empty
+ * conversation for 30–90 seconds and read the queue explanation only when
+ * nothing was left to do. This row is printed when the wait STARTS, once per
+ * wait, and the attempt number makes consecutive rows textually different —
+ * the host's per-turn de-duplication (it suppresses identical notices) must not
+ * collapse the second wait into the first, or a two-wait retry would again look
+ * frozen after the first line.
+ */
+export function formatQueueWaitNotice(facts: QoderQueueFacts, wait: QoderQueueWaitProgress): string {
+  const seconds = Math.max(1, Math.round(wait.waitMs / 1000))
+  const left = wait.remaining > 0
+    ? `，本次请求还可再等 ${wait.remaining} 次`
+    : '，这是本次请求的最后一次等待'
+  const queue = facts.queueCount === undefined ? '' : `（当前排队约 ${facts.queueCount} 个请求）`
+  const quoted = facts.upstreamMessage === undefined
+    ? undefined
+    : boundMessage(facts.upstreamMessage)
+  const source = quoted === undefined ? '' : `（上游原文：${quoted}）`
+  return `上游模型排队中：正在等待约 ${seconds} 秒后重试（第 ${wait.attempt} 次等待${left}）${queue}。这不是登录态或额度问题${source}`
+}
+
 /**
  * Every JSON object reachable from `body`, outermost first.
  *

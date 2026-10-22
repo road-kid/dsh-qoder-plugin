@@ -53,3 +53,22 @@ export const qoderUserAgent = `qoder/${qoderIdeVersion}`
  * carry different builds. Overridable through `QODER_DESKTOP_VERSION`.
  */
 export const metadataCosyVersion: string = readOverride('QODER_DESKTOP_VERSION', '0.4.8')
+
+/**
+ * User agent for the campaign/check-in request family — the 1.0.0 wire value,
+ * deliberately NOT derived from {@link qoderIdeVersion}.
+ *
+ * rot-guard T3 requires the check-in headers to stay byte-identical: that
+ * family is risk-gated on the desktop identity and its current header set has
+ * been verified against production, so an inference-build bump must not move
+ * it. Kept literal (and not env-overridable) on purpose: an override would
+ * reintroduce exactly the drift this constant exists to prevent. Changing it
+ * requires re-verifying the campaign endpoint, not just a version bump.
+ */
+export const campaignUserAgent = 'qoder/1.1.47'
+
+/**
+ * `cosy-version` for the campaign/check-in request family — the 1.0.0 wire
+ * value (see {@link campaignUserAgent}).
+ */
+export const campaignCosyVersion = '1.0.1'

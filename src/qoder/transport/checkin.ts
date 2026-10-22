@@ -199,6 +199,9 @@ export class QoderCheckInService {
       // The campaign family gates on the desktop identifier; the generic one
       // answers 200 with an empty list (see `qoderDesktopClientType`).
       headers: { 'cosy-clienttype': qoderDesktopClientType, ...riskHeaders(identity) },
+      // Byte-identical 1.0.0 fingerprint: this family is risk-gated, so it must
+      // not follow the inference build's version pair.
+      fingerprint: 'campaign',
       signal,
       timeoutMs: this.timeoutMs,
       logger: this.logger,
@@ -216,6 +219,7 @@ export class QoderCheckInService {
       method: 'POST',
       token,
       headers: { origin: openApiUrl, 'cosy-clienttype': qoderDesktopClientType, ...riskHeaders(identity) },
+      fingerprint: 'campaign',
       signal,
       timeoutMs: this.timeoutMs,
       logger: this.logger,

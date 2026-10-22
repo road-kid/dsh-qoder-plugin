@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { qoderQueueFacts, qoderQueueSignal } from '../../src/qoder/errors.ts'
-import { formatQueueNotice, parseQueueFacts } from '../../src/qoder/queue-notice.ts'
+import { formatQueueNotice, formatQueueWaitNotice, parseQueueFacts } from '../../src/qoder/queue-notice.ts'
 
 /**
  * The body the user pasted, byte for byte: the upstream nests its own JSON
@@ -278,6 +278,31 @@ test('formatQueueNotice keeps the milder queued state distinct from an outage', 
   const text = formatQueueNotice({ isQueued: true, serviceAvailable: true, retryAfterSeconds: 30 }, { waited: false, occurrences: 1 })
   assert.match(text, /上游模型排队中（模型排队中，上游建议 30 秒后重试）/u)
   assert.doesNotMatch(text, /模型暂不可服务/u)
+})
+
+test('formatQueueWaitNotice reports the wait that is happening, not the failure', () => {
+  const facts = parseQueueFacts(nestedBody('403'))
+  assert.ok(facts !== undefined)
+  const first = formatQueueWaitNotice(facts, { waitMs: 31_000, attempt: 1, remaining: 1 })
+  assert.match(first, /正在等待约 31 秒后重试/u)
+  assert.match(first, /第 1 次等待/u)
+  assert.match(first, /本次请求还可再等 1 次/u)
+  assert.match(first, /这不是登录态或额度问题/u)
+  // The queue depth the body carried is worth showing while waiting.
+  assert.match(first, /当前排队约 8887 个请求/u)
+
+  // A later wait must READ differently: the host suppresses identical notices
+  // within one turn, so a copy-identical row would leave a second wait silent.
+  const second = formatQueueWaitNotice(facts, { waitMs: 31_000, attempt: 2, remaining: 0 })
+  assert.match(second, /第 2 次等待/u)
+  assert.match(second, /这是本次请求的最后一次等待/u)
+  assert.notEqual(first, second)
+
+  // Facts-only: no invented countdown and no claim of an outage.
+  const bare = formatQueueWaitNotice({ isQueued: true, serviceAvailable: true }, { waitMs: 1_500, attempt: 1, remaining: 0 })
+  assert.match(bare, /正在等待约 2 秒后重试/u)
+  assert.doesNotMatch(bare, /当前排队/u)
+  assert.doesNotMatch(bare, /暂不可服务/u)
 })
 
 /** The property names of the outermost object, for the "did not dig" assertion. */
