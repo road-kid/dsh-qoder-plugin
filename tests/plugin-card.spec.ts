@@ -1061,6 +1061,27 @@ describe('Qoder plugin card', () => {
     // there. The account list uses the same two words for the same reason.
     expect(second).toContain(en.accountParked)
     expect(second).not.toContain(en.accountHealthNormal)
+    // Parked carries no state word at all — not even the neutral 尚未观测.
+    expect(second).not.toContain(en.accountHealthUnknown)
+  })
+
+  it('states an unobserved seat as 尚未观测 in both pool views, never as 正常', async () => {
+    // `withPool` stores two enabled seats and neither has a recorded failure.
+    // Absent health is "nothing observed yet", not "observed healthy": the
+    // composer panel already stays silent about that gap, and the two pool
+    // views must not fill the silence with a claim the host never made.
+    withPool()
+    await mountWithSettings(fakeSettingsScope({ routingStrategy: 'custom', routingOrder: ['pat:aaaa', 'pat:bbbb'] }))
+    const chips = view!.root.findAll(node =>
+      node.props['className'] === 'qdp-tag' && node.children.join('') === en.accountHealthUnknown)
+    // One chip per seat in the account list, and one per seat in the routing
+    // list: the two views of the same pool say the same thing.
+    expect(chips).toHaveLength(4)
+    for (const chip of chips) {
+      expect(chip.props['className']).not.toContain('qdp-tagSuccess')
+      expect(chip.props['className']).not.toContain('qdp-tagWarn')
+    }
+    expect(rendered()).not.toContain(en.accountHealthNormal)
   })
 
   it('writes all three stickiness bounds on commit and clamps one outside them', async () => {

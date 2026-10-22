@@ -269,8 +269,16 @@ function accountRowCredits(
  * 限流 is the upstream's own term for an account that only ever answers with a
  * per-model queue, so the label states the condition the host actually
  * recorded instead of guessing at a cause.
+ *
+ * An absent state is not a healthy one: `health` stays undefined until the
+ * transport observes a failure, so the word for it is 「尚未观测」 — the same
+ * silence {@link ComposerQuota} keeps, said out loud where a tag is expected.
  */
-export function accountHealthLabel(health: QoderAccountHealth, t: QoderPluginCardInjected['t']): string {
+export function accountHealthLabel(
+  health: QoderAccountHealth | undefined,
+  t: QoderPluginCardInjected['t'],
+): string {
+  if (health === undefined) return t('accountHealthUnknown')
   if (health === 'queued') return t('accountHealthQueued')
   if (health === 'limited') return t('accountHealthLimited')
   return t('accountHealthNormal')
@@ -840,14 +848,14 @@ function RoutingOrderList(props: {
          */
         const creditsText = account === undefined ? undefined : accountRowCredits(account, t)
         /*
-         * Same rule as the account list: an enabled seat the plugin has not
-         * observed reads as 正常 (nothing has failed), and a parked seat shows
-         * no service state at all — it is out of the walk, so calling it
-         * healthy would be a promise this list will not keep.
+         * Same rule as the account list: an enabled seat shows its observed
+         * state, and an unobserved one says so (neutral 尚未观测) rather than
+         * claiming 正常 — nothing has failed, but nothing has served either. A
+         * parked seat shows no service state at all: it is out of the walk, so
+         * calling it healthy would be a promise this list will not keep.
          */
-        const health = account === undefined || account.enabled === false
-          ? undefined
-          : (account.health ?? 'normal')
+        const showHealth = account !== undefined && account.enabled !== false
+        const health = account?.health
         return (
           <li className="qdp-routingItem" key={id} data-account-id={id}>
             {/* Name and balance share one growing cell so the balance sits
@@ -859,11 +867,11 @@ function RoutingOrderList(props: {
                 <span className="qdp-routingCredits">{creditsText}</span>
               )}
             </span>
-            {health === undefined ? null : (
-              <QdpTag tone={health === 'normal' ? 'success' : 'warn'}>
+            {showHealth ? (
+              <QdpTag tone={health === undefined ? 'neutral' : health === 'normal' ? 'success' : 'warn'}>
                 {accountHealthLabel(health, t)}
               </QdpTag>
-            )}
+            ) : null}
             {side === undefined ? null : (
               <QdpTag tone="neutral">{side === 'cn' ? t('variantTabCN') : t('variantTabGlobal')}</QdpTag>
             )}
@@ -2120,18 +2128,20 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                   const name = entry.accountName ?? t('accountSlot', { order: entry.order })
                   const armed = confirmingRemoveId === entry.id
                   /*
-                   * The seat's state, always shown.
+                   * The seat's state, always shown for an enabled seat.
                    *
                    * `entry.health` is absent until the transport observes a
                    * failure, and an absent state is not the same as a healthy
-                   * one — but the account list exists to answer "which of these
-                   * can serve me right now" at a glance, so an enabled seat with
-                   * no observation reads as 正常 (nothing has failed) rather than
-                   * as a blank cell. A parked seat shows no state at all: it is
-                   * out of the walk, so calling it healthy would be a promise
-                   * this list will not keep.
+                   * one — saying 正常 would invent an observation the host never
+                   * made, and the composer panel already stays silent about it.
+                   * So the account list names the gap: an enabled seat with no
+                   * observation reads 「尚未观测」 in the neutral tone. A parked
+                   * seat shows no state at all: it is out of the walk, so
+                   * calling it healthy would be a promise this list will not
+                   * keep.
                    */
-                  const health = entry.enabled === false ? undefined : (entry.health ?? 'normal')
+                  const showHealth = entry.enabled !== false
+                  const health = entry.health
                   return (
                     <li
                       className={entry.enabled === false ? 'qdp-accountItem is-off' : 'qdp-accountItem'}
@@ -2166,13 +2176,13 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                             promise this list will never keep.
                           */}
                           <span className="qdp-accountItemCredits">{accountRowCredits(entry, t)}</span>
-                          {health === undefined ? null : (
+                          {showHealth ? (
                             <span className="qdp-accountHealth" title={t('accountHealthAria')}>
-                              <QdpTag tone={health === 'normal' ? 'success' : 'warn'}>
+                              <QdpTag tone={health === undefined ? 'neutral' : health === 'normal' ? 'success' : 'warn'}>
                                 {accountHealthLabel(health, t)}
                               </QdpTag>
                             </span>
-                          )}
+                          ) : null}
                           {entry.active ? <QdpTag tone="success">{t('accountCurrent')}</QdpTag> : null}
                           {entry.enabled === false ? <QdpTag tone="neutral">{t('accountParked')}</QdpTag> : null}
                         </span>

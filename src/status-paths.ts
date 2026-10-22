@@ -165,13 +165,18 @@ export type QoderAccountHealth = 'normal' | 'queued' | 'limited'
 /**
  * The account pool and its failover policy, as the card displays them.
  *
- * `autoFailover` is a user preference, not a derived fact: switching accounts
- * changes which subscription pays for a request, so it is opt-out-able even
- * though it is on by default.
+ * `autoFailover` is a derived fact, not the user's preference: it answers
+ * "could a connection failure be absorbed right now", which needs both the
+ * switch on ({@link autoFailoverEnabled}) and a second usable seat in the walk.
+ * Switching accounts changes which subscription pays for a request, so the
+ * preference itself stays opt-out-able even though it is on by default.
  */
 export interface QoderWebAccounts {
   entries: readonly QoderAccountSummary[]
-  /** Whether a connection failure moves on to the next account automatically. */
+  /**
+   * Whether a connection failure could be absorbed right now: the switch is on
+   * and at least two accounts are usable (parked ones are out of the walk).
+   */
   autoFailover: boolean
   /**
    * The last automatic switch, epoch ms; absent when none has happened in this

@@ -78,8 +78,14 @@ function accepted(text: string): Response {
   })
 }
 
-/** A queue answer with the upstream's own `retryAfterSeconds` advice. */
-function queued(retryAfterSeconds: number): Response {
+/**
+ * A queue answer with the upstream's own advice.
+ *
+ * `waitTime` is a separate hint and can exceed `retryAfterSeconds` (the
+ * reported incident: 30 vs 86); it defaults to the retry advice only for the
+ * tests that are not about the difference.
+ */
+function queued(retryAfterSeconds: number, waitTime = retryAfterSeconds): Response {
   const inner = JSON.stringify({
     isQueued: true,
     modelKey: 'qmodel',
@@ -88,7 +94,7 @@ function queued(retryAfterSeconds: number): Response {
     retryAfterSeconds,
     serviceAvailable: false,
     subCode: 'RESOURCE_LIMIT',
-    waitTime: retryAfterSeconds,
+    waitTime,
   })
   const body = JSON.stringify({ code: '403', message: JSON.stringify({ code: '10605', message: inner, subCode: '' }) })
   return new Response(body, { status: 403, headers: { 'content-type': 'application/json' } })
@@ -214,6 +220,19 @@ describe('QoderTransport queue wait padding', () => {
       chat: () => queued(1),
     })
     expect(high).toBe(1_000 + 1_000 + 1_998)
+  })
+
+  it('waits the longer of retryAfterSeconds and the queue waitTime', async () => {
+    // The reported incident: retryAfterSeconds=30 but waitTime=86. A wait built
+    // only on the retry advice returned to the same queue 30s later, so two
+    // waits of ~32s still never covered the 86s window and the request died
+    // before the model was free.
+    const waitMs = await loggedWait({
+      queueWait: { attempts: () => 2, seconds: () => 0 },
+      random: () => 0,
+      chat: () => queued(30, 86),
+    })
+    expect(waitMs).toBe(86_000 + 1_000)
   })
 
   it('keeps the padded wait under the five-minute ceiling', async () => {

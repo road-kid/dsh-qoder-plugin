@@ -269,13 +269,21 @@ describe('Advanced settings editing', () => {
     const rows = view!.root.findAll(node => node.props['data-account-id'] !== undefined)
     expect(rows.length).toBe(2)
 
-    // Row A: active, no observed failure -> 正常, with its balance inline.
+    // Row A: active, no observed failure -> 尚未观测, with its balance inline.
+    // Not 正常: absent health means the host has not observed anything yet, and
+    // the composer panel stays silent about exactly the same gap.
     const rowA = rows.find(row => row.props['data-account-id'] === 'acct-a')!
     const nameLineA = rowA.findAll(node => node.props.className === 'qdp-accountItemName')[0]!
     const textA = textOf(nameLineA)
     expect(textA).toContain('A')
     expect(textA).toContain('2,391')
-    expect(textA).toContain(en.accountHealthNormal)
+    expect(textA).toContain(en.accountHealthUnknown)
+    expect(textA).not.toContain(en.accountHealthNormal)
+    // The gap is stated in the neutral tone: not an alarm, not a healthy tick.
+    const healthChipA = nameLineA.findAll(node => node.props.className === 'qdp-accountHealth')[0]!
+    expect(healthChipA.findAll(node => node.props.className === 'qdp-tag')).toHaveLength(1)
+    expect(healthChipA.findAll(node => node.props.className === 'qdp-tagSuccess')).toHaveLength(0)
+    expect(healthChipA.findAll(node => node.props.className === 'qdp-tagWarn')).toHaveLength(0)
 
     // Row B: observed 限流, balance inline too.
     const rowB = rows.find(row => row.props['data-account-id'] === 'acct-b')!
@@ -320,8 +328,10 @@ describe('Advanced settings editing', () => {
     const text = textOf(row)
     expect(text).toContain(en.accountParked)
     expect(text).toContain(en.accountCreditsParked)
-    // A parked seat is out of the walk, so claiming a state for it would lie.
+    // A parked seat is out of the walk, so claiming a state for it would lie —
+    // including the neutral 「尚未观测」, which is still a statement about a seat.
     expect(text).not.toContain(en.accountHealthNormal)
+    expect(text).not.toContain(en.accountHealthUnknown)
   })
 })
 

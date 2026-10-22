@@ -7,7 +7,7 @@ import type { QoderCatalogModel } from '../catalog.ts'
 import type { QoderRegion } from './endpoints.ts'
 import { QoderLlmError, isQoderAuthRejection } from '../errors.ts'
 import { QoderAccountPenaltyLedger, type QoderAccountPenaltyKind } from '../../account-health.ts'
-import { QoderAccountTrafficLimiter } from './account-limiter.ts'
+import { QoderAccountTrafficLimiter, type QoderAccountLease } from './account-limiter.ts'
 import type { QoderLogger } from './logging.ts'
 import { fetchQoderModels } from './catalog-reader.ts'
 import {
@@ -612,37 +612,43 @@ export class DefaultQoderTransport implements QoderTransport {
     const pinned = await this.pinnedAccount(sessionId)
     let first = pinned ?? active
     /*
-     * Do not spend the request on an account the ledger is cooling down.
+     * Do not spend the request on an account the ledger is cooling down (T5) or
+     * that a concurrent request is already serving (T7) — but do it SILENTLY.
      *
-     * A cooldown is the transport's own conclusion that this account kept
-     * failing while another one served the same traffic, so starting on it
-     * again would be the self-harm T5 exists to prevent. Announcing the move
-     * through `switched` (rather than silently picking someone else) is what
-     * keeps the host's active pointer and the credential that actually signs
-     * from drifting apart. When nothing else is selectable the account is kept
-     * as the only option: the pool being all-cooling is not a reason to invent
-     * a wait or to refuse a request that account may well serve now.
+     * Both are dispatch facts about THIS request, not failures of the request:
+     * a cooldown is the transport's own conclusion that the account kept
+     * failing while another served the same traffic, and a reservation simply
+     * means a concurrent request got there first (the DSH host always fires a
+     * title request alongside the first message of a new session). Reporting
+     * either through `switched` made the host treat a healthy skip as a
+     * connection failure: it persisted a new active account, armed the
+     * credential file for a rewrite, and told the user "已自动切换到下一个账号
+     * 重试" 218ms into a request that never failed. So this branch only changes
+     * where this request starts; it does not touch the active pointer, the
+     * session pin, or any other request. When nothing else is selectable the
+     * account is kept as the only option: the pool being all-cooling or all-busy
+     * is not a reason to invent a wait or to refuse a request that account may
+     * well serve now.
      */
     const firstCooling = this.penalties.isCooling(first.id)
     const firstReserved = this.reservedAccounts.has(first.id)
+    let rerouted = false
     if (firstCooling || firstReserved) {
       const alternative = await this.nextWalkAccount(failover, first.id, new Set([first.id]))
       if (alternative !== undefined) {
-        await failover.switched({
+        this.logger?.warn?.('[Qoder Stream] Starting this request on another account without failing over', {
           fromId: first.id,
           toId: alternative.id,
-          // The host stores this reason on the switch row, so it has to say why
-          // the request did not start where the active pointer said it would:
-          // the account is either unhealthy (T5) or already serving someone
-          // else (T7). One wording each keeps the two causes distinguishable.
-          reason: firstCooling
-            ? 'account cooling down after repeated failures'
-            : 'account is already serving another request',
+          cause: firstCooling ? 'cooling' : 'reserved',
         })
         first = alternative
+        rerouted = true
       }
     }
-    if (pinned === undefined || first.id !== pinned.id) this.pinSession(sessionId, first)
+    // Pin only a start that was not rerouted. A local skip is a statement about
+    // this request, so rewriting the session pin from it would carry the
+    // workaround into the next turn.
+    if (!rerouted && (pinned === undefined || first.id !== pinned.id)) this.pinSession(sessionId, first)
     // Count the request against whichever account it actually starts on. This
     // is the request bound of stickiness; the ROUND bound is counted only when
     // an answer is consumed to the end, below.
@@ -693,11 +699,11 @@ export class DefaultQoderTransport implements QoderTransport {
       } catch (error: unknown) {
         if (options.signal?.aborted || state.emitted) throw error
         if (!isAccountFailure(error)) throw error
-        const next = await this.nextWalkAccount(failover, account.id, tried)
+        const next = await this.walkAfterFailure(failover, account.id, tried)
         // `undefined` is the end of the pool — every remaining candidate is
-        // either tried or cooling. The failure in hand is the honest answer,
-        // and the pending blame dies with the walk: nobody is punished for a
-        // request that no account could serve.
+        // either tried, cooling or reserved. The failure in hand is the honest
+        // answer, and the pending blame dies with the walk: nobody is punished
+        // for a request that no account could serve.
         if (next === undefined || tried.has(next.id)) throw error
         tried.add(next.id)
         // Report the account that failed before announcing the switch: the host
@@ -760,11 +766,15 @@ export class DefaultQoderTransport implements QoderTransport {
      * already serving — the attempt proceeds WITHOUT the claim rather than
      * refusing a request the user made: the traffic guard below still paces it,
      * so the fallback is a slower request instead of a failed one.
+     *
+     * The release closure is defined BEFORE `traffic.acquire` because the
+     * acquire can throw (its documented contract is "never rejects", but a
+     * failing guard or a test double can), and a claim leaked on that path
+     * would make the account look busy forever. `release` is idempotent, so the
+     * early definition costs nothing on the normal path.
      */
     const reserved = accountId === undefined ? false : this.reserveAccount(accountId)
-    const lease = accountId === undefined
-      ? undefined
-      : await this.traffic.acquire(accountId)
+    let lease: QoderAccountLease | undefined
     let released = false
     const release = (): void => {
       if (released) return
@@ -773,6 +783,7 @@ export class DefaultQoderTransport implements QoderTransport {
       lease?.release()
     }
     try {
+      lease = accountId === undefined ? undefined : await this.traffic.acquire(accountId)
       for await (const chunk of this.attemptPaced(options, model, pat, state, accountId, queueBudget)) {
         /*
          * Release at the terminal chunk, not only in `finally`.
@@ -927,20 +938,6 @@ export class DefaultQoderTransport implements QoderTransport {
     }
   }
 
-  /**
-   * The account the walk should visit next, skipping cooling accounts (T5).
-   *
-   * "Skip" is a statement about this request, not about the pool: cooling
-   * accounts are left untried so a known-bad guess cannot spend the request,
-   * but they stay in the walk order for when the ledger forgets them. Accounts
-   * that are merely deprioritised are collected and used as a fallback — the
-   * whole point of a downweight is "prefer others", not "refuse" — and only a
-   * walk with no un-cooled candidate at all returns `undefined`, which ends the
-   * walk and lets the original failure surface.
-   *
-   * The search is bounded and never revisits an id, so a host `nextAccount`
-   * that wraps the pool cannot make selection loop.
-   */
   /** Claim an account for dispatch; `false` means someone else holds it. */
   private reserveAccount(accountId: string): boolean {
     if (this.reservedAccounts.has(accountId)) return false
@@ -952,13 +949,38 @@ export class DefaultQoderTransport implements QoderTransport {
     this.reservedAccounts.delete(accountId)
   }
 
+  /**
+   * The account the walk should visit next, skipping cooling accounts (T5) and,
+   * unless `allowReserved` asks for them, accounts another request is already
+   * serving (T7).
+   *
+   * "Skip" is a statement about this request, not about the pool: cooling
+   * accounts are left untried so a known-bad guess cannot spend the request,
+   * but they stay in the walk order for when the ledger forgets them. Accounts
+   * that are merely deprioritised are collected and used as a fallback — the
+   * whole point of a downweight is "prefer others", not "refuse" — and only a
+   * walk with no un-cooled candidate at all returns `undefined`, which ends the
+   * walk and lets the original failure surface.
+   *
+   * `allowReserved` is the last-resort mode used by the failure walk: a busy
+   * account is better than a hard failure, because the traffic guard paces the
+   * two requests on that account instead of refusing one of them. Reserved
+   * accounts are collected separately and returned only when no ordinary
+   * candidate exists, so a reservation is preferred over an outage but never
+   * over a free account.
+   *
+   * The search is bounded and never revisits an id, so a host `nextAccount`
+   * that wraps the pool cannot make selection loop.
+   */
   private async nextWalkAccount(
     failover: NonNullable<QoderTransportOptions['failover']>,
     currentId: string,
     tried: ReadonlySet<string>,
+    allowReserved = false,
   ): Promise<{ id: string; pat: string } | undefined> {
     const considered = new Set<string>([currentId])
     const deprioritized: Array<{ id: string; pat: string }> = []
+    const reservedFallback: Array<{ id: string; pat: string }> = []
     let id = currentId
     for (let step = 0; step < maxWalkSearchSteps; step++) {
       const candidate = await this.nextAccount(failover, id, tried)
@@ -970,8 +992,11 @@ export class DefaultQoderTransport implements QoderTransport {
       }
       // Another request is already dispensing this account: walking onto it
       // would hand two concurrent conversations the same identity, which is
-      // the duplicate selection the reservation exists to prevent.
+      // the duplicate selection the reservation exists to prevent. In
+      // last-resort mode it is remembered instead, so that a request that
+      // would otherwise fail can still be served (paced by the traffic guard).
       if (this.reservedAccounts.has(candidate.id)) {
+        if (allowReserved) reservedFallback.push(candidate)
         id = candidate.id
         continue
       }
@@ -982,7 +1007,35 @@ export class DefaultQoderTransport implements QoderTransport {
       }
       return candidate
     }
-    return deprioritized[0]
+    return deprioritized[0] ?? reservedFallback[0]
+  }
+
+  /**
+   * Where the failure walk goes after `currentId`.
+   *
+   * The ordinary selection skips accounts another request is already serving,
+   * because two concurrent conversations on one identity is the duplicate
+   * selection T7 exists to prevent. A request that would otherwise FAIL is the
+   * exception: when every remaining account is busy, the traffic guard still
+   * paces the two requests on that identity, so a paced retry is strictly
+   * better than a hard failure (observed as "主账号被并发抢走 → 备用 PAT 失效 →
+   * 整请求报错"). Hence the second pass with `allowReserved`; reservations are
+   * returned only when no ordinary candidate exists.
+   */
+  private async walkAfterFailure(
+    failover: NonNullable<QoderTransportOptions['failover']>,
+    currentId: string,
+    tried: ReadonlySet<string>,
+  ): Promise<{ id: string; pat: string } | undefined> {
+    const next = await this.nextWalkAccount(failover, currentId, tried)
+    if (next !== undefined && !tried.has(next.id)) return next
+    // Only a reservation can make the first pass look empty while a usable
+    // account remains, so the second pass is skipped when nobody holds one:
+    // this keeps the ordinary "walk the pool once" bound intact (a single
+    // consultation per account) and reserves the extra search for the case it
+    // exists for.
+    if (this.reservedAccounts.size === 0) return undefined
+    return await this.nextWalkAccount(failover, currentId, tried, true)
   }
 
   /**
@@ -1205,8 +1258,12 @@ export class DefaultQoderTransport implements QoderTransport {
    * queue at all.
    *
    * The upstream's own advice wins over the configured fallback because it is
-   * computed from the queue it describes, but both are capped: a window long
-   * enough to outlive the caller's patience is a hang dressed up as a wait. On
+   * computed from the queue it describes, and the LARGER of its two hints is
+   * used: `retryAfterSeconds` is a retry hint that can be far shorter than the
+   * queue it describes (observed 30s against a `waitTime` of 86s), and a wait
+   * that returns to the same queue is just a slower error. Both are capped: a
+   * window long enough to outlive the caller's patience is a hang dressed up as
+   * a wait. With no advice at all the configured seconds are the fallback. On
    * top of the window comes the padding and jitter described at
    * `queueWaitPaddingMs`, and the total is capped again so the padding can
    * never push a five-minute wait past the ceiling that exists to bound the
@@ -1215,8 +1272,12 @@ export class DefaultQoderTransport implements QoderTransport {
   private queueWaitMs(error: unknown): number | undefined {
     if (!(error instanceof QoderLlmError) || error.qoderQueue === undefined) return undefined
     const advised = error.failure.providerRetryAfterMs
-    const baseMs = advised !== undefined && Number.isFinite(advised) && advised > 0
-      ? Math.min(advised, queueWaitCeilingMs)
+    const advisedMs = advised !== undefined && Number.isFinite(advised) && advised > 0 ? advised : 0
+    const waitTime = error.qoderQueue.waitTime
+    const waitTimeMs = waitTime !== undefined && Number.isFinite(waitTime) && waitTime > 0 ? waitTime * 1000 : 0
+    const queuedMs = Math.max(advisedMs, waitTimeMs)
+    const baseMs = queuedMs > 0
+      ? Math.min(queuedMs, queueWaitCeilingMs)
       : Math.min(Math.max(0, this.queueWait?.seconds() ?? 0) * 1000, queueWaitCeilingMs)
     const jitterMs = Math.floor(Math.max(0, Math.min(0.999, this.random())) * queueWaitJitterMs)
     return Math.min(baseMs + queueWaitPaddingMs + jitterMs, queueWaitCeilingMs)

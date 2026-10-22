@@ -64,6 +64,16 @@ export interface QoderQueueFacts {
   queueCount?: number
   queueType?: string
   retryAfterSeconds?: number
+  /**
+   * How long the upstream expects this request to sit in the queue, in
+   * seconds.
+   *
+   * Deliberately separate from `retryAfterSeconds`: the two disagree in the
+   * wild (observed `retryAfterSeconds=30` with `waitTime=86`), and the wait
+   * budget must cover the longer one or the caller retries straight back into
+   * the same queue.
+   */
+  waitTime?: number
   subCode?: string
   /** The upstream's own message text, unescaped and bounded. */
   upstreamMessage?: string
@@ -223,6 +233,8 @@ function factsFromRecords(records: readonly LooseRecord[], body: string): QoderQ
   if (queueCount !== undefined) facts.queueCount = queueCount
   const retryAfterSeconds = deepestNumber(records, 'retryAfterSeconds')
   if (retryAfterSeconds !== undefined) facts.retryAfterSeconds = retryAfterSeconds
+  const waitTime = deepestNumber(records, 'waitTime')
+  if (waitTime !== undefined) facts.waitTime = waitTime
   // The innermost `message` IS the upstream's own words: with two nesting
   // layers the middle one holds the JSON facts, and with a human sentence at
   // the bottom this picks the sentence. When no wrapper carried one at all the
@@ -260,6 +272,8 @@ function factsFromMarkerText(body: string): QoderQueueFacts | undefined {
   if (queueCount !== undefined) facts.queueCount = queueCount
   const retryAfterSeconds = readNumber(/"retryAfterSeconds"\s*:\s*"?(\d+)"?/u.exec(text)?.[1])
   if (retryAfterSeconds !== undefined) facts.retryAfterSeconds = retryAfterSeconds
+  const waitTime = readNumber(/"waitTime"\s*:\s*"?(\d+(?:\.\d+)?)"?/u.exec(text)?.[1])
+  if (waitTime !== undefined) facts.waitTime = waitTime
   const upstreamMessage = boundMessage(body)
   if (upstreamMessage !== undefined) facts.upstreamMessage = upstreamMessage
   return facts

@@ -190,13 +190,18 @@ type QoderAccountHealth = 'normal' | 'queued' | 'limited';
 /**
  * The account pool and its failover policy, as the card displays them.
  *
- * `autoFailover` is a user preference, not a derived fact: switching accounts
- * changes which subscription pays for a request, so it is opt-out-able even
- * though it is on by default.
+ * `autoFailover` is a derived fact, not the user's preference: it answers
+ * "could a connection failure be absorbed right now", which needs both the
+ * switch on ({@link autoFailoverEnabled}) and a second usable seat in the walk.
+ * Switching accounts changes which subscription pays for a request, so the
+ * preference itself stays opt-out-able even though it is on by default.
  */
 interface QoderWebAccounts {
   entries: readonly QoderAccountSummary[];
-  /** Whether a connection failure moves on to the next account automatically. */
+  /**
+   * Whether a connection failure could be absorbed right now: the switch is on
+   * and at least two accounts are usable (parked ones are out of the walk).
+   */
   autoFailover: boolean;
   /**
    * The last automatic switch, epoch ms; absent when none has happened in this
@@ -2034,6 +2039,36 @@ declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindo
 declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels", "variantEnabledGlobal"];
 declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
 /**
+ * Whether a connection failure could be absorbed by switching accounts.
+ *
+ * This is the derived fact the card's 「自动切换」 tag reports, and it is not the
+ * same claim as the user's setting: the walk needs somewhere to go, so a pool
+ * with no second usable seat cannot fail over even with the switch on. Parked
+ * seats are out of the walk (`accountById` refuses them), so they must not
+ * count towards "another account exists" — otherwise a two-seat pool with the
+ * spare parked would still advertise automatic switching.
+ *
+ * Kept as a named function because the host's status document is assembled
+ * inline, and this is the one part of it a test can pin without booting a
+ * whole fiber.
+ */
+declare function autoFailoverActive(enabled: boolean | undefined, entries: readonly {
+  readonly enabled?: boolean;
+}[]): boolean;
+/**
+ * Move the stored active pointer to the account a failover just switched to.
+ *
+ * The retry itself is already answering with the successor's PAT, so this move
+ * only decides which account every LATER read (catalog, credits, the card)
+ * resolves. A refusal is therefore harmless to the request in flight: the id
+ * can go stale between the transport's walk and this write when the account is
+ * removed in another tab, and a failed adoption must not turn a recovered
+ * request into an error. The caller still records the switch and still reports
+ * it — the switch did happen, only its stored pointer is behind. Returns
+ * whether the pointer moved; warns with the reason when it did not.
+ */
+declare function adoptFailoverAccount(store: Pick<QoderCredentialStore, 'activate'>, accountId: string, warn: (message: string) => void): Promise<boolean>;
+/**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their
  * credential-driven catalog lifecycles.
@@ -2045,4 +2080,4 @@ declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGloba
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, apply, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };
+export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, adoptFailoverAccount, apply, autoFailoverActive, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };

@@ -567,9 +567,12 @@ describe('QoderTransport account penalties (blame deferred)', () => {
     await drain(transport)
 
     expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat, BETA.pat])
+    // The cooling skip is a dispatch fact about that request, not a failover:
+    // it is applied silently, so only the real 429 switch remains on the record.
+    // (Announcing it would make the host persist a new active account and show
+    // an error row for a request that succeeded.)
     expect(poolState.switches.map(info => [info.fromId, info.toId, info.reason])).toEqual([
       [ALPHA.id, BETA.id, 'upstream RATE_LIMIT (HTTP 429)'],
-      [ALPHA.id, BETA.id, 'account cooling down after repeated failures'],
     ])
   })
 

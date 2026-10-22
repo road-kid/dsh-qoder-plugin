@@ -684,6 +684,15 @@ describe('QoderCheckInService risk identity', () => {
     // The per-account derived device id/hostname of the inference path must
     // never appear here: the campaign upstream only honours the real client
     // identity, so substituting a derived one would silently empty the list.
+    //
+    // Stated in the lowercase spelling this merge actually writes (a plain
+    // object literal, not a `Headers` instance): the previous check named
+    // 'Cosy-Machineid'/'Cosy-Machinehostname', which this code path can never
+    // produce, so it passed no matter what was merged in.
+    expect(headers).not.toHaveProperty('cosy-machineid')
+    expect(headers).not.toHaveProperty('cosy-machinehostname')
+    // And still refuse the inference path's capitalised spelling, which is how
+    // a derived identity would arrive if those wire headers were spread in.
     expect(headers).not.toHaveProperty('Cosy-Machineid')
     expect(headers).not.toHaveProperty('Cosy-Machinehostname')
   })

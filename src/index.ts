@@ -789,6 +789,56 @@ function failoverNoticeText(reason: string): string {
   return `已自动切换到下一个账号重试（原因：${reason}）— 当前请求由备用账号继续`
 }
 
+/**
+ * Whether a connection failure could be absorbed by switching accounts.
+ *
+ * This is the derived fact the card's 「自动切换」 tag reports, and it is not the
+ * same claim as the user's setting: the walk needs somewhere to go, so a pool
+ * with no second usable seat cannot fail over even with the switch on. Parked
+ * seats are out of the walk (`accountById` refuses them), so they must not
+ * count towards "another account exists" — otherwise a two-seat pool with the
+ * spare parked would still advertise automatic switching.
+ *
+ * Kept as a named function because the host's status document is assembled
+ * inline, and this is the one part of it a test can pin without booting a
+ * whole fiber.
+ */
+export function autoFailoverActive(
+  enabled: boolean | undefined,
+  entries: readonly { readonly enabled?: boolean }[],
+): boolean {
+  if (enabled === false) return false
+  return entries.filter(entry => entry.enabled !== false).length > 1
+}
+
+/**
+ * Move the stored active pointer to the account a failover just switched to.
+ *
+ * The retry itself is already answering with the successor's PAT, so this move
+ * only decides which account every LATER read (catalog, credits, the card)
+ * resolves. A refusal is therefore harmless to the request in flight: the id
+ * can go stale between the transport's walk and this write when the account is
+ * removed in another tab, and a failed adoption must not turn a recovered
+ * request into an error. The caller still records the switch and still reports
+ * it — the switch did happen, only its stored pointer is behind. Returns
+ * whether the pointer moved; warns with the reason when it did not.
+ */
+export async function adoptFailoverAccount(
+  store: Pick<QoderCredentialStore, 'activate'>,
+  accountId: string,
+  warn: (message: string) => void,
+): Promise<boolean> {
+  try {
+    await store.activate(accountId)
+    return true
+  } catch (error: unknown) {
+    warn(
+      `dsh-qoder-plugin: could not adopt the failover account (${accountId}): ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return false
+  }
+}
+
 /** Build one variant's stores, transport, and probe state. */
 function createVariantRuntime(
   ctx: Context,
@@ -926,7 +976,14 @@ function createVariantRuntime(
         // — the catalog, credits, the card — resolves the ACTIVE account, so
         // the stored pointer has to move with the request or the next refresh
         // would authenticate as the account that just failed.
-        await store.activate(info.toId)
+        //
+        // A refusal here must not escape: this hook runs on the success path of
+        // a request that has already recovered, and an account removed in
+        // another tab (or re-keyed while the walk ran) would otherwise turn that
+        // recovery into an unhandled rejection and kill the request. Record the
+        // switch and announce it below either way — the retry did switch, only
+        // the pointer move did not, and that is a warning, not a failure.
+        await adoptFailoverAccount(store, info.toId, message => { ctx.logger.warn(message) })
         failoverAt = Date.now()
         failoverReason = info.reason
         // A different identity pays from here on, so the previous account's
@@ -1858,11 +1915,14 @@ export function apply(ctx: Context, config: Config): void {
             entries,
             /*
              * The tag reports whether a failure could actually be absorbed, not
-             * whether some policy bit is set: with one account the walk has
-             * nowhere to go, so the honest reading of "automatic switch" is off
-             * — and it turns itself on the moment a second account is saved.
+             * whether some policy bit is set: the walk needs a second seat it
+             * may try AND the user's permission to try it. With one account (or
+             * one usable account left after parking) there is nowhere to go,
+             * and with the switch off the walk never runs — either way the
+             * honest reading of 「自动切换」 is off, and it turns itself on the
+             * moment both conditions hold.
              */
-            autoFailover: entries.length > 1,
+            autoFailover: autoFailoverActive(current().autoFailoverEnabled, entries),
             /*
              * The switch as the user set it, which is a different claim from
              * `autoFailover` above: that one answers "could a failure be

@@ -107,6 +107,25 @@ test('parseQueueFacts accepts quoted numbers and booleans', () => {
   assert.equal(facts?.queueCount, 7)
 })
 
+test('parseQueueFacts keeps waitTime separate from retryAfterSeconds', () => {
+  // Observed in the wild: the retry advice (30s) was far shorter than the
+  // queue window (86s), so a wait built only on retryAfterSeconds returns to
+  // the same queue. The transport needs both numbers to take the larger one.
+  const inner = { ...QUEUED, retryAfterSeconds: 30, waitTime: 86 }
+  const facts = parseQueueFacts(nestedBody('403', inner))
+  assert.ok(facts !== undefined)
+  assert.equal(facts.retryAfterSeconds, 30)
+  assert.equal(facts.waitTime, 86)
+  // The classification/retry hint must NOT silently become the queue window:
+  // the host's retry policy is a different consumer with a different contract.
+  assert.deepEqual(qoderQueueSignal(nestedBody('403', inner)), { retryAfterMs: 30_000 })
+
+  // Quoted numbers are read like the other numeric facts…
+  assert.equal(parseQueueFacts('{"isQueued":true,"waitTime":"86"}')?.waitTime, 86)
+  // …and an absent waitTime stays absent rather than being invented.
+  assert.equal(parseQueueFacts('{"isQueued":true}')?.waitTime, undefined)
+})
+
 test('parseQueueFacts returns undefined when the body is not a queue answer', () => {
   const junk = [
     '',

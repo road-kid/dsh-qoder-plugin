@@ -7,6 +7,7 @@ import { QoderCredentialStore, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL } from '..
 import { type QoderModelInfo } from '../src/catalog.ts'
 import { qoderStatusHandler, qoderWebStatus, QODER_STATUS_PATH, type QoderStatusRouteOptions } from '../src/web-status.ts'
 import { CHINA_VARIANT } from '../src/variants.ts'
+import { adoptFailoverAccount, autoFailoverActive } from '../src/index.ts'
 import {
   recordQoderInnerError,
   resetQoderInnerErrors,
@@ -526,5 +527,66 @@ describe('web status route gate', () => {
     expect(body.error).toContain('probe state exploded')
     expect(body.error).toContain('pat=[redacted]')
     expect(body.error).not.toContain('pt-live-abc')
+  })
+})
+
+describe('host account-pool failover state', () => {
+  /*
+   * The status document's `autoFailover` is a derived fact — "could a failure
+   * be absorbed right now" — not the raw setting. Two things can make it false
+   * while the setting is true: no second usable seat, or the user switching the
+   * walk off. The card's tag reads only this fact, so getting it wrong makes the
+   * card promise a failover that cannot happen.
+   */
+  it('reports automatic switching only when the switch is on and a second usable seat exists', () => {
+    expect(autoFailoverActive(true, [{}, {}])).toBe(true)
+    // Absent setting means default-on, matching the transport's `enabled` hook.
+    expect(autoFailoverActive(undefined, [{}, {}])).toBe(true)
+    expect(autoFailoverActive(false, [{}, {}])).toBe(false)
+    expect(autoFailoverActive(true, [{}])).toBe(false)
+    expect(autoFailoverActive(undefined, [{}])).toBe(false)
+    expect(autoFailoverActive(true, [])).toBe(false)
+  })
+
+  it('does not count a parked seat as the seat a failure could move to', () => {
+    // `accountById` refuses a parked account, so the walk has nowhere to go:
+    // counting it made a two-seat pool with the spare parked advertise
+    // automatic switching it could never perform.
+    expect(autoFailoverActive(true, [{}, { enabled: false }])).toBe(false)
+    expect(autoFailoverActive(true, [{ enabled: false }, { enabled: false }])).toBe(false)
+    // A parked seat beside two usable ones changes nothing.
+    expect(autoFailoverActive(true, [{}, { enabled: false }, { enabled: true }])).toBe(true)
+  })
+
+  it('adopts the failover account by moving the stored pointer', async () => {
+    const calls: string[] = []
+    const activate: Pick<QoderCredentialStore, 'activate'>['activate'] = async accountId => {
+      calls.push(accountId)
+      return { pat: 'pt-b', region: 'china', source: 'card' }
+    }
+    const warn = vi.fn()
+    await expect(adoptFailoverAccount({ activate }, 'pat:b', warn)).resolves.toBe(true)
+    expect(calls).toEqual(['pat:b'])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('warns instead of throwing when the failover id no longer exists', async () => {
+    /*
+     * The id can go stale between the transport's walk and this write — the
+     * account was removed in another tab. The request under this hook already
+     * recovered on the successor's token, so a refusal here must come back as a
+     * warning, not as an error thrown out of the stream (which would kill the
+     * recovered request and hide the notice that explains it).
+     */
+    const activate: Pick<QoderCredentialStore, 'activate'>['activate'] = async () => {
+      throw new Error('qoder: no stored account matches pat:gone')
+    }
+    const warn = vi.fn()
+    await expect(adoptFailoverAccount({ activate }, 'pat:gone', warn)).resolves.toBe(false)
+    expect(warn).toHaveBeenCalledTimes(1)
+    const [message] = warn.mock.calls[0]!
+    expect(message).toMatch(/could not adopt the failover account/u)
+    expect(message).toContain('pat:gone')
+    expect(message).toContain('no stored account matches')
   })
 })

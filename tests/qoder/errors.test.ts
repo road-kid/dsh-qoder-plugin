@@ -117,6 +117,11 @@ test('qoderHttpError reads a queued 401/403 as RATE_LIMIT, not AUTH', () => {
   // The diagnostic facts survive: 10605 and the queue markers stay readable.
   assert.match(error.message, /10605/u)
   assert.match(error.message, /retryAfterSeconds/u)
+  // waitTime is a SEPARATE fact from retryAfterSeconds (274 vs 30 in this
+  // body): the host's retry policy still uses the 30s advice, while the
+  // transport's own single wait must cover the longer queue window.
+  assert.equal(error.qoderQueue?.retryAfterSeconds, 30)
+  assert.equal(error.qoderQueue?.waitTime, 274)
 
   // Without an explicit retryAfterSeconds the throttle still classifies as a
   // rate limit; the backoff then follows the host's own policy.
