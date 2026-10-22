@@ -28,7 +28,6 @@ import { newestFirst, QoderProbeStore, qoderProbePath } from './probe-store.ts'
 import { QoderUpstreamClient, validateApiKey } from './upstream.ts'
 import { createQoderTransport, type QoderCheckInResult, type QoderTransport } from './qoder/transport/index.ts'
 import { getMachineId } from './qoder/transport/machine-id.ts'
-import { qoderMachineIdPath } from './paths.ts'
 import { registerQoderStatusRoute, webPlan } from './web-status.ts'
 import { createProbeKey, registerQoderProbeRoute } from './probe-route.ts'
 import { CheckInScheduler, DEFAULT_CHECK_IN_MINUTE, JsonFileCheckInStore, normalizeCheckInMinute } from './checkin-scheduler.ts'
@@ -900,9 +899,14 @@ function createVariantRuntime(
   const transport = createQoderTransport({
     region: variant.region,
     resolvePat: () => store.patPromise(),
-    // Keep the machine-id seed inside the plugin's own data directory
-    // (state/) instead of letting the transport write it near $HOME.
-    resolveMachineId: () => getMachineId([qoderMachineIdPath()]),
+    /*
+     * The DEFAULT chain, deliberately: it reads the official client's own
+     * `~/.qoder/.auth/machine_id` first and only falls back to a host-level DSH
+     * seed. Pinning a profile-scoped path here made every DSH profile a
+     * different "machine" and ignored the identity the client had already
+     * registered with the upstream — see `machine-id.ts`.
+     */
+    resolveMachineId: () => getMachineId(),
     attachments,
     /*
      * Automatic next-account failover.
@@ -1111,8 +1115,8 @@ function createVariantRuntime(
       // the next account. All three are bounds: whichever is reached first
       // moves the conversation on, so a single big turn cannot pin a session to
       // one account for longer than the round or request bound allows.
-      rounds: () => current().stickinessRounds ?? 1,
-      requests: () => current().stickinessRequests ?? 60,
+      rounds: () => current().stickinessRounds ?? 3,
+      requests: () => current().stickinessRequests ?? 200,
       minutes: () => current().stickinessMinutes ?? 180,
     },
     routing: {
@@ -1487,8 +1491,8 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       queueWaitSeconds: 30,
       routingStrategy: 'save-order',
       routingOrder: [],
-      stickinessRounds: 1,
-      stickinessRequests: 60,
+      stickinessRounds: 3,
+      stickinessRequests: 200,
       stickinessMinutes: 180,
     }
   }

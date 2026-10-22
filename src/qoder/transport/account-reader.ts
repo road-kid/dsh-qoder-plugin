@@ -309,10 +309,19 @@ export class QoderUsageReader {
       email: creds.email || '',
     }
 
+    /*
+     * Every member of the metadata family carries the device identity, not just
+     * the status probe. The desktop client sends one fingerprint across the
+     * whole family; a plan or quota call that omits `Cosy-MachineToken` is a
+     * device the backend has never seen signed in, which is exactly the shape a
+     * shared-credential observer filters for. `wire/cosy.ts` and `auth.ts` both
+     * document that promise; until now only the status call kept it.
+     */
+    const machineId = creds.machineID
     const [usage, plan, status] = await Promise.all([
-      retryMetadataRead(signal, () => this.fetchUsage(creds.authToken, signal)),
-      this.safeFetchPlan(creds.authToken, signal),
-      this.safeFetchStatus(creds.authToken, creds.machineID, signal),
+      retryMetadataRead(signal, () => this.fetchUsage(creds.authToken, machineId, signal)),
+      this.safeFetchPlan(creds.authToken, machineId, signal),
+      this.safeFetchStatus(creds.authToken, machineId, signal),
     ])
 
     const accountInfo: QoderAccountInfo = {
@@ -340,10 +349,15 @@ export class QoderUsageReader {
     }
   }
 
-  private async fetchUsage(jobToken: string, signal?: AbortSignal): Promise<QoderQuotaUsage> {
+  private async fetchUsage(
+    jobToken: string,
+    machineId?: string,
+    signal?: AbortSignal,
+  ): Promise<QoderQuotaUsage> {
     const data = await openApiJsonRequest<RawUsageInfo>(this.fetchImpl, {
       url: getQoderUsageUrl(this.region),
       token: jobToken,
+      machineId,
       signal,
       timeoutMs: this.timeoutMs,
       logger: this.logger,
@@ -362,10 +376,15 @@ export class QoderUsageReader {
     }
   }
 
-  private async fetchPlan(jobToken: string, signal?: AbortSignal): Promise<QoderSubscriberPlan | undefined> {
+  private async fetchPlan(
+    jobToken: string,
+    machineId?: string,
+    signal?: AbortSignal,
+  ): Promise<QoderSubscriberPlan | undefined> {
     const data = await openApiJsonRequest<unknown>(this.fetchImpl, {
       url: getQoderUserPlanUrl(this.region),
       token: jobToken,
+      machineId,
       signal,
       timeoutMs: this.timeoutMs,
       logger: this.logger,
@@ -375,9 +394,13 @@ export class QoderUsageReader {
     return normalizePlan(data)
   }
 
-  private async safeFetchPlan(jobToken: string, signal: AbortSignal): Promise<QoderSubscriberPlan | undefined> {
+  private async safeFetchPlan(
+    jobToken: string,
+    machineId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<QoderSubscriberPlan | undefined> {
     try {
-      return await this.fetchPlan(jobToken, signal)
+      return await this.fetchPlan(jobToken, machineId, signal)
     } catch (error) {
       if (signal.aborted) throw error
       this.logger?.warn?.('[Qoder Plan] Failed to load user plan (degraded)', error instanceof Error ? error.message : error)

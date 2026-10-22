@@ -2,6 +2,70 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.1 — 2026-10-23
+
+A repair release for the account pool. Everything below is about the same
+thing: which account serves a request, and whether the settings that describe
+that choice take effect.
+
+### Fixed — stickiness and rotation now actually move
+
+**The rotation never happened.** The round bound counted a chat only if the
+caller kept reading the stream to its end; the HTTP layer in front of the
+transport stops at the terminating chunk, so the counter was never reached and
+a conversation stayed on the same account no matter how the bounds were set. A
+round is now counted at that terminating chunk, which is the moment the model
+output is complete. The regression test drives the same consumption shape the
+HTTP layer does, so this specific mistake cannot come back silently.
+
+**The quarantine ladder was dead with it.** The same unreachable line held the
+"this account served a request, clear its penalty" and "the account we blamed
+has been replaced by one that works, record the failure" bookkeeping. Nothing
+ever recorded a penalty, so rate-limit cooldowns never engaged and a failing
+account was retried as though it were healthy. Both now run at the same
+terminating chunk.
+
+**Stickiness ignored the custom order.** Reaching a stickiness bound moved the
+conversation along the *saved* order even when a custom priority order was
+configured. It now uses the same walk order as a failure, so a custom order
+means one thing everywhere.
+
+**A new conversation ignored the custom order.** Under the custom strategy a
+conversation started on whatever account was active and only consulted the list
+once something failed — which is why a carefully ordered list looked inert. A
+new conversation now starts on the first usable account of the order. Save
+order, which states no priority, still starts on the active account.
+
+### Changed — stickiness defaults for a small pool
+
+`轮数 / requests / minutes` default to **3 rounds / 200 requests / 180
+minutes** (was 1 / 60 / 180). A round is one model output, so the old 1 rotated
+the account after every single answer — which defeats the point of a priority
+order and loses the upstream prompt cache on every message. Three rounds lets a
+whole turn with a few tool calls finish on one account, while a pool of three or
+four accounts still rotates within a session. Existing settings files that do
+not name a field pick up the new default; a stored value is untouched.
+
+### Fixed — plan and quota reads carry the device identity
+
+`status` sent `Cosy-MachineToken` / `Cosy-MachineType`, but the `plan` and
+`quota` reads did not, so two of the three metadata calls looked like an
+unregistered device asking about a subscriber. All three now send it.
+
+### Fixed — the machine id is the official client's again
+
+The host machine id came from a per-profile file, so each DSH profile presented
+itself as a different machine and none of them matched the official client. The
+lookup is now `~/.qoder/.auth/machine_id` (the id the official client stored),
+falling back to a host-level `~/.dsh/qoder/machine_id`, and only then to a
+generated seed. The per-profile file is gone.
+
+### Fixed — cooldown skips are visible in the log
+
+Starting a request on a different account because the intended one is cooling
+down or busy now logs the ledger's view of the skipped account, including when
+it becomes eligible again. Before, the request simply started elsewhere.
+
 ## 1.0.0 — 2026-10-22
 
 The first stable release. It bundles the four capability rounds since 0.6.0 —

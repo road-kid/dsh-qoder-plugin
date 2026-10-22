@@ -303,8 +303,8 @@ startup:
 | `queueWaitSeconds` | 1..300 | 30 | fallback window when the upstream names none |
 | `routingStrategy` | `save-order` \| `custom` | `save-order` | walk order source |
 | `routingOrder` | `string[]` | `[]` | account ids, may mix both variants |
-| `stickinessRounds` | 0..100 | 1 | completed rounds before the conversation moves on |
-| `stickinessRequests` | 0..1000 | 60 | requests before the conversation moves on |
+| `stickinessRounds` | 0..100 | 3 | completed rounds before the conversation moves on |
+| `stickinessRequests` | 0..10000 | 200 | requests before the conversation moves on |
 | `stickinessMinutes` | 0..1440 | 180 | minutes before the conversation moves on |
 
 All three stickiness bounds must be satisfied to stay put: any one of them

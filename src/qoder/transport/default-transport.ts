@@ -121,6 +121,21 @@ function penaltyKind(error: unknown): QoderAccountPenaltyKind {
 }
 
 /**
+ * Whether a terminal chunk is the model finishing an ANSWER.
+ *
+ * The `finish` chunk is the single terminal signal of a stream, and it carries
+ * a failure reason for the two kinds that did not produce an answer: an upstream
+ * error and a caller abort. Everything else — `stop`, `tool-calls`, `max-tokens`
+ * — means the conversation was served to the end, which is what the stickiness
+ * round bound counts and what exonerates an account in the penalty ledger.
+ */
+function isServedFinish(chunk: StreamChunk): boolean {
+  if (chunk.type !== 'finish') return false
+  const kind = chunk.reason.kind
+  return kind !== 'error' && kind !== 'aborted'
+}
+
+/**
  * One session's claim on one account, with the two counters its bounds read.
  *
  * The credential is remembered beside the id because a pinned session may start
@@ -143,6 +158,31 @@ interface SessionPin {
   rounds: number
   /** Requests this account started while holding the pin. */
   requests: number
+}
+
+/**
+ * Per-attempt bookkeeping handed from the account walk down into `attempt`.
+ *
+ * `emitted` says bytes have already left this transport, so a retry would
+ * duplicate rather than recover. `onServed` is the answer to the other question
+ * a walk asks: did this account finish a response? It has to be a callback
+ * rather than a flag the walk checks afterwards, because the HTTP layer closes
+ * the body stream at the terminal chunk instead of resuming the generator — see
+ * `attempt` — so the walk's own code after `yield*` never runs in production.
+ */
+interface AttemptState {
+  /**
+   * Whether a chunk (or an error frame) has already been handed downstream.
+   */
+  emitted: boolean
+  /**
+   * Called once when this attempt produced a finished ANSWER, at the terminal
+   * chunk. Optional so an ambient attempt with no pool walk can pass none.
+   *
+   * Cleared (deleted) by `attempt` after the first call, so it is declared
+   * optional-but-assignable rather than merely absent.
+   */
+  onServed?: (() => void) | undefined
 }
 
 /**
@@ -603,7 +643,25 @@ export class DefaultQoderTransport implements QoderTransport {
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
     const pinned = await this.pinnedAccount(sessionId)
-    let first = pinned ?? active
+    /*
+     * Precedence, and why it is exactly this order — this is the answer to
+     * "轮换逻辑打架": one chain, no feature overriding another by accident.
+     *
+     * 1. A live session pin. This conversation already belongs to an account;
+     *    stickiness is a claim about ownership, and re-deciding it per request
+     *    would make it meaningless.
+     * 2. Otherwise the head of the custom routing order. A custom order is a
+     *    stated PRIORITY — the list reads "try these, top to bottom" — so it has
+     *    to govern where a conversation STARTS, not only where it moves after a
+     *    failure or a reached bound. Leaving it out here was the reason a saved
+     *    list looked inert: every conversation opened on whatever account the
+     *    host had stored, and the order only appeared once something went wrong.
+     * 3. Otherwise the stored active account — the user's "now". The card's
+     *    switch button writes it, and so do our own `switched`/`adopted` hooks,
+     *    so it is the one pointer that reflects a real decision, and it stays
+     *    the start for the save-order strategy, which states no priority.
+     */
+    let first = pinned ?? await this.preferredStart(failover, active)
     /*
      * Do not spend the request on an account the ledger is cooling down (T5) or
      * that the traffic guard is already serving (T7) — but do it SILENTLY, and
@@ -656,6 +714,11 @@ export class DefaultQoderTransport implements QoderTransport {
           fromId: first.id,
           toId: alternative.id,
           cause: firstCooling ? 'cooling' : 'busy',
+          // The ledger's own view of the skipped account. It is the only place
+          // this state is ever reported, so without it a cooldown is invisible:
+          // the request just starts somewhere else with no record of why, or of
+          // when the account becomes eligible again.
+          penalty: this.penalties.snapshot(first.id),
         })
         first = alternative
         rerouted = true
@@ -689,28 +752,43 @@ export class DefaultQoderTransport implements QoderTransport {
       // Per attempt: whether a chunk has already left this transport. Once it
       // has, the bytes cannot be unsent, and a retry on another account would
       // duplicate them rather than recover anything.
-      const state = { emitted: false }
+      const state: AttemptState = { emitted: false }
+      /*
+       * The account served the request to the end, which is the exoneration
+       * pending blame was waiting for: land every earlier account's failure now,
+       * and clear anything still held against THIS account. Order matters so
+       * that a request that starts on a penalised account (the all-cooling
+       * fallback) clears it before any new penalty could apply to it.
+       *
+       * Wired as a callback rather than left after the `yield*` below because
+       * the HTTP layer closes the body stream at the terminal chunk instead of
+       * resuming this generator (see `attempt`): code after `yield*` is
+       * unreachable in production, and the round bound plus this whole
+       * exoneration path died with it.
+       */
+      state.onServed = ((): (() => void) => {
+        // Captured by value: `account` is reassigned as the walk moves, and a
+        // late callback must credit the account that actually served, not
+        // whichever one the walk happens to hold when it fires.
+        const servedId = account.id
+        return (): void => {
+          this.penalties.noteSuccess(servedId)
+          for (const blame of pendingBlame) this.penalties.noteFailure(blame.accountId, blame.kind)
+          this.completeRound(sessionId, servedId)
+          // The walk is over and every deferred penalty has landed, so nothing
+          // may blame these accounts again if the caller keeps pulling.
+          pendingBlame.length = 0
+        }
+      })()
       // Set before the attempt, not after it: `attempt` reads it when it fires
       // the acceptance handler, and on a failure that escapes the walk it must
       // already name the account whose attempt failed last.
       attribution.accountId = account.id
       try {
         yield* this.attempt(options, model, account.pat, state, account.id, queueBudget)
-        // Reached only when the attempt's stream finished normally: an abort, a
-        // failure, or a caller that stopped reading all leave this line
-        // unexecuted. That is exactly the "output completed" definition of a
-        // round, and it is what the stickiness round bound counts.
-        /*
-         * The account served the request to the end, which is the exoneration
-         * pending blame was waiting for: land every earlier account's failure
-         * now, and clear anything still held against THIS account. Order
-         * matters so that a request that starts on a penalised account (the
-         * all-cooling fallback) clears it before any new penalty could apply to
-         * it.
-         */
-        this.penalties.noteSuccess(account.id)
-        for (const blame of pendingBlame) this.penalties.noteFailure(blame.accountId, blame.kind)
-        this.completeRound(sessionId, account.id)
+        // Reached only when the source ended without a terminal chunk at all,
+        // which the SSE layer treats as a failure. A normally finished answer
+        // was already recorded by `state.onServed` at its finish chunk.
         return
       } catch (error: unknown) {
         if (options.signal?.aborted || state.emitted) throw error
@@ -759,7 +837,7 @@ export class DefaultQoderTransport implements QoderTransport {
     options: GenerateOptions,
     model: QoderCatalogModel | undefined,
     pat: string,
-    state: { emitted: boolean } = { emitted: false },
+    state: AttemptState = { emitted: false },
     accountId?: string,
     queueBudget: { waitsLeft: number; total: number } = { waitsLeft: 0, total: 0 },
   ): AsyncGenerator<StreamChunk> {
@@ -803,6 +881,28 @@ export class DefaultQoderTransport implements QoderTransport {
          * chunk is terminal by contract, so nothing after it needs the slot.
          */
         if (chunk.type === 'finish') release()
+        /*
+         * Fire the served-answer hook at that same terminal chunk, for the same
+         * reason: the walk never resumes after the finish chunk, so anything it
+         * wants to record about a completed answer has to be recorded here,
+         * while the transport is still being pulled. `isServedFinish` keeps an
+         * error or aborted terminal chunk out of it — those produced no answer
+         * and must not count as a round or exonerate the account.
+         */
+        if (state.onServed !== undefined && isServedFinish(chunk)) {
+          const onServed = state.onServed
+          // One shot: a misbehaving source that yields twice must not count the
+          // round twice, and the callback must never be able to affect the
+          // chunk stream by throwing.
+          state.onServed = undefined
+          try {
+            onServed()
+          } catch (error: unknown) {
+            this.logger?.warn?.('[Qoder Stream] Served-answer bookkeeping threw; continuing the stream', {
+              message: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
         yield chunk
       }
     } finally {
@@ -1013,6 +1113,38 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
+   * The account an unpinned request starts on.
+   *
+   * Under the save-order strategy the stored active account is the whole
+   * answer: nothing has been stated about priority, so "where the user left
+   * off" is the only honest choice. Under a custom order the user has stated
+   * one, so the first entry that still resolves is where a conversation opens;
+   * the walk and the stickiness rotation then continue from there through the
+   * same resolver, which is what turns the list into one policy instead of a
+   * failure-only hint.
+   *
+   * A list that resolves to nobody is a typo, not a policy, so it falls back to
+   * the active account rather than failing the request.
+   *
+   * Cooling and busy accounts are deliberately NOT skipped here: the dispatch
+   * block that runs next applies those two transient facts to every start
+   * whatever chose it, so this method stays a pure precedence decision.
+   */
+  private async preferredStart(
+    failover: NonNullable<QoderTransportOptions['failover']>,
+    active: { id: string; pat: string },
+  ): Promise<{ id: string; pat: string }> {
+    const routing = this.routing
+    const resolve = failover.accountById
+    if (routing === undefined || resolve === undefined || routing.strategy() !== 'custom') return active
+    for (const id of routing.order()) {
+      const account = await resolve(id)
+      if (account !== undefined) return account
+    }
+    return active
+  }
+
+  /**
    * The account the walk visits after `currentId`.
    *
    * With no custom routing this is exactly the host's own save order. A custom
@@ -1116,16 +1248,29 @@ export class DefaultQoderTransport implements QoderTransport {
   /**
    * Move a session to the next account of the walk order, and pin it there.
    *
-   * `nextAccount` is the host's own answer to "who comes after this one", so
-   * stickiness rotates through exactly the order routing and failover use —
-   * including a parked account being skipped. `undefined`, or the same account
+   * This goes through `nextWalkAccount` — the same resolver the failure walk
+   * uses — instead of the raw `failover.nextAccount` hook, so a rotation follows
+   * the user's custom `routing.order` and skips accounts the ledger is cooling
+   * down or that the traffic guard is serving. Using the hook directly was the
+   * second half of "每轮切换没有生效": the bound fired, but the session moved
+   * along the host's SAVE order, so a custom priority list never took part in a
+   * rotation at all.
+   *
+   * A pool whose every other account is cooling (or busy) must still rotate
+   * rather than strand the session on the account it just outgrew, so the raw
+   * hook is the fallback: a bound means "change account", and cooling is a
+   * transient opinion, not a membership test. `undefined`, or the same account
    * back again (a pool of one), means there is nowhere to go.
    */
   private async rotatePin(
     sessionId: string,
     pin: SessionPin,
   ): Promise<{ id: string; pat: string } | undefined> {
-    const next = await this.failover?.nextAccount(pin.id)
+    const failover = this.failover
+    if (failover === undefined) return undefined
+    const tried = new Set<string>([pin.id])
+    const free = await this.nextWalkAccount(failover, pin.id, tried)
+    const next = free ?? await this.nextAccount(failover, pin.id, tried)
     if (next === undefined || next.id === pin.id) return undefined
     this.pinSession(sessionId, next)
     return { id: next.id, pat: next.pat }

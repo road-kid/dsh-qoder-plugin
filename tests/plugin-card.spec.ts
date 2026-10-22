@@ -1161,11 +1161,11 @@ describe('Qoder plugin card', () => {
   it('shows the three stickiness bounds with the host defaults', async () => {
     const scope = fakeSettingsScope()
     await mountWithSettings(scope)
-    // The defaults the user asked for: one round per account, 60 requests,
-    // 180 minutes. A control that rendered a different default would silently
-    // tell the user a number the host is not using.
-    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('1')
-    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('60')
+    // The host defaults: 3 rounds, 200 requests, 180 minutes. A control that
+    // rendered a different default would silently tell the user a number the
+    // host is not using.
+    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('3')
+    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('200')
     expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('180')
   })
 

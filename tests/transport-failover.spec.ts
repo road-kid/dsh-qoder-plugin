@@ -233,6 +233,31 @@ async function drain(transport: QoderTransport): Promise<StreamChunk[]> {
   return chunks
 }
 
+
+/**
+ * Consume a stream the way the production HTTP layer does.
+ *
+ * `src/upstream.ts` closes the body stream at the finish chunk and never
+ * resumes the generator, so everything the transport records about a completed
+ * answer has to be recorded at that chunk. Draining with `for await` resumes it
+ * and would hide a bookkeeping path that is dead in production — which is how
+ * the deferred-penalty ledger stayed inert while its test passed.
+ */
+async function drainLikeHttp(transport: QoderTransport): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  const iterator = transport.stream(request())[Symbol.asyncIterator]()
+  for (;;) {
+    const step = await iterator.next()
+    if (step.done === true) break
+    chunks.push(step.value)
+    if (step.value.type === 'finish') {
+      await iterator.return?.()
+      break
+    }
+  }
+  return chunks
+}
+
 async function drainError(transport: QoderTransport): Promise<unknown> {
   try {
     await drain(transport)
@@ -574,6 +599,31 @@ describe('QoderTransport account penalties (blame deferred)', () => {
     expect(poolState.switches.map(info => [info.fromId, info.toId, info.reason])).toEqual([
       [ALPHA.id, BETA.id, 'upstream RATE_LIMIT (HTTP 429)'],
     ])
+  })
+
+  /**
+   * The deferred blame has to land under the consumption shape production uses.
+   *
+   * The ledger is only allowed to punish an account once ANOTHER account served
+   * the same request, and the place that lands that blame is the terminal chunk
+   * of the served answer. When that code sat after `yield*` it never ran for a
+   * real conversation: no account was ever cooled, so the cooling-aware start
+   * downstream was dead as well.
+   */
+  it('lands the deferred blame when the caller stops at the finish chunk', async () => {
+    const poolState = pool({ accounts: [ALPHA, BETA] })
+    const { transport, upstream: fake } = harness({
+      failover: poolState.hooks,
+      chat: pat => pat === ALPHA.pat ? new Response('', { status: 429 }) : sseChat('from-b'),
+    })
+
+    await drainLikeHttp(transport)
+    // Beta served the request, so Alpha's 429 is its own fault and the next
+    // request must start on Beta without failing over again.
+    await drainLikeHttp(transport)
+
+    expect(fake.chatPats).toEqual([ALPHA.pat, BETA.pat, BETA.pat])
+    expect(poolState.switches.map(info => [info.fromId, info.toId])).toEqual([[ALPHA.id, BETA.id]])
   })
 
   it('punishes nobody when the whole pool fails', async () => {

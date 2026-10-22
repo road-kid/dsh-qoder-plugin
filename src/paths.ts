@@ -139,15 +139,3 @@ export function qoderPluginDataDir(): string {
 export function qoderStateDir(): string {
   return join(qoderPluginDataDir(), QODER_STATE_DIR_NAME)
 }
-
-/**
- * The plugin-owned seed for the Qoder transport's machine id.
- *
- * The transport's `getMachineId(paths)` helper reads a list of trusted
- * locations and writes its created UUID into the last one; this is the
- * DSH-side location the host wires into that chain, so the identifier stays
- * inside the plugin's own folder instead of scattering files near `$HOME`.
- */
-export function qoderMachineIdPath(): string {
-  return join(qoderStateDir(), '.qoder-machine-id')
-}

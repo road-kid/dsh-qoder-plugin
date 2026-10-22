@@ -158,6 +158,32 @@ async function drain(transport: QoderTransport, sessionId?: Session): Promise<St
   return chunks
 }
 
+/**
+ * Consume a stream the way the production HTTP layer does.
+ *
+ * `src/upstream.ts` wraps the generator in an SSE encoder and closes the body
+ * stream at the finish chunk instead of resuming the generator (or calling
+ * `iterator.return()`), so the transport is never pulled past that chunk. A
+ * plain `for await` — which every other test here uses — resumes the generator
+ * after the terminal chunk, and that is the one code path production never
+ * takes. Bookkeeping that only runs on resume is therefore invisible to
+ * `for await`, which is exactly how a dead round counter passed review.
+ */
+async function drainLikeHttp(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  const iterator = transport.stream(request(sessionId))[Symbol.asyncIterator]()
+  for (;;) {
+    const step = await iterator.next()
+    if (step.done === true) break
+    chunks.push(step.value)
+    if (step.value.type === 'finish') {
+      await iterator.return?.()
+      break
+    }
+  }
+  return chunks
+}
+
 const SESSION = 'session-1' as Session
 
 // ---------------------------------------------------------------------------
@@ -201,6 +227,56 @@ describe('QoderTransport session stickiness', () => {
     // on its own and came back through the walk, instead of staying there
     // forever because the bound only dropped the pin.
     expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  /**
+   * The round bound has to fire under the consumption shape production uses.
+   *
+   * `drainLikeHttp` stops at the finish chunk and abandons the generator, which
+   * is what `src/upstream.ts` does in front of this transport. The counter used
+   * to be incremented after `yield*`, so it only ever ran for a caller that
+   * drained past the finish chunk — i.e. for tests, never for a real
+   * conversation. This case fails if that regression comes back.
+   */
+  it('rotates on the round bound when the caller stops at the finish chunk, as the HTTP layer does', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drainLikeHttp(transport, SESSION)
+    await drainLikeHttp(transport, SESSION)
+
+    // Request 1 is Alpha's, and its answer really was consumed to the end: the
+    // round bound of one is spent, so request 2 must start on the next account
+    // of the walk. Before the fix this read [pt-a, pt-a].
+    expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat])
+  })
+
+  /**
+   * ...and it must count exactly once, however the caller consumes the stream.
+   *
+   * A full `for await` resumes the generator after the finish chunk, so a
+   * counter that ran both at the terminal chunk AND after `yield*` would charge
+   * two rounds for one answer and rotate a request early.
+   */
+  it('counts one round per answer even when the caller drains past the finish chunk', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { rounds: () => 2, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    // With a bound of two and one round per answer, the rotation lands on the
+    // THIRD request. Doubling each answer would have rotated on the second.
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, BETA.pat])
   })
 
   /**

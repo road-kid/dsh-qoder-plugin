@@ -211,7 +211,8 @@ export class QoderAccountTrafficLimiter {
     return gate !== undefined && (gate.held || gate.waiters.length > 0)
   }
 
-  private gateFor(accountId: string): AccountGate {    const existing = this.accounts.get(accountId)
+  private gateFor(accountId: string): AccountGate {
+    const existing = this.accounts.get(accountId)
     if (existing !== undefined) return existing
     const gate: AccountGate = { waiters: [], held: false, lastStartMs: undefined }
     this.accounts.set(accountId, gate)

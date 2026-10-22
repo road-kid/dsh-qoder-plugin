@@ -308,8 +308,16 @@ test('QoderUsageReader reads subscriber plan and user status with machine finger
 
   assert.equal(planHeaders?.authorization, 'Bearer jt-plan-test')
   assert.equal(statusHeaders?.authorization, 'Bearer jt-plan-test')
-  assert.equal(statusHeaders?.['Cosy-MachineToken'], 'umid-fingerprint-test')
-  assert.equal(statusHeaders?.['Cosy-MachineType'], 'host')
+  /*
+   * The whole metadata family carries the device fingerprint, not just the
+   * status probe. A plan or quota read that arrives without the machine token
+   * is an unregistered device asking about a subscriber, which is precisely the
+   * traffic shape a shared-credential observer is looking for.
+   */
+  for (const headers of [quotaHeaders, planHeaders, statusHeaders]) {
+    assert.equal(headers?.['Cosy-MachineToken'], 'umid-fingerprint-test')
+    assert.equal(headers?.['Cosy-MachineType'], 'host')
+  }
   assert.equal(planHeaders?.['user-agent'], qoderUserAgent)
   assert.equal(statusHeaders?.['user-agent'], qoderUserAgent)
   assert.equal(quotaHeaders?.['user-agent'], qoderUserAgent)
