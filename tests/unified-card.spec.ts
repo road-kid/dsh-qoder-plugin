@@ -200,6 +200,20 @@ describe('Unified Qoder Plugin Card', () => {
     expect(json()).toContain(en.checkInTimeHint)
   })
 
+  it('puts the daily check-in above the failover policy', async () => {
+    await mountUnified()
+    const text = json()
+    // Reading the card top to bottom: the once-a-day housekeeping action comes
+    // first, the policy that changes how a running conversation is served
+    // second. A user looking for "turn check-in on" should not have to scroll
+    // past the failover controls to find it.
+    expect(text.indexOf(en.paneUsage)).toBeGreaterThan(-1)
+    expect(text.indexOf(en.checkInTime)).toBeGreaterThan(-1)
+    expect(text.indexOf(en.autoFailoverLabel)).toBeGreaterThan(-1)
+    expect(text.indexOf(en.paneUsage)).toBeLessThan(text.indexOf(en.autoFailoverLabel))
+    expect(text.indexOf(en.checkInTime)).toBeLessThan(text.indexOf(en.autoFailoverLabel))
+  })
+
   it('switches between China and Global tabs when clicked', async () => {
     await mountUnified()
     await act(async () => { tabButtons()[1]!.props.onClick() })
@@ -213,6 +227,52 @@ describe('Unified Qoder Plugin Card', () => {
     await act(async () => { tabButtons()[0]!.props.onClick() })
     text = json()
     expect(text).toContain(t('patTail', { tail: '****1111' }))
+  })
+
+  it('does not carry a pool confirmation from one tab to the other', async () => {
+    // The two products keep separate account lists, so an "已切换到备用账号"
+    // line belongs to the tab that produced it: painted under Global it would
+    // claim a switch that never happened on that account.
+    request.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => ({ ok: true, status: 'saved' }) }
+      if (String(url) === QODER_STATUS_PATH) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: 'signed-in',
+            region: 'china',
+            pat: { source: 'card', savedAtMs: 1700000000000, patTail: '1111' },
+            authKey: 'cn-auth-key',
+            accounts: {
+              autoFailover: true,
+              entries: [
+                { id: 'pat:main', source: 'card', active: true, order: 1, patTail: '1111' },
+                { id: 'pat:spare', accountName: '备用账号', source: 'card', active: false, order: 2, patTail: '2222' },
+              ],
+            },
+            credits: { total: 30, accounts: [] },
+            models: [],
+          }),
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'signed-out', region: 'global', authKey: 'global-auth-key' }),
+      }
+    })
+    await mountUnified()
+
+    const switchButton = view!.root.findAll(node => node.type === 'button' && node.props['aria-label'] === t('accountSwitchAria', { name: '备用账号' }))[0]
+    await act(async () => { switchButton!.props.onClick() })
+    expect(json()).toContain(t('accountSwitched', { name: '备用账号' }))
+
+    // Global has no pool of its own, so the confirmation has nothing to stand on.
+    await act(async () => { tabButtons()[1]!.props.onClick() })
+    const text = json()
+    expect(text).not.toContain(t('accountSwitched', { name: '备用账号' }))
+    expect(text).not.toContain('pat:spare')
   })
 
   it('reactively enables the auto-check-in switch when a PAT turns the account signed-in', async () => {
@@ -279,8 +339,12 @@ describe('Unified Qoder Plugin Card', () => {
     const scope = fakeScope()
     await mountUnified({ scope })
     const poll = view!.root.findAll(node => node.type === 'input' && node.props['aria-label'] === en.quotaPollLabel)[0]!
-    expect(poll.props.value).toBe(5) // 300_000 ms renders as five minutes
+    expect(poll.props.value).toBe('5') // 300_000 ms renders as five minutes
+    // A draft until committed: writing per keystroke is what made the field
+    // impossible to retype.
     await act(async () => { poll.props.onChange({ target: { value: '7' } }) })
+    expect(scope.set).not.toHaveBeenCalled()
+    await act(async () => { poll.props.onBlur() })
     expect(scope.set).toHaveBeenCalledWith('quotaPollMs', 420_000)
   })
 

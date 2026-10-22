@@ -29,6 +29,7 @@ interface Harness {
   store: QoderCredentialStore
   upstreamBodies: string[]
   upstreamSignals: (AbortSignal | undefined)[]
+  upstreamSessions: (string | undefined)[]
   upstreamResponse: () => QoderChatResult
 }
 
@@ -96,12 +97,14 @@ async function startShim(
     store,
     upstreamBodies: [],
     upstreamSignals: [],
+    upstreamSessions: [],
     upstreamResponse,
   }
   const client: Pick<QoderUpstreamClient, 'chatStream'> = {
-    async chatStream(bodyJson: string, signal?: AbortSignal): Promise<QoderChatResult> {
+    async chatStream(bodyJson: string, signal?: AbortSignal, sessionId?: string): Promise<QoderChatResult> {
       harness.upstreamBodies.push(bodyJson)
       harness.upstreamSignals.push(signal)
+      harness.upstreamSessions.push(sessionId)
       return harness.upstreamResponse()
     },
   }
@@ -212,8 +215,7 @@ describe('Qoder shim guards', () => {
     expect(harness.upstreamBodies).toHaveLength(0)
   })
 
-  it('checks the content type before the credential (415 wins over 401)', async () => {
-    // A signed-out shim with a form-encoded body still answers the CSRF-shape
+  it('checks the content type before the credential (415 wins over 401)', async () => {    // A signed-out shim with a form-encoded body still answers the CSRF-shape
     // guard first, exactly as the handler's order is written.
     const harness = await startShim(UNUSED_FAILURE, { signedIn: false })
     const port = Number(new URL(harness.shim.baseUrl()).port)
@@ -491,5 +493,71 @@ describe('Qoder shim error mapping', () => {
     expect(body.error.message.length).toBeLessThanOrEqual('qoder upstream server (http 502): '.length + 400)
     expect(body.error.message).toContain('x'.repeat(400))
     expect(body.error.message).not.toContain(`${'x'.repeat(401)}`)
+  })
+})
+
+/**
+ * Session affinity: the shim is the only place the harness's session id can
+ * cross into the transport, because pi-ai sends it as a header rather than in
+ * the chat-completions body. Session stickiness has no other source for its
+ * pin key, so these cases guard the whole crossing.
+ */
+describe('session affinity header', () => {
+  /** One chat POST carrying exactly the given extra headers. */
+  async function postChat(harness: Harness, extra: Record<string, string>): Promise<number> {
+    const port = Number(new URL(harness.shim.baseUrl()).port)
+    const res = await rawRequest({
+      port,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        'content-type': 'application/json',
+        authorization: `Bearer ${harness.shim.token()}`,
+        ...extra,
+      },
+      body: JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    return res.status
+  }
+
+  it('forwards x-session-affinity to the upstream client', async () => {
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, { 'x-session-affinity': 'session-abc' })).toBe(200)
+    expect(harness.upstreamSessions).toEqual(['session-abc'])
+  })
+
+  it('accepts the bare session_id spelling as the same fact', async () => {
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, { session_id: 'session-xyz' })).toBe(200)
+    expect(harness.upstreamSessions).toEqual(['session-xyz'])
+  })
+
+  it('passes no session when the request carries none', async () => {
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, {})).toBe(200)
+    expect(harness.upstreamSessions).toEqual([undefined])
+  })
+
+  it('treats a blank affinity header as no session at all', async () => {
+    // A blank value must not become a pin key shared by every session that
+    // sent it — that would silently couple unrelated conversations.
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, { 'x-session-affinity': '   ' })).toBe(200)
+    expect(harness.upstreamSessions).toEqual([undefined])
+  })
+
+  it('prefers x-session-affinity when both spellings are present', async () => {
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, { 'x-session-affinity': 'primary', session_id: 'secondary' })).toBe(200)
+    expect(harness.upstreamSessions).toEqual(['primary'])
+  })
+
+  it('does not leak the session into the request body', async () => {
+    // The session is transport-side routing information, not part of the
+    // OpenAI-compatible wire the upstream is asked to answer.
+    const harness = await startShim(() => sseResponse('data: [DONE]\n\n'))
+    expect(await postChat(harness, { 'x-session-affinity': 'session-abc' })).toBe(200)
+    expect(harness.upstreamBodies[0]).not.toContain('session-abc')
   })
 })

@@ -51,6 +51,14 @@ export interface QuotaSettingsScope<T> {
    * @returns the host-specific settlement, which this card does not read.
    */
   unset: (field: string) => Promise<unknown>
+  /**
+   * Load the host document unless it is already loaded or loading.
+   *
+   * Optional: a scope whose first read failed (the host route was not mounted
+   * yet, or the host plugin was being replaced) can recover without a page
+   * reload. A scope that never serves documents simply omits it.
+   */
+  ensureLoaded?: (() => void) | undefined
 }
 
 /** One settings form's sync state, identical in both hosts. */
@@ -61,6 +69,14 @@ export interface QuotaSettingsSnapshot<T> {
   value: T | undefined
   /** Whether the host document accepts writes. */
   writable: boolean
+  /**
+   * The last write the host refused, as a message to show the user.
+   *
+   * Absent while the last write (or read) succeeded. Present means the value
+   * on screen is NOT what the host holds, so the card must say so rather than
+   * leave a control looking applied.
+   */
+  error?: string | undefined
 }
 
 /** Everything the registration binds into the card. */
@@ -86,5 +102,29 @@ export interface QuotaSection {
   variantEnabledCN?: boolean
   /** The whole global variant's master switch (on by default). */
   variantEnabledGlobal?: boolean
+  /*
+   * The failover and routing policy.
+   *
+   * These are the host Config's own field names, so the settings face can store
+   * them verbatim; the card only decides how to present them. They are optional
+   * because an older host serves a face without them, and a control whose
+   * backing field the host does not own must not be rendered as if it wrote.
+   */
+  /** Whether a connection failure walks on to the next account at all. */
+  autoFailoverEnabled?: boolean
+  /** How many times a queued answer is retried (0 = report at once). */
+  queueWaitAttempts?: number
+  /** How long each queue retry waits, in seconds. */
+  queueWaitSeconds?: number
+  /** Which order the walk follows: the save order, or the user's own list. */
+  routingStrategy?: 'save-order' | 'custom'
+  /** The user's own routing order, account ids, highest priority first. */
+  routingOrder?: string[]
+  /** How many completed rounds one account serves before the session moves on. */
+  stickinessRounds?: number
+  /** How many requests one account serves before the session moves on. */
+  stickinessRequests?: number
+  /** How many minutes one account serves before the session moves on. */
+  stickinessMinutes?: number
 }
 

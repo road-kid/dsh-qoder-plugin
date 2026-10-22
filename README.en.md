@@ -37,6 +37,9 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 
 - **PAT: save it and it works** — paste a PAT into the settings card and press *Save*; the token is validated live against that variant's region before anything is written, and the model group appears immediately — no DSH restart. Once signed in, *Replace PAT* (the new token overwrites only after it validates, so a mistyped paste can never strand a working credential) and *Clear PAT* are one click away.
 - **Two independent variants** — `qoder` (china) and `qoder-global` (global) keep separate credential files, routes and saved catalogs: a token minted on qoder.com does not work against the China deployment and vice versa.
+- **Account pool with automatic failover** — either variant can hold several PATs, listed row by row on the card (order, token tail, account name, plan, remaining credit); one click switches, and any row can be removed. Failover to the next account is **on by default**: when a request cannot reach the upstream on one account (network error, timeout, a stream that breaks before its first byte, an upstream 5xx, a rate limit) the next account in order is tried, at most one pass over the pool. A refused request (the request itself is invalid) does not switch — another account would answer the same thing — and neither does a *queued model*, because that is a fact about the model, not the account. *Advanced* lets you turn the switch off, set **queue wait attempts / queue wait seconds** (when the upstream says the model is queued, sit out the advised window inside that same request, up to N times for up to S seconds each), pick a **routing strategy** (save order, or a hand-ordered list that may mix both variants — mixing lists the models enabled in only one variant as an explanation without gating the save), and set **conversation stickiness** (one account serves a conversation until **rounds / requests / minutes** runs out, whichever comes first, and the conversation then **moves on to the next account in the order** — a round counts only when a chat's model output finished, the defaults are 1 round / 60 requests / 180 minutes, and 0 in a field turns that bound off).
+- **Per-account park checkbox and health** — every account row carries a checkbox; unticking it *parks* the account: nothing is deleted and the token stays, it simply takes no part in routing or failover and the composer panel shows its credits as parked rather than as a spendable balance. Each row also carries a health chip — **normal / queued / limited**. A queued answer marks it queued; two queued answers more than an hour apart on the same account, or three connection failures in a row, escalate it to limited; one accepted chat clears it back to normal.
+- **An explanation when the upstream cannot serve a model, instead of a bare error** — when the upstream answers *model queued / not serviceable*, the plugin inserts an explanation into the conversation (reusing the plugin's existing `command/run` + `command/done` notice row, the approach dsh-connect-workbuddy settled on). It states that this is neither a sign-in nor a quota problem, how many seconds the upstream advises waiting, and quotes the upstream's own message, and it raises the possibility of risk control when the same answer recurs inside one outage window. The sentence "waited the advised 30 seconds and it is still not serviceable" appears **only when the wait really happened** — the request actually sat out a full advised window and was refused again afterwards; otherwise it reports only the facts. The same notice is inserted once per turn rather than stacking rows, and a later accepted chat retires it, so it never hangs on screen after the condition is over.
 - **Three-tier model catalog (live → saved → fallback)** — the card states where the list on screen came from: *“Model list updated …”* (fetched now), *“Showing the saved model list from …”* (this account's last successful fetch, restored after a restart or a failed fetch), or *“Showing the built-in model list (not yet updated from Qoder)”* (the roster compiled into the plugin). The reason of the most recent failed fetch is shown too, and a *Refresh model list* button sits right there.
 - **Per-model context window (staged, one save)** — every model row carries a thick solid Qoder-style slider (tick labels under the track; releasing snaps to the windows the model declares — 200K / 400K / 1M). Dragging is continuous again — nothing quantises under the pointer — and only the release settles on the nearest allowed window. Dragging only edits a local draft — nothing is written per drag tick — and the enable switches plus window changes are committed together by one *Save*; a sticky *“N unsaved change(s)”* bar appears while the draft is dirty and *Cancel* restores the saved state. Requests carry the selected window; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent settings.
 - **Model visibility toggles** — the *Models* card lists every model of the selected variant in Qoder's own order (no re-sorting — it matches the official GUI), with each model's reasoning efforts and the upstream default labelled. Disabled models are hidden from the DSH model picker, keeping it tidy. Toggles stage locally like the window sliders and are committed by the same *Save*.
@@ -48,7 +51,7 @@ Configure only what you use: a variant with no saved PAT shows no model group an
 
 ## A look at the UI
 
-The settings page is three compact cards: **Account** (sign-in state, plan, the remaining-credit / check-in / current-account strip and 一键签到, the variant switch with its whole-variant checkboxes, credential source, replace/clear PAT), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Advanced** (show credits in the composer, auto check-in, check-in time, refresh interval). Nothing is collapsed behind tabs, and no card draws its own chrome.
+The settings page is three compact cards: **Account** (sign-in state, plan, the remaining-credit / check-in / current-account strip and 一键签到, the variant switch with its whole-variant checkboxes, credential source, replace/clear PAT, and the **multi-account list** — one row per saved account with a park checkbox, switch, remove and a health chip), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Advanced** (show credits in the composer, credit refresh interval, **auto check-in and its time**, the **auto-failover switch**, **queue wait attempts / seconds**, **routing strategy and order**, and **stickiness rounds / requests / minutes**). Nothing is collapsed behind tabs, and no card draws its own chrome. Both the account list and the custom-priority list now print each account's **remaining credit** and **health** (normal / queued / rate-limited) right next to its name, so you can see which seats are usable without opening anything.
 
 The **China / Global** segmented switch sits at the top of the account card, and the checkbox on each tab enables or disables that whole variant's models; under it the summary strip carries the signed-in account's remaining credit, today's check-in state and the current account, with a *Check in all* button on the right:
 
@@ -171,8 +174,8 @@ Everything the plugin owns lives in one data directory: `<profile>/.dsh-qoder-pl
 
 ```text
 <profile>/.dsh-qoder-plugin/
-├── .qoder-auth.json              # China PAT ({version:2, pat, region, savedAt})
-├── .qoder-global-auth.json       # Global PAT
+├── .qoder-auth.json              # China account pool ({version:3, activeId, accounts:[{id, pat, region, savedAt, enabled?}]})
+├── .qoder-global-auth.json       # Global account pool (same shape; the two never mix)
 ├── settings.json                 # refresh interval / check-in time / per-variant enable, own config
 ├── checkin-status.json           # check-in state (claimed today + when), no ledger
 └── state/
@@ -185,6 +188,14 @@ Everything the plugin owns lives in one data directory: `<profile>/.dsh-qoder-pl
 ```
 
 `DSH_QODER_DATA_DIR` overrides the directory explicitly.
+
+The two `auth.json` files now hold an **account pool**, not a single token: a
+`version: 3` document stores several accounts plus one `activeId` pointer, and an
+`enabled` field appears only while an account is parked (*not in use*). Removing
+that field restores the account, so "never parked" and "restored" are
+indistinguishable on disk — deliberately. Old `version: 2` single-token files
+still read fine and upgrade to v3 in place on the next write, without losing the
+token already saved.
 
 **Device identity for the international check-in**: the international campaign
 only reaches requests that carry a device risk identity, and that identity
@@ -220,6 +231,52 @@ The card component follows the owner's `view` contract accordingly:
 
 ---
 
+## Settings reference
+
+Every control on the settings cards maps to one of the `Config` fields below (the schema in `src/index.ts` is the source of truth; the card only sends values inside the stated range and refuses out-of-range input instead of silently clamping it). Fields that exist per variant are stored separately for China and Global, except the check-in time and the stickiness bounds, which both variants share.
+
+| Setting | Where | Type / range | Default | What it does |
+|---|---|---|---|---|
+| `variantEnabledCN` / `variantEnabledGlobal` | right of the account tabs | boolean | on | Enables or disables the whole variant's models; a disabled variant's models leave the DSH model picker |
+| `disabledModelsCN` / `disabledModels` | Models card, per-row checkbox | string array | empty | Model ids that are switched off; the checkboxes write straight here |
+| `useMaximumContextWindowCN` / `useMaximumContextWindow` | Models card | boolean | on | Prefer the largest context window Qoder declares, when alternatives exist |
+| `modelContextWindowsCN` / `modelContextWindows` | Models card slider | dict (model id → tokens, ≥1) | empty | Per-model context-window overrides, written when the slider is released |
+| `probeConsent` | Models card | boolean | off | Authorises reasoning-effort probes, which send real requests and can spend credit |
+| `quotaPollMs` | Advanced: credit refresh interval | number (≥60000 ms) | 300000 | How often the composer credit readout refreshes |
+| `autoCheckInCN` / `autoCheckInGlobal` | Advanced: auto check-in | boolean | off | Daily automatic check-in, independently per variant |
+| `checkInMinute` | Advanced: check-in time | number 0–1439 (minutes past UTC+8 midnight) | 600 (10:00) | The single check-in time both variants share; it sets the 10:00 → next-day-10:00 claim window |
+| `autoFailoverEnabled` | Advanced: automatic account switching | boolean | on | With it off, a failure is returned as-is and no account is switched |
+| `queueWaitAttempts` | Advanced: queue wait attempts | number 0–10 | 0 | How many extra times a queued request retries inside the same turn (0 = report the queue fact immediately) |
+| `queueWaitSeconds` | Advanced: queue wait seconds | number 1–300 | 30 | How long to wait before each retry; an upstream-advised delay wins over this |
+| `routingStrategy` | Advanced: routing strategy | `save-order` \| `custom` | `save-order` | Which order accounts are tried in: save order, or the custom order below |
+| `routingOrder` | Advanced: custom priority | string array (account ids) | empty | The custom order, may mix China and Global accounts; an empty list falls back to save order |
+| `stickinessRounds` | Advanced: session stickiness | number 0–100 | 1 | Switch accounts after this many rounds with one account (0 = unlimited) |
+| `stickinessRequests` | Advanced: session stickiness | number 0–10000 | 60 | Switch after this many requests with one account (0 = unlimited) |
+| `stickinessMinutes` | Advanced: session stickiness | number 0–1440 | 180 | Switch after this many minutes with one account (0 = unlimited) |
+| `sidebarQuotaCN` / `sidebarQuotaGlobal` | — (no UI) | boolean | off | Legacy: the sidebar quota card was removed; the plugin forces these off at boot and keeps them only to stay compatible with older settings files |
+
+The three stickiness bounds are ORed: whichever is reached first switches the account, and setting all three to 0 turns stickiness off.
+
+---
+
+## Troubleshooting
+
+**The card says "not signed in".** That variant has no usable credential. Paste a PAT on the card, or set the matching environment variable (see [environment-variable fallback](#environment-variable-fallback)). China and Global keep separate credential stores — filling in one does not light up the other.
+
+**A message appears in the conversation saying the upstream model is queued.** That is not a sign-in or a quota problem: the upstream is temporarily not serving that model. The plugin inserts the explanation once per turn, naming the delay the upstream advised and quoting its own message. If the same answer recurs inside one outage it also mentions that the account may have been risk-controlled — switch accounts or wait it out. A later accepted chat clears the notice.
+
+**An account is labelled queued or rate-limited.** A queued upstream answer marks 排队; two queued answers more than an hour apart, or three consecutive connection failures, escalate to 限流; the next successful chat resets it to normal. The label only informs you — no account is ever deleted automatically.
+
+**One-click check-in reports a conflict.** The upstream refused the claim with a 409 (already claimed, or not claimable in this window). The plugin re-reads the campaign list and answers truthfully: it says the benefit was already granted, or says explicitly that nothing was granted this time — it no longer reports the 409 as a network error.
+
+**Auto-failover is on but the request never switched accounts.** Switching only happens on account-level failures *before the first byte* reaches the client (connection drop, timeout, truncated stream, upstream 5xx, rate limit, auth rejection). An invalid request would fail on every account, and bytes already sent cannot be recalled — neither switches.
+
+**A settings change does not stick.** Controls only accept values inside their range; out-of-range input is never written. Number fields commit on blur and on Enter, and a rejected commit reverts the control to the stored value.
+
+**The model list is empty or short.** The card states where the current list came from (live fetch / saved catalog / built-in fallback) and offers a manual refresh. A disabled variant, or one with every model unchecked, legitimately shows nothing in the picker.
+
+---
+
 ## Development
 
 ```sh
@@ -231,7 +288,7 @@ pnpm run typecheck  # tsc across the host and client tsconfigs
 pnpm run check      # typecheck + test + test:qoder + build in one gate
 ```
 
-> **Known failures:** the full suite is **496** cases, and every run lands at **488–490 passed / 6–8 failed**. The failures sit in three files: `tests/adapter.spec.ts` (1 — the code and the test expectation contradict each other), `tests/catalog-lifecycle.spec.ts` (1 — module-level state leaks between cases), and `tests/reasoning-merge.spec.ts` (5 — 5-second-timeout flakes that fire after `boot()`, varying between 4 and 6 per run, which is why the failed count swings 6–8). These three files are long-standing baseline failures, not introduced by this version. Separately, `test:qoder` (the node --test Qoder transport suite) is **131/131** green.
+> **Known failures:** the full suite is **669** cases, and a run lands at **662 passed / 7 failed**. The failures sit in three files: `tests/adapter.spec.ts` (1 — the code and the test expectation contradict each other), `tests/catalog-lifecycle.spec.ts` (1 — module-level state leaks between cases), and `tests/reasoning-merge.spec.ts` (4 — 5-second-timeout flakes that fire after `boot()`, varying between 4 and 5 per run, which is why the failed count swings 6–7). These three files are long-standing baseline failures that also fail on the release before 1.0.0, so they are not introduced by this version. Separately, `test:qoder` (the node --test Qoder transport suite) is **150/150** green.
 
 ### Releasing
 
@@ -255,7 +312,7 @@ git tag -a v<version> -m "v<version>" && git push origin main --tags
 This project's implementation was informed by the following open-source projects — thanks to their authors:
 
 - [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect) — plugin skeleton and the connect mechanism
-- [dsh-connect-workbuddy](https://github.com/masknull/dsh-workbuddy-connect) — the shape of the composer readout and its anchored panel
+- [dsh-connect-workbuddy](https://github.com/masknull/dsh-workbuddy-connect) — the shape of the composer readout and its anchored panel; the insertion approach and wording strategy of the *upstream cannot service this model* notice are informed by this project too ([mirror](https://github.com/dingminhua/dsh-connect-workbuddy#readme))
 - [dsh-provider-qoder](https://github.com/mo-n/dsh-provider-qoder) — Qoder transport protocol details
 
 All of them are released under the MIT License, as is this project — see [LICENSE](./LICENSE). This is a community adapter — not affiliated with, authorized by, or endorsed by Qoder or DeepSeek, and not an official implementation.

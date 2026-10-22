@@ -5,14 +5,38 @@
  */
 
 import { LlmError, ProviderRequestId, type LlmErrorOptions } from '@deepseek-ai/dsh-llm'
+import { parseQueueFacts, type QoderQueueFacts } from './queue-notice.ts'
+
+export type { QoderQueueFacts }
 
 export class QoderLlmError extends LlmError {
+  /**
+   * The parsed queue answer, when this error IS the upstream's "model not
+   * serviceable" reply.
+   *
+   * It rides the error because the body is the only place the distinction
+   * lives, and the body is read exactly once, here, while classifying. Every
+   * layer above gets the explanation without re-reading or re-parsing a body
+   * it never had: the host builds the user-facing notice from this, and the
+   * notice can therefore never disagree with the classification that decided
+   * the request failed.
+   */
+  qoderQueue?: QoderQueueFacts
+
   constructor(message: string, code: string = 'UNKNOWN_ERROR', options?: LlmErrorOptions) {
     super(message, code, options)
   }
 }
 
-/** The queue/limit markers Qoder puts in a rejection body (observed 2026-09-26). */
+/**
+ * The queue/limit markers Qoder puts in a rejection body (observed 2026-09-26).
+ *
+ * `./queue-notice.ts` keeps its own copy of this list on purpose: this one
+ * drives the AUTH-versus-RATE_LIMIT classification shared with `src/upstream.ts`
+ * and the transport, and it must keep reading observed bodies exactly as they
+ * are even if the richer parser next door changes. Tests on both sides hold the
+ * two in step.
+ */
 const QUEUE_BODY_MARKERS: readonly RegExp[] = [
   /"code"\s*:\s*"?10605"?/u,
   /"isQueued"\s*:\s*true/u,
@@ -53,6 +77,22 @@ export function qoderQueueSignal(body: string | undefined): { retryAfterMs?: num
 }
 
 /**
+ * The parsed facts of Qoder's queue/unserviceable answer, or `undefined` when
+ * the body is not that answer at all.
+ *
+ * {@link qoderQueueSignal} answers the classification question — "is this a
+ * throttle rather than a dead credential?" — with the minimum it needs. This
+ * answers the explanation question — "what should the user be told?" — from the
+ * same body, so a call site can classify an error and describe it without
+ * parsing the nesting twice, and the two can never disagree about what the
+ * upstream said. The re-export lives here because this module owns the
+ * upstream-error surface callers already import.
+ */
+export function qoderQueueFacts(body: string | undefined): QoderQueueFacts | undefined {
+  return parseQueueFacts(body ?? '')
+}
+
+/**
  * Replace status digits that read as authorization failure with a neutral
  * word, for messages the upstream used to announce a queue.
  *
@@ -84,7 +124,14 @@ export function qoderHttpError(
     ? qoderQueueSignal(body ?? message)
     : undefined
   if (queue !== undefined) {
-    const retryAfterMs = queue.retryAfterMs ?? headerRetryAfterMs
+    // A "0 seconds" advice means "retry now", which is no window to wait on.
+    // The host's `LlmError` rejects a non-positive `providerRetryAfterMs` by
+    // throwing from its own constructor, and that throw arrives at the caller
+    // as a transport failure — replacing the queue classification (and the
+    // notice built from it) with a wrong reason and a spent retry. Only a real,
+    // positive window is forwarded; a header value may still supply one.
+    const advisedMs = queue.retryAfterMs !== undefined && queue.retryAfterMs > 0 ? queue.retryAfterMs : undefined
+    const retryAfterMs = advisedMs ?? headerRetryAfterMs
     // The message must not carry the upstream's 401/403 digits. The harness's
     // pi-ai error classifier matches those numbers in message TEXT ahead of
     // every other signal (`/\b(?:401|403)\b/` before `/\b429\b|rate.?limit/`),
@@ -93,11 +140,17 @@ export function qoderHttpError(
     // facts survive: status stays 403 in `failure.status`, the body still
     // names 10605 / isQueued / retryAfterSeconds, and the retry hint rides
     // on providerRetryAfterMs.
-    return new QoderLlmError(deauthorizeDigits(message), 'RATE_LIMIT', {
+    const rejection = new QoderLlmError(deauthorizeDigits(message), 'RATE_LIMIT', {
       status,
       ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
       ...requestId === undefined ? {} : { requestId },
     })
+    // `qoderQueueSignal` above only answered "is this a queue"; the facts the
+    // notice needs come from the richer parser reading the same body. It is
+    // given the same input so the two can never describe different answers.
+    const facts = qoderQueueFacts(body ?? message)
+    if (facts !== undefined) rejection.qoderQueue = facts
+    return rejection
   }
   const code = status === 401 || status === 403
     ? 'AUTH'

@@ -55,16 +55,151 @@ export const QODER_GLOBAL_AUTH_PATH = '/plugins/dsh-qoder-plugin/global/auth'
  * One action the PAT route accepts.
  *
  * `save-pat` validates the pasted token against the variant's region and, only
- * on success, persists it; `clear` removes the stored credential. There is no
- * device flow and no credential import: the token is the whole auth surface.
+ * on success, persists it (an already-stored token is re-selected rather than
+ * duplicated); `activate-account` switches which stored token signs requests;
+ * `remove-account` drops one stored token; `set-account-enabled` parks one
+ * stored token without deleting it — the failover walk skips it and the
+ * composer panel leaves its credits out, yet it stays saved and stays
+ * hand-signable; `clear` removes every stored credential. There is no device
+ * flow and no credential import: the token is the whole auth surface.
  */
-export type QoderAuthAction = 'save-pat' | 'clear'
+export type QoderAuthAction = 'save-pat' | 'clear' | 'activate-account' | 'remove-account' | 'set-account-enabled'
 
 /** Request body accepted by the PAT route. */
 export interface QoderAuthRequest {
   action: QoderAuthAction
   /** The token to validate and store; required for `save-pat`. */
   pat?: string
+  /**
+   * The stable id of the stored account to act on; required for
+   * `activate-account`, `remove-account` and `set-account-enabled`.
+   *
+   * Never the token itself: the id is the credential's one-way hash
+   * (`qoderCredentialIdentity`), which is what the status document hands the
+   * card, so a card can only ever name an account the host told it about.
+   */
+  accountId?: string
+  /**
+   * The new enablement for `set-account-enabled`.
+   *
+   * Required for that action and rejected for every other one: a missing value
+   * there is a malformed request, not "keep it as it is", because a card that
+   * lost the value would otherwise silently re-enable an account the user had
+   * just parked.
+   */
+  enabled?: boolean
+}
+
+/**
+ * One stored account, as the card lists it.
+ *
+ * A variant may hold several PATs (the user's own, a colleague's, a spare), and
+ * which one signs a request is a choice rather than a constant. This is the
+ * browser-safe projection of one entry: the display facts plus the two pieces
+ * of identity the card needs to act on it — never the token.
+ */
+export interface QoderAccountSummary {
+  /** Stable account id: the credential's one-way hash, safe to display. */
+  id: string
+  /** Last four characters of the token, enough to tell two of them apart. */
+  patTail?: string
+  /** The subscriber name the upstream reported for this account, when known. */
+  accountName?: string
+  /** When this token was saved, epoch milliseconds. */
+  savedAtMs?: number
+  /** Where this credential came from when it was stored. */
+  source: QoderCredentialSource
+  /** Whether this is the account that currently signs requests. */
+  active: boolean
+  /**
+   * 1-based position in the order automatic failover walks.
+   *
+   * The switch order is the order the accounts were saved in, which is the
+   * only ordering the plugin can honestly claim: it has no per-account health
+   * ranking to sort by, and inventing one would reorder a user's list behind
+   * their back.
+   */
+  order: number
+  /**
+   * This account's own plan, when the host could read it.
+   *
+   * The composer panel prices every pooled account, not just the one that
+   * signs; each row carries the plan its credits belong to so a spare seat's
+   * tier is visible before the user switches to it.
+   */
+  plan?: QoderWebPlan
+  /** This account's own credits, from that account's billing answer. */
+  credits?: QoderWebCredits
+  /**
+   * Why this account's billing answer is missing, when the read failed.
+   *
+   * A failed price must not hide an account the user can still switch to, so
+   * the row survives with an explanation instead of disappearing or showing a
+   * stale figure borrowed from another account.
+   */
+  creditsError?: string
+  /**
+   * Whether automatic switching may pick this account.
+   *
+   * A disabled account stays saved and stays signable when the user activates
+   * it by hand; it is simply never chosen by the failover walk, and the
+   * composer panel leaves its credits out. Absent means enabled — documents
+   * written before this field existed must keep every account usable.
+   */
+  enabled?: boolean
+  /**
+   * This account's observed service state, from its own request outcomes.
+   *
+   * `normal`: nothing wrong was seen. `queued`: the last thing the upstream
+   * said about this account was its per-model queue answer. `limited`: the
+   * account keeps queueing or keeps failing to connect — two queue answers at
+   * least an hour apart, or repeated connection failures — which is what the
+   * card shows as 限流. Absent when the plugin has observed nothing yet.
+   */
+  health?: QoderAccountHealth
+}
+
+/** One account's observed service state (see {@link QoderAccountSummary.health}). */
+export type QoderAccountHealth = 'normal' | 'queued' | 'limited'
+
+/**
+ * The account pool and its failover policy, as the card displays them.
+ *
+ * `autoFailover` is a user preference, not a derived fact: switching accounts
+ * changes which subscription pays for a request, so it is opt-out-able even
+ * though it is on by default.
+ */
+export interface QoderWebAccounts {
+  entries: readonly QoderAccountSummary[]
+  /** Whether a connection failure moves on to the next account automatically. */
+  autoFailover: boolean
+  /**
+   * The last automatic switch, epoch ms; absent when none has happened in this
+   * process. The card renders it so an otherwise silent account change shows.
+   */
+  lastFailoverAt?: number
+  /** Why the last automatic switch happened, a short redacted reason. */
+  lastFailoverReason?: string
+  /**
+   * Whether the user enabled automatic switching at all.
+   *
+   * Distinct from {@link autoFailover}: that one reports whether a failure
+   * COULD be absorbed right now (two or more usable accounts, switching on).
+   * This one is the raw preference, which the advanced settings render as a
+   * switch even when only one account is saved.
+   */
+  autoFailoverEnabled?: boolean
+  /**
+   * The account ids in the order the walk tries them, as configured.
+   *
+   * Empty when the user never reordered anything, in which case the walk uses
+   * save order. Ids that name accounts of the other variant are carried here
+   * too: one list spans both variants, and each variant's walk simply skips
+   * the ids that are not its own.
+   */
+  routingOrder?: readonly string[]
+  /** Which strategy the walk follows: the save order, or {@link routingOrder}. */
+  routingStrategy?: 'save-order' | 'custom'
 }
 
 /** Where the credential in effect came from. */
@@ -241,6 +376,38 @@ export interface QoderCatalogModelSnapshot {
   source?: string
 }
 
+/**
+ * One upstream "this model is not serviceable" answer, as the card shows it.
+ *
+ * Qoder answers a saturated per-model queue (or a region whose service is off)
+ * with HTTP 401/403/200 whose body carries `code: 10605`, `isQueued`,
+ * `serviceAvailable`, and `retryAfterSeconds`. That answer is emphatically NOT
+ * a credential or quota problem, and the two ways it used to be misreported
+ * were both actively misleading: as `AUTH` it sent the user to replace a
+ * perfectly good token, and as a bare `RATE_LIMIT` it said "throttled" while
+ * hiding the one fact that matters — the model is unavailable, and coming back
+ * later is the whole remedy. This carries the explanation, and the upstream's
+ * own words, to the surfaces that show it.
+ */
+export interface QoderWebUpstreamNotice {
+  /** `queued`: a saturated per-model queue. `unavailable`: the service is off. */
+  kind: 'queued' | 'unavailable'
+  /** The upstream's own message, verbatim and bounded, for the user to quote. */
+  upstreamMessage?: string
+  /** The delay the upstream asked for, milliseconds. */
+  retryAfterMs?: number
+  /**
+   * Whether the plugin actually waited that delay and retried before
+   * reporting. The notice's own wording claims a wait, so the claim is carried
+   * as a fact rather than assumed by the renderer.
+   */
+  waited: boolean
+  /** When the notice was recorded, epoch milliseconds. */
+  at: number
+  /** How many times this same notice has recurred in this process. */
+  occurrences: number
+}
+
 /** The JSON document the plugin card renders. */
 export type QoderWebStatus =
   | {
@@ -249,6 +416,19 @@ export type QoderWebStatus =
     region?: QoderRegion
     /** Redacted summary of the PAT in effect. */
     pat?: QoderPatSummary
+    /**
+     * The account pool and its failover policy.
+     *
+     * Present even with a single account (`entries.length === 1`): the card
+     * renders the list from this alone, so a separate single-account shape
+     * would be a second code path that only ever shows one row.
+     */
+    accounts?: QoderWebAccounts
+    /**
+     * The most recent upstream "not serviceable" answer, when one is in effect.
+     * Absent when the upstream has not refused a model on this variant.
+     */
+    upstreamNotice?: QoderWebUpstreamNotice
     /**
      * The subscriber's coding plan, when the upstream described one.
      *

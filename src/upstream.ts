@@ -370,7 +370,12 @@ async function openAiContentBlocks(
  */
 async function toGenerateOptions(
   bodyJson: string,
-  context: { providerId: string, attachments: Pick<AttachmentStore, 'saveImage'> | undefined, signal?: AbortSignal | undefined },
+  context: {
+    providerId: string
+    attachments: Pick<AttachmentStore, 'saveImage'> | undefined
+    signal?: AbortSignal | undefined
+    sessionId?: string | undefined
+  },
 ): Promise<GenerateOptions> {
   let parsed: unknown
   try {
@@ -479,6 +484,11 @@ async function toGenerateOptions(
   const temperature = parsed['temperature']
   const maxTokens = parsed['max_tokens']
 
+  // Narrowed once rather than inside the object spread: with
+  // `exactOptionalPropertyTypes` the spread of `string | undefined` still
+  // infers `undefined` into the optional slot, which the target type refuses.
+  const sessionId = context.sessionId === undefined ? undefined : (context.sessionId as GenerateOptions['sessionId'])
+
   return {
     provider: context.providerId,
     model,
@@ -491,6 +501,7 @@ async function toGenerateOptions(
     ...Array.isArray(stop)
       ? { stop: stop.filter((entry): entry is string => typeof entry === 'string') }
       : typeof stop === 'string' ? { stop: [stop] } : {},
+    ...sessionId === undefined ? {} : { sessionId },
     ...context.signal === undefined ? {} : { signal: context.signal },
   }
 }
@@ -659,6 +670,75 @@ function failureResult(error: unknown): QoderChatResult {
   return { ok: false, status: 502, kind: 'server', message: String(error) }
 }
 
+/**
+ * One pooled account's billing answer, host-side.
+ *
+ * Shared by the ambient credential's read ({@link QoderUpstreamClient.fetchCredits},
+ * which also caches the name and plan for the card) and the per-account read
+ * ({@link QoderUpstreamClient.fetchAccountBilling}) so both price an account
+ * identically — a pooled row must never disagree with the headline row about
+ * the same upstream answer.
+ */
+export interface QoderAccountBilling {
+  /** The subscriber name, absent when the upstream reported none. */
+  accountName?: string
+  /** The plan these credits belong to, when the upstream described one. */
+  plan?: QoderSubscriberPlan
+  credits: QoderCredits
+}
+
+/**
+ * Map one quota answer onto the card's credit shape.
+ *
+ * Qoder reports one personal quota, an optional organization resource package,
+ * and the day's bonus bucket; each becomes a package row the card already knows
+ * how to draw. An unbounded personal allowance (`total === 0`, not exceeded) is
+ * the account's "unlimited" state.
+ *
+ * `expiresAt` 是账号级的周期边界（喂给 `cycleResetTime`），不是任何资源包
+ * 自己的效期。此前三个包行都借用它作 `packageEndTime`，把同一个 9999 哨兵
+ * 同时印在三行上 —— 官方页各包效期互不相同。`quota/usage` 不含 per-bucket
+ * 效期字段，所以包行不携带效期，渲染为「无到期」，绝不猜日期。
+ */
+export function creditsFromUsage(usage: QoderQuotaUsage): QoderCredits {
+  const accounts: QoderCreditAccount[] = []
+  const personal = usage.userQuota
+  if (personal !== undefined) {
+    accounts.push({
+      packageName: '个人额度',
+      remain: personal.remaining,
+      size: personal.total,
+    })
+  }
+  const org = usage.orgResourcePackage
+  if (org !== undefined) {
+    accounts.push({
+      packageName: '组织资源包',
+      remain: org.remaining,
+      size: org.total,
+    })
+  }
+  // Bonus credits sit beside the plan upstream (the daily campaign's 100 land
+  // here). Dropping the bucket made the card list fewer packages than the
+  // account actually holds — the web showed two, the card showed one.
+  const addOn = usage.addOnQuota
+  if (addOn !== undefined) {
+    accounts.push({
+      packageName: '赠送额度',
+      remain: addOn.remaining,
+      size: addOn.total,
+    })
+  }
+  const unlimited = usage.isQuotaExceeded === false && personal !== undefined && personal.total === 0
+  return {
+    total: usage.totalUsagePercentage ?? personal?.percentage ?? 0,
+    totalSize: accounts.reduce((sum, entry) => sum + entry.size, 0),
+    accounts,
+    ...(unlimited ? { unlimited: true as const } : {}),
+    ...usage.expiresAt === undefined ? {} : { cycleResetTime: usage.expiresAt },
+  }
+}
+
 /** Constructor options for {@link QoderUpstreamClient}. */
 export interface QoderUpstreamClientOptions {
   /** Which upstream region this client's transport talks to. */
@@ -754,17 +834,43 @@ export class QoderUpstreamClient {
   }
 
   /**
-   * The subscriber's quota answer, mapped onto the card's credit shape.
+   * One named account's plan and credits, without adopting it.
    *
-   * Qoder reports one personal quota and an optional organization resource
-   * package; each becomes a package row the card already knows how to draw.
-   * An unbounded personal allowance (`total === 0`, not exceeded) is the
-   * account's "unlimited" state.
+   * {@link fetchCredits} prices the credential that currently signs and caches
+   * its name for the card; this reads a SPECIFIC pooled token so the composer
+   * panel can price every account the user holds. The distinction is
+   * load-bearing: reading a spare account must not relabel the ambient one, so
+   * neither `accountName` nor `accountPlan` is touched here — the caller
+   * projects the answer onto the row it belongs to.
    *
-   * `expiresAt` 是账号级的周期边界（喂给 `cycleResetTime`），不是任何资源包
-   * 自己的效期。此前三个包行都借用它作 `packageEndTime`，把同一个 9999 哨兵
-   * 同时印在三行上 —— 官方页各包效期互不相同。`quota/usage` 不含 per-bucket
-   * 效期字段，所以包行不携带效期，渲染为「无到期」，绝不猜日期。
+   * `force` is deliberately not offered: the account reader already caches per
+   * token with single-flight, and pricing a whole pool on every status poll is
+   * exactly the case that cache exists for.
+   */
+  async fetchAccountBilling(pat: string, signal?: AbortSignal): Promise<QoderAccountBilling> {
+    const account: QoderAccountInfo = await this.transport.readAccount({
+      pat,
+      ...signal === undefined ? {} : { signal },
+    })
+    const name = account.profile.name
+    return {
+      ...name === '' ? {} : { accountName: name },
+      ...account.plan === undefined ? {} : { plan: account.plan },
+      credits: creditsFromUsage(account.usage ?? {}),
+    }
+  }
+
+  /**
+   * The ambient credential's quota answer, plus the name and plan it belongs
+   * to, cached for the next status document.
+   *
+   * `force: true` is deliberate here and only here: this is the read the user
+   * is looking at, and a cached figure that lags the account they just switched
+   * to is the one staleness the card must not show. The per-account pool read
+   * ({@link fetchAccountBilling}) is the opposite case and uses the cache.
+   *
+   * The mapping itself lives in {@link creditsFromUsage}, shared with the pool
+   * read so both price an account identically.
    */
   async fetchCredits(signal?: AbortSignal): Promise<QoderCredits> {
     const account: QoderAccountInfo = await this.transport.readAccount({ force: true, ...signal === undefined ? {} : { signal } })
@@ -773,43 +879,7 @@ export class QoderUpstreamClient {
     this.accountName = account.profile.name === '' ? undefined : account.profile.name
     // Same read, same place: the plan the credits above belong to.
     this.accountPlan = account.plan
-    const usage: QoderQuotaUsage = account.usage ?? {}
-    const accounts: QoderCreditAccount[] = []
-    const personal = usage.userQuota
-    if (personal !== undefined) {
-      accounts.push({
-        packageName: '个人额度',
-        remain: personal.remaining,
-        size: personal.total,
-      })
-    }
-    const org = usage.orgResourcePackage
-    if (org !== undefined) {
-      accounts.push({
-        packageName: '组织资源包',
-        remain: org.remaining,
-        size: org.total,
-      })
-    }
-    // Bonus credits sit beside the plan upstream (the daily campaign's 100 land
-    // here). Dropping the bucket made the card list fewer packages than the
-    // account actually holds — the web showed two, the card showed one.
-    const addOn = usage.addOnQuota
-    if (addOn !== undefined) {
-      accounts.push({
-        packageName: '赠送额度',
-        remain: addOn.remaining,
-        size: addOn.total,
-      })
-    }
-    const unlimited = usage.isQuotaExceeded === false && personal !== undefined && personal.total === 0
-    return {
-      total: usage.totalUsagePercentage ?? personal?.percentage ?? 0,
-      totalSize: accounts.reduce((sum, entry) => sum + entry.size, 0),
-      accounts,
-      ...(unlimited ? { unlimited: true as const } : {}),
-      ...usage.expiresAt === undefined ? {} : { cycleResetTime: usage.expiresAt },
-    }
+    return creditsFromUsage(account.usage ?? {})
   }
 
   /**
@@ -829,14 +899,20 @@ export class QoderUpstreamClient {
    * status, not as a 200 whose first frame is an error. Once streaming has
    * begun, failures degrade to the error-frame-then-`[DONE]` form the
    * {@link ChunkEncoder} documents.
+   *
+   * `sessionId` is the harness conversation this request belongs to, taken
+   * from the affinity header the shim reads. It rides `GenerateOptions` so the
+   * transport can keep one session on one account (session stickiness); an
+   * absent id simply means the request is not sticky.
    */
-  async chatStream(bodyJson: string, signal?: AbortSignal): Promise<QoderChatResult> {
+  async chatStream(bodyJson: string, signal?: AbortSignal, sessionId?: string): Promise<QoderChatResult> {
     let options: GenerateOptions
     try {
       options = await toGenerateOptions(bodyJson, {
         providerId: this.providerId,
         attachments: this.attachments,
         ...signal === undefined ? {} : { signal },
+        ...sessionId === undefined ? {} : { sessionId },
       })
     } catch (error) {
       return failureResult(error)

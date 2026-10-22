@@ -18,10 +18,28 @@ import type { QoderModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { getClaimWindowDateString } from './claim-window.ts'
 import { QODER_STATUS_PATH } from './status-paths.ts'
-import type { QoderCatalogModelSnapshot, QoderPatSummary, QoderWebCatalog, QoderWebPlan, QoderWebProbeSection, QoderWebStatus } from './status-paths.ts'
+import type { QoderCatalogModelSnapshot, QoderPatSummary, QoderWebAccounts, QoderWebCatalog, QoderWebPlan, QoderWebProbeSection, QoderWebStatus, QoderWebUpstreamNotice } from './status-paths.ts'
 
 export { QODER_STATUS_PATH } from './status-paths.ts'
 export type { QoderWebStatus } from './status-paths.ts'
+
+/**
+ * Project a subscriber plan onto the fields the card renders.
+ *
+ * Only these three facts cross to the browser: the raw payload stays host-side
+ * and the organization is reduced to its display name. Shared by the ambient
+ * account's row and every pooled account's row — a plan that is named one way
+ * in the headline and another in the list would be a bug the user sees as two
+ * different subscriptions.
+ */
+export function webPlan(plan: QoderSubscriberPlan | undefined): QoderWebPlan | undefined {
+  if (plan === undefined) return undefined
+  return {
+    planTierName: plan.planTierName,
+    ...plan.organization?.orgName === undefined ? {} : { organizationName: plan.organization.orgName },
+    ...plan.endDate === undefined ? {} : { endDate: plan.endDate },
+  }
+}
 
 /** Constructor dependencies. */
 export interface QoderStatusRouteOptions {
@@ -61,6 +79,19 @@ export interface QoderStatusRouteOptions {
   useMaximumContextWindow?: () => boolean
   /** Disabled models query for this variant. */
   disabledModels?: () => readonly string[]
+  /**
+   * The account pool and its failover policy.
+   *
+   * Async because it reads the credential file: the pool is what the card acts
+   * on, so it must be the file's current contents rather than a cached copy
+   * taken when the route was mounted.
+   */
+  accounts?: () => Promise<QoderWebAccounts>
+  /**
+   * The most recent upstream "not serviceable" answer, when one is in effect.
+   * Optional so the route keeps working without a notice recorder in tests.
+   */
+  upstreamNotice?: () => QoderWebUpstreamNotice | undefined
   /**
    * When the self-heal last auto-refreshed the job token, epoch ms; absent
    * when it has not happened in this process. Rides the signed-in document
@@ -172,17 +203,9 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
     }
   }
   const accountName = deps.accountName?.()
-  // The plan projection rides the same account read as the name. Only the
-  // fields the card renders cross over: the raw payload stays host-side, and
-  // the organization is reduced to its display name.
-  const plan = deps.plan?.()
-  const planField: QoderWebPlan | undefined = plan === undefined
-    ? undefined
-    : {
-      planTierName: plan.planTierName,
-      ...plan.organization?.orgName === undefined ? {} : { organizationName: plan.organization.orgName },
-      ...plan.endDate === undefined ? {} : { endDate: plan.endDate },
-    }
+  // The plan projection rides the same account read as the name, and is shared
+  // with the pooled rows so every account's tier is projected one way.
+  const planField = webPlan(deps.plan?.())
   // The signed-in arm's pat summary, extended with the subscriber name when
   // the upstream reported one. Typed against the arm's own field so the
   // optional-spreading below stays exactOptionalPropertyTypes-clean.
@@ -265,14 +288,37 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
         today: deps.today?.() ?? getClaimWindowDateString(),
       },
     }
+  /*
+   * The account pool rides the signed-in document so the card renders the list,
+   * the active marker, and the switch buttons from the same response it already
+   * polls — a second endpoint would be a second thing to keep in step, and the
+   * card must never show a stale "active" row.
+   */
+  const accountsSection = await deps.accounts?.()
+  const withAccounts: QoderWebStatus = accountsSection === undefined
+    ? withCheckIn
+    : { ...withCheckIn, accounts: accountsSection }
+  /*
+   * The last upstream "not serviceable" answer, when there is one.
+   *
+   * This is the fact that used to be invisible: a saturated per-model queue
+   * arrived as an auth-looking 401/403 or a bare "throttled", and the card
+   * showed either a dead-credential hint or nothing at all. The notice names
+   * the queue, quotes the upstream, and says outright that it is neither a
+   * sign-in nor a quota problem.
+   */
+  const upstreamNotice = deps.upstreamNotice?.()
+  const withNotice: QoderWebStatus = upstreamNotice === undefined
+    ? withAccounts
+    : { ...withAccounts, upstreamNotice }
   try {
     const credits = await deps.client.fetchCredits()
     // `unlimited` and `cycleResetTime` ride along as-is: the card must see
     // "no cap" as its own state, and the fetch only sets them when the
     // upstream actually reported them.
-    return { ...withCheckIn, credits }
+    return { ...withNotice, credits }
   } catch (error: unknown) {
-    return { ...withCheckIn, creditsError: safeMessage(error) }
+    return { ...withNotice, creditsError: safeMessage(error) }
   }
 }
 

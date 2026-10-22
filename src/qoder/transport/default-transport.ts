@@ -39,8 +39,123 @@ export const defaultStreamIdleTimeoutMs = 5 * 60 * 1000
  */
 const jobTokenNoticeMaxAgeMs = 5 * 60 * 1000
 
+/**
+ * Longest single queue wait the transport will honour.
+ *
+ * A queue answer can carry a retry window the upstream computed, and nothing
+ * stops that window from naming hours. Holding a request open for hours is not
+ * a wait, it is a hang: the caller's own retry cycle is shorter than that, and
+ * the user would rather see the queue explained than a spinner that outlives
+ * their patience. Waits longer than this are capped and the queue is reported
+ * on the next failure.
+ */
+const queueWaitCeilingMs = 5 * 60 * 1000
+
+/**
+ * Most session pins the transport remembers at once.
+ *
+ * A host process can carry thousands of sessions, and each pin is small but not
+ * free. The cap only ever costs an evicted session its stickiness — it picks an
+ * account again on its next request — so it is a memory bound, not a
+ * correctness one. Exported so the bound itself can be tested.
+ */
+export const sessionPinCapacity = 512
+
+/**
+ * One session's claim on one account, with the two counters its bounds read.
+ *
+ * The credential is remembered beside the id because a pinned session may start
+ * while its account is not the active one, and re-resolving it on every request
+ * would need a store lookup per turn. When the host does expose `accountById`
+ * the pin is re-resolved through it, so an account the user removed can never
+ * keep signing requests.
+ *
+ * The counters are what let a bound be reached EXACTLY: a pin that merely
+ * counted down "further rounds" could not also honour a request bound, and one
+ * that stored an absolute expiry could not start counting from the instant the
+ * account actually took over the session.
+ */
+interface SessionPin {
+  id: string
+  pat: string
+  /** Wall-clock instant this account took over the session. */
+  pinnedAtMs: number
+  /** Conversations this account served to the end while holding the pin. */
+  rounds: number
+  /** Requests this account started while holding the pin. */
+  requests: number
+}
+
+/**
+ * The pooled account one request is currently being attempted on.
+ *
+ * Created per request and threaded down into the walk rather than kept as a
+ * transport field, because one transport serves concurrent requests: a shared
+ * "current account" would let one request's terminal failure be reported
+ * against another request's account.
+ */
+interface AttemptAttribution {
+  accountId: string | undefined
+}
+
 function aborted(message: string): QoderLlmError {
   return new QoderLlmError(message, 'ABORTED')
+}
+
+/**
+ * Whether a failure says something about the ACCOUNT rather than the request.
+ *
+ * A malformed request fails identically on every account, so switching would
+ * only trade a clear error for a slower identical one — and adopt an identity
+ * nothing needed. `INVALID_REQUEST` is therefore excluded explicitly, and the
+ * remaining signals are the connection-level family (the fetch never completed,
+ * the handshake or stream timed out, the response carried no body to stream)
+ * plus the account-level classifications. `QUOTA` is deliberately not one of
+ * them: the frozen spec enumerates what failover answers to, and a depleted
+ * quota is an account fact the user resolves by choosing another account.
+ *
+ * A queue answer is excluded for the same reason one step removed. It is the
+ * upstream's statement about a busy MODEL (`isQueued`, `serviceAvailable:false`)
+ * that merely travels wearing `RATE_LIMIT` and the upstream's 403 — see
+ * `qoderHttpError`. No credential queue-jumps a model, so the walk would only
+ * spend a second subscription on the same answer, and because a switch reports
+ * the previous condition over, it would also erase the explanation this plugin
+ * owes the user for exactly that answer (observed end to end: a two-account
+ * pool answered the queue on B, `upstreamNotice` came back undefined, and the
+ * stored active account had moved). The queue is reported, never retried
+ * against another identity.
+ */
+function isAccountFailure(error: unknown): boolean {
+  if (!(error instanceof LlmError)) return false
+  if (error.code === 'INVALID_REQUEST') return false
+  if (error instanceof QoderLlmError && error.qoderQueue !== undefined) return false
+  if (
+    error.code === 'AUTH'
+    || error.code === 'RATE_LIMIT'
+    || error.code === 'SERVER'
+    || error.code === 'TIMEOUT'
+    || error.code === 'TRANSPORT'
+    || error.code === 'EMPTY_RESPONSE'
+  ) {
+    return true
+  }
+  const status = error.failure.status
+  return status !== undefined
+    && (status === 401 || status === 403 || status === 429 || (status >= 500 && status <= 599))
+}
+
+/**
+ * A short, redacted account-switch reason for the host's `switched` record.
+ *
+ * It names the classification and status only: the upstream's message can quote
+ * request content, and the credential must never travel into a notice.
+ */
+function switchReason(error: unknown): string {
+  if (error instanceof LlmError) {
+    const status = error.failure.status
+    return status === undefined ? `upstream ${error.code}` : `upstream ${error.code} (HTTP ${status})`
+  }
+  return 'connection failure'
 }
 
 export class DefaultQoderTransport implements QoderTransport {
@@ -58,8 +173,29 @@ export class DefaultQoderTransport implements QoderTransport {
   private readonly attachments: Pick<AttachmentStore, 'imageLimits' | 'readImageRequest'> | undefined
   private readonly imageUploader: QoderImageUploader
   private readonly preserveThinking: boolean | undefined
+  private readonly failover: QoderTransportOptions['failover']
+  private readonly onUpstreamQueue: QoderTransportOptions['onUpstreamQueue']
+  /**
+   * The accepted-chat callback, named apart from `onChatAccepted` because that
+   * name is the seam this transport fires it from.
+   */
+  private readonly chatAccepted: QoderTransportOptions['onChatAccepted']
   private readonly onJobTokenRefreshed: QoderTransportOptions['onJobTokenRefreshed']
   private readonly onJobTokenRefreshFailed: QoderTransportOptions['onJobTokenRefreshFailed']
+  private readonly queueWait: QoderTransportOptions['queueWait']
+  private readonly stickiness: QoderTransportOptions['stickiness']
+  private readonly routing: QoderTransportOptions['routing']
+  private readonly now: () => number
+  /**
+   * Session → account pins, least recently used first.
+   *
+   * Stickiness cannot live in the host's stored account state: that state names
+   * one active account for the whole plugin, and the point of a pin is that two
+   * sessions may legitimately sit on two accounts at the same time. A bounded
+   * map keyed by the session id the caller already supplies is therefore the
+   * storage, ordered by Map insertion so the oldest pin is the one evicted.
+   */
+  private readonly sessionPins = new Map<string, SessionPin>()
   /**
    * Set when the self-heal exchanged a fresh job token, cleared when a chat
    * afterwards succeeds. The notice reports "the token was rotated because the
@@ -89,8 +225,15 @@ export class DefaultQoderTransport implements QoderTransport {
     this.metadataTimeoutMs = options.metadataTimeoutMs
     this.attachments = options.attachments
     this.preserveThinking = options.preserveThinking
+    this.failover = options.failover
+    this.onUpstreamQueue = options.onUpstreamQueue
+    this.chatAccepted = options.onChatAccepted
     this.onJobTokenRefreshed = options.onJobTokenRefreshed
     this.onJobTokenRefreshFailed = options.onJobTokenRefreshFailed
+    this.queueWait = options.queueWait
+    this.stickiness = options.stickiness
+    this.routing = options.routing
+    this.now = options.now ?? Date.now
     this.auth = new QoderAuthService({
       fetch: this.fetchImpl,
       logger: this.logger,
@@ -168,10 +311,15 @@ export class DefaultQoderTransport implements QoderTransport {
    * `streamChat` calls this the moment its first chunk arrives — the only point
    * at which "the credential was accepted" is actually known. A rejected chat
    * throws before that, so this never fires on a failing attempt.
+   *
+   * Acceptance is equally proof that the condition an earlier failure announced
+   * is over, so the host is told here as well: it owns that notice's wording and
+   * lifetime, and nothing in the transport can retract it later.
    */
-  private onChatAccepted(): void {
+  private onChatAccepted(accountId?: string): void {
     this.refreshFailureAnnounced = false
     this.flushPendingRefreshNotice()
+    this.chatAccepted?.(accountId)
   }
 
   async discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]> {
@@ -194,8 +342,11 @@ export class DefaultQoderTransport implements QoderTransport {
     )
   }
 
-  async readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined }): Promise<QoderAccountInfo> {
-    const pat = await this.requirePat(options?.signal)
+  async readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; pat?: string | undefined }): Promise<QoderAccountInfo> {
+    // An explicit token reads THAT account; the ambient credential is only the
+    // fallback. Reading a pooled account must never adopt it — the active
+    // pointer moves through the store, not through a billing read.
+    const pat = options?.pat ?? await this.requirePat(options?.signal)
     return this.usage.readAccount(pat, {
       force: options?.force,
       signal: options?.signal,
@@ -230,6 +381,9 @@ export class DefaultQoderTransport implements QoderTransport {
    * completed `yield*` would then never run.
    *
    * @param onAccepted - Called once, before the first chunk is forwarded.
+   * @param onFirstByte - Called only when there is a chunk to forward, so a
+   *   caller can tell "the upstream accepted this credential" apart from "the
+   *   consumer has already seen bytes", which an empty stream would conflate.
    */
   private async * streamChat(
     options: GenerateOptions,
@@ -237,6 +391,7 @@ export class DefaultQoderTransport implements QoderTransport {
     credentials: CosyCredentials,
     messages: QoderWireMessage[],
     onAccepted: () => void,
+    onFirstByte?: () => void,
   ): AsyncGenerator<StreamChunk> {
     const stream = streamQoderChat(options, model, credentials, messages, {
       fetch: this.fetchImpl,
@@ -247,7 +402,10 @@ export class DefaultQoderTransport implements QoderTransport {
     })
     const first = await stream.next()
     onAccepted()
-    if (!first.done) yield first.value
+    if (!first.done) {
+      onFirstByte?.()
+      yield first.value
+    }
     yield* stream
   }
 
@@ -260,8 +418,146 @@ export class DefaultQoderTransport implements QoderTransport {
     // Phase 1: static validation finishes before credential resolution or any
     // provider I/O, so an unusable request never consumes a subscription.
     validateQoderRequestShape(options, model)
+    // The attribution carrier: the walk fills in the account each attempt signs
+    // with, and the handlers below read it AFTER the walk has finished, so the
+    // id they report is the one that actually produced the outcome.
+    const attribution: AttemptAttribution = { accountId: undefined }
+    try {
+      yield* this.generateWithAccounts(options, model, attribution)
+    } catch (error: unknown) {
+      /*
+       * The final failure of a request is where the queue explanation belongs.
+       *
+       * Every recovery this transport owns has already run by here — the
+       * same-account job-token self-heal, then the next-account walk — so a
+       * failure still in hand is one the user is about to see. A request that
+       * recovered throws nothing, which is exactly why a queue that another
+       * account absorbed stays silent: there is nothing to explain.
+       *
+       * The facts ride the error from the classifier, so the notice is built
+       * from the body that decided the classification. An abort is never a
+       * queue and is not reported.
+       */
+      const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
+      if (facts !== undefined && options.signal?.aborted !== true) {
+        this.onUpstreamQueue?.(facts, attribution.accountId)
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Walk the account pool once, retrying a connection-level failure on the next
+   * account, and yield the first account's successful stream.
+   *
+   * This sits OUTSIDE the per-account self-heal (see `attempt`) on purpose: a
+   * stale job token belongs to the account that holds it, so that account gets
+   * its one fresh-token retry before the transport spends a second identity.
+   * Only a failure the account could not be rescued from advances the walk.
+   *
+   * The `switched` hook is awaited before the retry because it is also what
+   * points the host at the new account: the image publisher's own credential
+   * refresh resolves the ambient active PAT, so that adoption must have landed
+   * before the retry can reach it.
+   */
+  private async * generateWithAccounts(
+    options: GenerateOptions,
+    model: QoderCatalogModel | undefined,
+    attribution: AttemptAttribution,
+  ): AsyncGenerator<StreamChunk> {
+    const failover = this.failover
+    if (failover === undefined || !failover.enabled()) {
+      // No pool to walk, or the user turned switching off: resolve the ambient
+      // credential and behave exactly as before the hooks existed.
+      yield* this.attempt(options, model, await this.requirePat(options.signal))
+      return
+    }
+    const active = await failover.activeAccount()
+    if (active === undefined) {
+      // An env-only credential is not a pooled account, so there is no identity
+      // to advance FROM and nothing for `nextAccount` to be given; the ambient
+      // resolution is the whole answer. `attribution` stays empty, which is how
+      // the host learns that no pooled account is answerable for this request.
+      yield* this.attempt(options, model, await this.requirePat(options.signal))
+      return
+    }
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    // Stickiness chooses where a request STARTS, never whether the walk runs: a
+    // pinned account that fails still advances like any other, because a pin is
+    // a statement about identity, not a promise about health.
+    const pinned = await this.pinnedAccount(sessionId)
+    const first = pinned ?? active
+    if (pinned === undefined) this.pinSession(sessionId, active)
+    // Count the request against whichever account it actually starts on. This
+    // is the request bound of stickiness; the ROUND bound is counted only when
+    // an answer is consumed to the end, below.
+    this.noteRequest(sessionId, first.id)
+    // An id already tried ends the walk. That is what bounds a `nextAccount`
+    // that wraps around the pool: at most one pass, never a cycle.
+    const tried = new Set<string>([first.id])
+    let account = first
+    for (;;) {
+      // Per attempt: whether a chunk has already left this transport. Once it
+      // has, the bytes cannot be unsent, and a retry on another account would
+      // duplicate them rather than recover anything.
+      const state = { emitted: false }
+      // Set before the attempt, not after it: `attempt` reads it when it fires
+      // the acceptance handler, and on a failure that escapes the walk it must
+      // already name the account whose attempt failed last.
+      attribution.accountId = account.id
+      try {
+        yield* this.attempt(options, model, account.pat, state, account.id)
+        // Reached only when the attempt's stream finished normally: an abort, a
+        // failure, or a caller that stopped reading all leave this line
+        // unexecuted. That is exactly the "output completed" definition of a
+        // round, and it is what the stickiness round bound counts.
+        this.completeRound(sessionId, account.id)
+        return
+      } catch (error: unknown) {
+        if (options.signal?.aborted || state.emitted) throw error
+        if (!isAccountFailure(error)) throw error
+        const next = await this.nextAccount(failover, account.id, tried)
+        // `undefined` is the end of the pool; an already-tried id means the
+        // walk wrapped. Either way the failure in hand is the honest answer.
+        if (next === undefined || tried.has(next.id)) throw error
+        tried.add(next.id)
+        // Report the account that failed before announcing the switch: the host
+        // counts these per account to decide the card's 限流 label, and the
+        // observation must belong to `account`, not to the one taking over.
+        const reason = switchReason(error)
+        failover.failed?.({ accountId: account.id, reason, at: this.now() })
+        await failover.switched({ fromId: account.id, toId: next.id, reason })
+        account = next
+        // The session follows the walk. A pin left pointing at the account that
+        // just failed would send the very next turn straight back to it, once
+        // per request for as long as the pin lives — the opposite of recovery.
+        this.pinSession(sessionId, next)
+        // The retry is a request served by the account taking over, so it has
+        // to count against that account's request bound. `pinSession` started
+        // the counters at zero; without this line the account that rescued the
+        // request would get one request of bound back.
+        this.noteRequest(sessionId, next.id)
+      }
+    }
+  }
+
+  /**
+   * Run one account's whole request: credentials, wire translation, the chat,
+   * and the same-account job-token self-heal.
+   *
+   * @param pat - The PAT this attempt signs with. A failover retry passes the
+   *   next account's PAT instead of re-resolving the ambient credential.
+   * @param state - Flipped before the first chunk is forwarded, so the caller
+   *   knows a retry would duplicate bytes already handed to the consumer.
+   */
+  private async * attempt(
+    options: GenerateOptions,
+    model: QoderCatalogModel | undefined,
+    pat: string,
+    state: { emitted: boolean } = { emitted: false },
+    accountId?: string,
+  ): AsyncGenerator<StreamChunk> {
     // Phase 2: credentials, which the center image exchange must be able to sign with.
-    const pat = await this.requirePat(options.signal)
     const credentials = await this.auth.getCredentials(pat, options.signal)
     // Phase 3: read attachments, publish images, and assemble wire messages.
     const messages = await translateQoderMessages(options, this.attachments, {
@@ -271,104 +567,386 @@ export class DefaultQoderTransport implements QoderTransport {
     })
     // Image publication may have refreshed a rejected job token, so the chat
     // credential is read once more: it must be the token that actually signs.
-    const chatCredentials = await this.auth.getCredentials(pat, options.signal)
-    try {
-      // A pending notice from an earlier heal is reported as soon as this
-      // request is accepted (see `streamChat`).
-      yield* this.streamChat(options, model, chatCredentials, messages, () => {
-        this.onChatAccepted()
-      })
-      return
-    } catch (error: unknown) {
-      // A cached job token the upstream has started rejecting (a gateway-side
-      // invalidation or its own rotation) reads as HTTP 401 before any stream
-      // byte is produced. One fresh exchange self-heals that window; a
-      // genuinely revoked PAT fails the retry identically, and the retry
-      // trades one extra exchange call against turning a transient gateway
-      // state into a false "sign in again" report for the user.
-      //
-      // Note what is NOT healed: a 401/403 the upstream used to announce a
-      // saturated queue (body carries code 10605 / isQueued / retryAfterSeconds)
-      // now classifies as RATE_LIMIT, not AUTH — see qoderQueueSignal. A fresh
-      // token cannot jump a queue, so those rejections surface immediately and
-      // let the host's retry policy (which retries RATE_LIMIT, never AUTH)
-      // ride out the window instead.
-      if (!isQoderAuthRejection(error) || options.signal?.aborted) throw error
-      this.logger?.warn?.(
-        '[Qoder Stream] Chat rejected as unauthorized; exchanging a fresh job token and retrying once',
-        { status: error.failure.status },
-      )
-    }
-    // A gateway fault window outlives one immediate retry (observed 2026-09-20:
-    // ~09:49-11:27 local, 401s lasting minutes). Two paced rounds cover a
-    // short window; a revoked PAT still terminates honestly at the first
-    // round's failure, just two exchanges later. Each retry exchanges OUTSIDE
-    // the shared single-flight (exchangeFresh): the flight can be aborted by a
-    // departing concurrent waiter (quota poll, catalog sweep), and a retry
-    // joined to it would be cancelled by a path unrelated to the chat.
-    let lastRejection: unknown
-    // The rotation this request armed for its own heal. The pending notice is
-    // instance state shared by every in-flight request on this transport, so
-    // discarding on failure must clear only what this request armed — a
-    // concurrent request may have armed its own (successful) notice after ours
-    // and deserves it.
+    let chatCredentials = await this.auth.getCredentials(pat, options.signal)
+    const onFirstByte = (): void => { state.emitted = true }
+    // Wait out a queue answer instead of failing the request.
+    //
+    // A queue is the upstream saying "the model is busy", so the honest
+    // recovery is time, not another identity: the account walk below is skipped
+    // for it entirely (`isAccountFailure`), and because the wait happens here —
+    // inside the attempt, before the failure can leave it — a wait that
+    // succeeds is invisible to both the user and the host's retry policy. Only
+    // bytes already handed to the consumer make a retry pointless, which is the
+    // same rule the account walk follows.
+    let waitsLeft = this.queueWaitBudget()
+    let healRound = 0
     let noticeAt: number | undefined
-    for (let round = 0; round < 2; round++) {
-      const refreshed = await this.auth.exchangeFresh(pat, options.signal)
-      // The rotation has happened; the first chat accepted afterwards — this
-      // round's retry or any subsequent one — is what makes it reportable.
-      this.pendingRefreshAt = Date.now()
-      noticeAt = this.pendingRefreshAt
+    for (;;) {
       try {
-        yield* this.streamChat(options, model, refreshed, messages, () => {
-          this.onChatAccepted()
-        })
+        // A pending notice from an earlier heal is reported as soon as this
+        // request is accepted (see `streamChat`).
+        yield* this.streamChat(options, model, chatCredentials, messages, () => {
+          this.onChatAccepted(accountId)
+        }, onFirstByte)
         return
       } catch (error: unknown) {
+        // A queue is resolved by waiting, never by another account and never by
+        // a fresh token — so it is checked BEFORE the self-heal, whose exchange
+        // would otherwise burn a job token on a model that was merely busy (a
+        // queue answer classifies as RATE_LIMIT, not AUTH, so the heal would
+        // in fact decline it — but the ordering makes that explicit rather than
+        // incidental).
+        if (waitsLeft > 0 && !state.emitted && options.signal?.aborted !== true) {
+          const waitMs = this.queueWaitMs(error)
+          if (waitMs !== undefined) {
+            waitsLeft -= 1
+            this.logger?.warn?.('[Qoder Stream] Upstream queue is saturated; waiting before retrying the same account', {
+              waitMs,
+              attemptsLeft: waitsLeft,
+            })
+            await this.waitOutQueue(waitMs, options.signal)
+            continue
+          }
+        }
+        // A cached job token the upstream has started rejecting (a gateway-side
+        // invalidation or its own rotation) reads as HTTP 401 before any stream
+        // byte is produced. One fresh exchange self-heals that window; a
+        // genuinely revoked PAT fails the retry identically, and the retry
+        // trades one extra exchange call against turning a transient gateway
+        // state into a false "sign in again" report for the user.
+        //
+        // Note what is NOT healed: a 401/403 the upstream used to announce a
+        // saturated queue (body carries code 10605 / isQueued / retryAfterSeconds)
+        // now classifies as RATE_LIMIT, not AUTH — see qoderQueueSignal. A fresh
+        // token cannot jump a queue, so those rejections surface immediately and
+        // let the host's retry policy (which retries RATE_LIMIT, never AUTH)
+        // ride out the window instead.
         if (!isQoderAuthRejection(error) || options.signal?.aborted) throw error
-        lastRejection = error
-        if (round + 1 < 2) {
+        if (healRound >= 2) {
+          // Both paced rounds exhausted on authorization rejections: the honest
+          // answer is the last rejection, not a silently empty stream.
+          //
+          // The rotation did NOT rescue this chat, so the deferred success
+          // notice it would otherwise have qualified for is void. Dropping it
+          // here is what stops a later, unrelated chat acceptance from printing
+          // "已自动重换并恢复" with a stale rotation time — the row that made the
+          // notice look broken. Only this request's own notice is void, though:
+          // a concurrent heal that armed the pending slot after ours keeps it.
+          if (this.pendingRefreshAt === noticeAt) this.discardPendingRefreshNotice()
+          // Report the failed heal once per outage. The success notice covers
+          // "the rotation rescued the chat"; without this, a rejection the
+          // rotation could NOT rescue was announced nowhere at all, and the user
+          // was left reading a bare authorization failure with no hint that
+          // recovery had been attempted.
+          if (!this.refreshFailureAnnounced) {
+            this.refreshFailureAnnounced = true
+            this.logger?.warn?.('[Qoder Stream] Job token refresh did not recover the chat; the upstream still rejects it', {
+              status: error.failure.status,
+            })
+            this.onJobTokenRefreshFailed?.({
+              region: this.region,
+              at: Date.now(),
+              ...(error.failure.status === undefined ? {} : { status: error.failure.status }),
+            })
+          }
+          throw error
+        }
+        if (healRound === 0) {
+          this.logger?.warn?.(
+            '[Qoder Stream] Chat rejected as unauthorized; exchanging a fresh job token and retrying once',
+            { status: error.failure.status },
+          )
+        } else {
+          // A gateway fault window outlives one immediate retry (observed
+          // 2026-09-20: ~09:49-11:27 local, 401s lasting minutes), so the second
+          // exchange is deliberately late; a revoked PAT still terminates
+          // honestly at the last round's failure, just two exchanges later.
           this.logger?.warn?.('[Qoder Stream] Fresh job token also rejected; waiting 2s and retrying once more', {
             status: error.failure.status,
-            round: round + 1,
+            round: healRound,
           })
-          await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(resolve, 2_000)
-            options.signal?.addEventListener('abort', () => {
-              clearTimeout(timer)
-              reject(aborted('Request was aborted during the re-auth backoff.'))
-            }, { once: true })
-          })
+          await this.pauseBeforeNextHeal(options)
         }
+        // Each retry exchanges OUTSIDE the shared single-flight
+        // (exchangeFresh): the flight can be aborted by a departing concurrent
+        // waiter (quota poll, catalog sweep), and a retry joined to it would be
+        // cancelled by a path unrelated to the chat.
+        const refreshed = await this.auth.exchangeFresh(pat, options.signal)
+        // The rotation has happened; the first chat accepted afterwards — this
+        // round's retry or any subsequent one — is what makes it reportable.
+        this.pendingRefreshAt = Date.now()
+        noticeAt = this.pendingRefreshAt
+        chatCredentials = refreshed
+        healRound += 1
       }
     }
-    // Both paced rounds exhausted on authorization rejections: the honest
-    // answer is the last rejection, not a silently empty stream.
-    //
-    // The rotation did NOT rescue this chat, so the deferred success notice it
-    // would otherwise have qualified for is void. Dropping it here is what
-    // stops a later, unrelated chat acceptance from printing "已自动重换并恢复"
-    // with a stale rotation time — the row that made the notice look broken.
-    // Only this request's own notice is void, though: a concurrent heal that
-    // armed the pending slot after ours must keep it.
-    if (this.pendingRefreshAt === noticeAt) this.discardPendingRefreshNotice()
-    // Report the failed heal once per outage. The success notice covers "the
-    // rotation rescued the chat"; without this, a rejection the rotation could
-    // NOT rescue was announced nowhere at all, and the user was left reading a
-    // bare authorization failure with no hint that recovery had been attempted.
-    if (!this.refreshFailureAnnounced) {
-      this.refreshFailureAnnounced = true
-      this.logger?.warn?.('[Qoder Stream] Job token refresh did not recover the chat; the upstream still rejects it', {
-        status: lastRejection instanceof LlmError ? lastRejection.failure.status : undefined,
-      })
-      this.onJobTokenRefreshFailed?.({
-        region: this.region,
-        at: Date.now(),
-        ...(lastRejection instanceof LlmError && lastRejection.failure.status !== undefined
-          ? { status: lastRejection.failure.status }
-          : {}),
-      })
+  }
+
+  /**
+   * The account the walk visits after `currentId`.
+   *
+   * With no custom routing this is exactly the host's own save order. A custom
+   * order is a statement about which accounts the user wants used first, so it
+   * is followed while it can serve and abandoned the moment it cannot: ids the
+   * user has since removed resolve to nothing, and a list that names nobody
+   * would otherwise turn a routing typo into an outage.
+   */
+  private async nextAccount(
+    failover: NonNullable<QoderTransportOptions['failover']>,
+    currentId: string,
+    tried: ReadonlySet<string>,
+  ): Promise<{ id: string; pat: string } | undefined> {
+    const routing = this.routing
+    const resolve = failover.accountById
+    if (routing === undefined || resolve === undefined || routing.strategy() !== 'custom') {
+      return await failover.nextAccount(currentId)
     }
-    throw lastRejection
+    const order = routing.order()
+    if (order.length === 0) return await failover.nextAccount(currentId)
+    // Start just after the current account, so a walk that begins on the
+    // active account still visits the user's first choice before its own
+    // predecessor.
+    const start = order.indexOf(currentId)
+    for (let offset = 1; offset <= order.length; offset++) {
+      const id = order[(start + offset + order.length) % order.length]
+      if (id === undefined || tried.has(id)) continue
+      const account = await resolve(id)
+      if (account !== undefined) return account
+    }
+    return await failover.nextAccount(currentId)
+  }
+
+  /**
+   * The account a session should start on, or `undefined` when it should start
+   * over on the active account.
+   *
+   * A live pin is re-resolved through `accountById` whenever the host exposes
+   * it, so an account the user removed can never keep signing: the pin is
+   * dropped and the session starts over on the active account. Without that
+   * hook the credential captured when the session was pinned is the best
+   * available answer.
+   *
+   * When the pin has reached one of its bounds the session is moved to the next
+   * account in the walk order — reaching a bound means "change account", not
+   * "stop remembering one". Only a session that has nobody to move to stays
+   * where it is, with its counters restarted so the same bound is not examined
+   * and rejected on every following request.
+   */
+  private async pinnedAccount(sessionId: string | undefined): Promise<{ id: string; pat: string } | undefined> {
+    const policy = this.stickiness
+    if (sessionId === undefined || policy === undefined || !this.stickinessEnabled(policy)) return undefined
+    const pin = this.sessionPins.get(sessionId)
+    if (pin === undefined) return undefined
+    const resolve = this.failover?.accountById
+    if (resolve !== undefined) {
+      const account = await resolve(pin.id)
+      if (account === undefined) {
+        this.sessionPins.delete(sessionId)
+        return undefined
+      }
+      pin.pat = account.pat
+    }
+    if (this.pinExhausted(pin, policy)) {
+      const moved = await this.rotatePin(sessionId, pin)
+      if (moved !== undefined) return moved
+      // A pool of one, or a walk that has nobody after this account: the
+      // session cannot move, so restart its counters. Without this the bound
+      // would be re-examined and re-rejected on every request of the session.
+      pin.pinnedAtMs = this.now()
+      pin.rounds = 0
+      pin.requests = 0
+    }
+    // Re-inserting moves the pin to the young end of the eviction order.
+    this.sessionPins.delete(sessionId)
+    this.sessionPins.set(sessionId, pin)
+    return { id: pin.id, pat: pin.pat }
+  }
+
+  /**
+   * Whether one bound of the stickiness policy has been reached.
+   *
+   * The three bounds are independent and all are counts of work this account
+   * actually did, so the comparison is `>=`: with a round bound of 1, the
+   * account serves exactly one completed conversation and the next request
+   * moves on.
+   */
+  private pinExhausted(
+    pin: SessionPin,
+    policy: NonNullable<QoderTransportOptions['stickiness']>,
+  ): boolean {
+    const rounds = policy.rounds()
+    if (Number.isFinite(rounds) && rounds > 0 && pin.rounds >= Math.floor(rounds)) return true
+    const requests = policy.requests()
+    if (Number.isFinite(requests) && requests > 0 && pin.requests >= Math.floor(requests)) return true
+    const minutes = policy.minutes()
+    if (Number.isFinite(minutes) && minutes > 0 && this.now() - pin.pinnedAtMs >= minutes * 60_000) return true
+    return false
+  }
+
+  /**
+   * Move a session to the next account of the walk order, and pin it there.
+   *
+   * `nextAccount` is the host's own answer to "who comes after this one", so
+   * stickiness rotates through exactly the order routing and failover use —
+   * including a parked account being skipped. `undefined`, or the same account
+   * back again (a pool of one), means there is nowhere to go.
+   */
+  private async rotatePin(
+    sessionId: string,
+    pin: SessionPin,
+  ): Promise<{ id: string; pat: string } | undefined> {
+    const next = await this.failover?.nextAccount(pin.id)
+    if (next === undefined || next.id === pin.id) return undefined
+    this.pinSession(sessionId, next)
+    return { id: next.id, pat: next.pat }
+  }
+
+  /**
+   * Count one request against the account its session is pinned to.
+   *
+   * Called once per request, after the account has been chosen: counting at
+   * choice time would let a request that never signed anything (the walk ended
+   * before any attempt) spend the request bound of an account it never asked.
+   */
+  private noteRequest(sessionId: string | undefined, accountId: string): void {
+    if (sessionId === undefined) return
+    const pin = this.sessionPins.get(sessionId)
+    if (pin === undefined || pin.id !== accountId) return
+    pin.requests += 1
+  }
+
+  /**
+   * Count one completed conversation against the account that served it.
+   *
+   * Fired only when the stream finished normally, which is the definition of a
+   * round the host asked for: a request that failed, or that the caller stopped
+   * reading, did not produce an output, so it must not move the session on.
+   */
+  private completeRound(sessionId: string | undefined, accountId: string): void {
+    if (sessionId === undefined) return
+    const pin = this.sessionPins.get(sessionId)
+    if (pin === undefined || pin.id !== accountId) return
+    pin.rounds += 1
+  }
+
+  /**
+   * Record that a session now belongs to an account.
+   *
+   * Called both when a session first picks an account and when the walk moves
+   * it, so the pin always names an account this session actually reached. The
+   * counters start at zero: the account has served no completed round yet, and
+   * the request about to run is counted by `noteRequest`, not here.
+   * Insertion order is the eviction order, and the cap only ever costs the
+   * oldest session its stickiness.
+   */
+  private pinSession(sessionId: string | undefined, account: { id: string; pat: string }): void {
+    const policy = this.stickiness
+    if (sessionId === undefined || policy === undefined) return
+    if (!this.stickinessEnabled(policy)) return
+    // Only a session the table has not seen yet needs room. Re-pinning an
+    // existing one (the walk moves a session, then the next turn touches it
+    // again) must not evict anybody: the table would spend its whole cap
+    // throwing away the sessions it was asked to remember.
+    if (!this.sessionPins.has(sessionId)) {
+      while (this.sessionPins.size >= sessionPinCapacity) {
+        const oldest = this.sessionPins.keys().next()
+        if (oldest.done === true) break
+        this.sessionPins.delete(oldest.value)
+      }
+    }
+    this.sessionPins.delete(sessionId)
+    this.sessionPins.set(sessionId, {
+      id: account.id,
+      pat: account.pat,
+      pinnedAtMs: this.now(),
+      rounds: 0,
+      requests: 0,
+    })
+  }
+
+  /**
+   * Whether stickiness has any bound to honour at all.
+   *
+   * All three providers returning zero is how the host says "off", and off has
+   * to mean fully off: a pin written with no bound would never move on, which is
+   * the one outcome worse than having no stickiness.
+   */
+  private stickinessEnabled(policy: NonNullable<QoderTransportOptions['stickiness']>): boolean {
+    const minutes = policy.minutes()
+    const rounds = policy.rounds()
+    const requests = policy.requests()
+    return (Number.isFinite(minutes) && minutes > 0)
+      || (Number.isFinite(rounds) && rounds > 0)
+      || (Number.isFinite(requests) && requests > 0)
+  }
+
+  /** How many queue waits one attempt may spend. */
+  private queueWaitBudget(): number {
+    const policy = this.queueWait
+    if (policy === undefined) return 0
+    const attempts = policy.attempts()
+    return Number.isFinite(attempts) ? Math.max(0, Math.floor(attempts)) : 0
+  }
+
+  /**
+   * How long to wait out a queue answer, or `undefined` when the error is not a
+   * queue at all.
+   *
+   * The upstream's own advice wins over the configured fallback because it is
+   * computed from the queue it describes, but both are capped: a window long
+   * enough to outlive the caller's patience is a hang dressed up as a wait.
+   */
+  private queueWaitMs(error: unknown): number | undefined {
+    if (!(error instanceof QoderLlmError) || error.qoderQueue === undefined) return undefined
+    const advised = error.failure.providerRetryAfterMs
+    if (advised !== undefined && Number.isFinite(advised) && advised > 0) {
+      return Math.min(advised, queueWaitCeilingMs)
+    }
+    const seconds = this.queueWait?.seconds() ?? 0
+    if (!Number.isFinite(seconds) || seconds <= 0) return 0
+    return Math.min(seconds * 1000, queueWaitCeilingMs)
+  }
+
+  /**
+   * Sleep out an advised queue window, aborting with the request.
+   *
+   * The abort has to CLEAR the timer rather than race it: a plain timeout would
+   * hold the request open until its deadline even after the caller had given
+   * up.
+   */
+  private async waitOutQueue(waitMs: number, signal: AbortSignal | undefined): Promise<void> {
+    if (waitMs <= 0) return
+    const cancelled = (): QoderLlmError => aborted('Request was aborted while waiting out the upstream queue.')
+    if (signal?.aborted === true) throw cancelled()
+    await new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = (): void => {
+        if (timer !== undefined) clearTimeout(timer)
+        reject(cancelled())
+      }
+      timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, waitMs)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /**
+   * The pause between the two paced self-heal rounds.
+   *
+   * Extracted from the heal itself because both the wait and the queue wait
+   * above must behave the same way under an abort: `setTimeout` never fires for
+   * a request whose signal is already aborted, and it must not leave a pending
+   * promise behind either.
+   */
+  private async pauseBeforeNextHeal(options: GenerateOptions): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 2_000)
+      options.signal?.addEventListener('abort', () => {
+        clearTimeout(timer)
+        reject(aborted('Request was aborted during the re-auth backoff.'))
+      }, { once: true })
+    })
   }
 }

@@ -13,17 +13,25 @@ import {
   QODER_STATUS_PATH,
 } from '../status-paths.ts'
 import type {
+  QoderAccountHealth,
+  QoderAccountSummary,
+  QoderAuthAction,
+  QoderAuthRequest,
   QoderCredentialSource,
   QoderProbeAction,
   QoderVariantId,
+  QoderWebAccounts,
   QoderWebCatalog,
+  QoderWebCredits,
   QoderWebStatus,
+  QoderWebUpstreamNotice,
 } from '../status-paths.ts'
 import { isQoderWebStatus } from './status-document.ts'
 import {
   QdpButton,
   QdpIconButton,
   QdpInput,
+  QdpNumberField,
   QdpSegmented,
   QdpStateDot,
   QdpSwitch,
@@ -40,6 +48,7 @@ import {
   onQuotaSettingsChange,
   quotaReadout,
   quotaSignInState,
+  quotaStatus,
   setQuotaReadout,
 } from './quota-settings-store.ts'
 
@@ -132,6 +141,44 @@ const CHECK_IN_MINUTE_DEFAULT = 600
 const POLL_DEFAULT_MS = 300_000
 /** The face clamps the poll interval at one minute. */
 const POLL_MIN_MS = 60_000
+/**
+ * The card's own ceiling for the poll interval, in minutes.
+ *
+ * The host sets no upper bound (a poll is cheap), but a field with no ceiling
+ * invites a typo that parks the readout for a day; one day is the widest
+ * interval that can still be called a poll.
+ */
+const POLL_MINUTES_MAX = 1440
+
+/*
+ * The failover/routing policy defaults and bounds.
+ *
+ * They MIRROR the host Config's own validation. Clamping here is not
+ * cosmetic: the host refuses an out-of-range write, so a keystroke the field
+ * would reject must never leave the control showing a value the document does
+ * not hold. The defaults are what an older document — one written before these
+ * fields existed — means, so the controls render the behaviour that is actually
+ * in force rather than zeroed-out inputs.
+ */
+const QUEUE_WAIT_ATTEMPTS_DEFAULT = 0
+const QUEUE_WAIT_ATTEMPTS_MAX = 10
+const QUEUE_WAIT_SECONDS_DEFAULT = 30
+const QUEUE_WAIT_SECONDS_MIN = 1
+const QUEUE_WAIT_SECONDS_MAX = 300
+const STICKINESS_ROUNDS_DEFAULT = 1
+const STICKINESS_ROUNDS_MAX = 100
+const STICKINESS_REQUESTS_DEFAULT = 60
+const STICKINESS_REQUESTS_MAX = 10_000
+const STICKINESS_MINUTES_DEFAULT = 180
+const STICKINESS_MINUTES_MAX = 1440
+/** The routing strategies the host accepts; 'save-order' is the default. */
+type QoderRoutingStrategy = 'save-order' | 'custom'
+
+/** Clamp an integer field into the host's accepted range, ignoring junk input. */
+function clampInt(value: number, min: number, max: number): number | undefined {
+  if (!Number.isFinite(value)) return undefined
+  return Math.min(max, Math.max(min, Math.trunc(value)))
+}
 
 /**
  * Map the status document's state onto the local state-dot vocabulary.
@@ -163,6 +210,335 @@ function patSourceText(source: QoderCredentialSource, t: QoderPluginCardInjected
   if (source === 'env') return t('patSourceEnv')
   if (source === 'cli') return t('patSourceCli')
   return t('patSourceCard')
+}
+
+/**
+ * One pooled account's facts, in the same order the single-credential row used
+ * (source · saved · tail) plus the failover position.
+ *
+ * The position leads because it is the only thing that distinguishes two rows
+ * saved at the same moment, and because it is what the user is choosing between
+ * when they press 「切换使用」.
+ */
+function accountRowMeta(account: QoderAccountSummary, t: QoderPluginCardInjected['t']): string {
+  return [
+    t('accountSlot', { order: account.order }),
+    patSourceText(account.source, t),
+    account.savedAtMs === undefined ? null : t('patSavedAt', { time: formatTime(account.savedAtMs) }),
+    account.patTail === undefined ? null : t('patTail', { tail: `****${account.patTail}` }),
+  ].filter(part => part !== null).join(' · ')
+}
+
+/**
+ * One pooled account's own credit figure.
+ *
+ * The row follows the SAME summation rule as the card header (see
+ * `creditSummary`), because two currency rules over one credential is how a
+ * card ends up disagreeing with itself.
+ *
+ * A PARKED account reports no figure at all. It is excluded from the failover
+ * walk and from the composer panel's totals, so printing a spendable-looking
+ * number beside it would promise a balance this list will never route through;
+ * saying why is more honest than an em dash that reads as a failed read.
+ */
+function accountRowCredits(
+  account: Pick<QoderAccountSummary, 'enabled' | 'credits' | 'creditsError'>,
+  t: QoderPluginCardInjected['t'],
+): string {
+  if (account.enabled === false) return t('accountCreditsParked')
+  if (account.credits === undefined) {
+    return account.creditsError === undefined
+      ? t('accountCreditsUnknown')
+      : t('creditsError', { message: account.creditsError })
+  }
+  const summary = creditSummary(account.credits)
+  return t('accountCreditsValue', {
+    value: summary.unlimited ? t('quotaUnlimited') : new Intl.NumberFormat(undefined).format(summary.remain),
+  })
+}
+
+/**
+ * One account's observed service state, as the user-facing word for it.
+ *
+ * 限流 is the upstream's own term for an account that only ever answers with a
+ * per-model queue, so the label states the condition the host actually
+ * recorded instead of guessing at a cause.
+ */
+export function accountHealthLabel(health: QoderAccountHealth, t: QoderPluginCardInjected['t']): string {
+  if (health === 'queued') return t('accountHealthQueued')
+  if (health === 'limited') return t('accountHealthLimited')
+  return t('accountHealthNormal')
+}
+
+/** One saved account as the routing list needs it: identity, name, owner. */
+interface RoutingAccount {
+  readonly id: string
+  /** The upstream's subscriber name, or `''` when the host had none. */
+  readonly name: string
+  /** The save order, used as the row's name when the upstream named nobody. */
+  readonly order: number
+  readonly variant: 'cn' | 'global'
+  /**
+   * The seat's balance and observed state, carried here so the routing list can
+   * answer "which of these is worth putting first" without a second document.
+   *
+   * These are the same fields the account list reads; they ride this projection
+   * because the two lists are two views of one pool, and a pool row that showed
+   * a balance in one view and nothing in the other would read as a bug.
+   */
+  readonly credits?: QoderWebCredits
+  readonly creditsError?: string
+  readonly health?: QoderAccountHealth
+  readonly enabled?: boolean
+}
+
+/** The facts the mixed-variant routing warning compares, across both variants. */
+interface RoutingFacts {
+  readonly accounts: readonly RoutingAccount[]
+  /** The model ids each variant OFFERS: its catalogue minus its blacklist. */
+  readonly cnServed: readonly string[]
+  readonly globalServed: readonly string[]
+  /** Every model id each variant's catalogue declares, offered or not. */
+  readonly cnCatalog: readonly string[]
+  readonly globalCatalog: readonly string[]
+}
+
+/**
+ * The two variants' routing facts as one stable string.
+ *
+ * The warning compares facts that live in two documents — this card's variant
+ * and whatever the shared store last saw of the other one — and
+ * `useSyncExternalStore` requires a snapshot that is reference-stable between
+ * renders (see {@link settingsKeyOf}). JSON is stable by construction; it is
+ * parsed back into {@link RoutingFacts} and cached by that string, so a render
+ * reads the same object until the store actually changes.
+ */
+function routingKeyOf(): string {
+  const project = (variantId: 'qoder' | 'qoder-global'): unknown => {
+    // A signed-out document has no pool and no catalog, so there is nothing to
+    // compare. Narrowing here is what keeps a missing pool from being read as
+    // "the user changed something" on every render.
+    const doc = quotaStatus(variantId)
+    const signedIn = doc?.status === 'signed-in' ? doc : undefined
+    /*
+     * Every read here is defensive, because this runs inside a
+     * `useSyncExternalStore` snapshot: a hostile or half-written document must
+     * degrade to "nothing to compare", not throw. A throw in the snapshot takes
+     * the entire card down — the user would lose the sign-in controls over a
+     * malformed pool they cannot even see — so a bad shape is flattened here
+     * rather than surfaced.
+     */
+    const entries = Array.isArray(signedIn?.accounts?.entries) ? signedIn.accounts.entries : []
+    const disabled = Array.isArray(signedIn?.disabledModels) ? signedIn.disabledModels : []
+    const catalog = Array.isArray(signedIn?.models) ? signedIn.models : []
+    const ids = catalog
+      .map(model => (typeof model?.id === 'string' ? model.id : ''))
+      .filter(id => id !== '')
+    return [
+      entries
+        .filter(entry => typeof entry === 'object' && entry !== null)
+        .map(entry => [
+          entry.id,
+          entry.accountName ?? '',
+          entry.order,
+          entry.credits ?? null,
+          entry.creditsError ?? null,
+          entry.health ?? null,
+          entry.enabled ?? null,
+        ]),
+      ids.filter(id => !disabled.includes(id)),
+      ids,
+    ]
+  }
+  return JSON.stringify([project('qoder'), project('qoder-global')])
+}
+
+let routingCacheKey: string | undefined
+let routingCacheFacts: RoutingFacts | undefined
+
+/** The parsed facts behind {@link routingKeyOf}, rebuilt only when it changes. */
+function routingFacts(): RoutingFacts {
+  const key = routingKeyOf()
+  if (key !== routingCacheKey || routingCacheFacts === undefined) {
+    routingCacheKey = key
+    routingCacheFacts = parseRoutingFacts(key)
+  }
+  return routingCacheFacts
+}
+
+function readRoutingIds(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+}
+
+function readRoutingAccounts(value: unknown, variant: 'cn' | 'global'): readonly RoutingAccount[] {
+  if (!Array.isArray(value)) return []
+  const accounts: RoutingAccount[] = []
+  for (const item of value) {
+    if (!Array.isArray(item)) continue
+    const [id, name, order, credits, creditsError, health, enabled] =
+      item as unknown as readonly [unknown, unknown, unknown, unknown, unknown, unknown, unknown]
+    if (typeof id !== 'string' || id === '') continue
+    accounts.push({
+      id,
+      name: typeof name === 'string' ? name : '',
+      order: typeof order === 'number' ? order : accounts.length + 1,
+      variant,
+      ...typeof credits === 'object' && credits !== null ? { credits: credits as QoderWebCredits } : {},
+      ...typeof creditsError === 'string' ? { creditsError } : {},
+      ...health === 'normal' || health === 'queued' || health === 'limited' ? { health } : {},
+      ...typeof enabled === 'boolean' ? { enabled } : {},
+    })
+  }
+  return accounts
+}
+
+function parseRoutingFacts(raw: string): RoutingFacts {
+  const empty: RoutingFacts = {
+    accounts: [],
+    cnServed: [],
+    globalServed: [],
+    cnCatalog: [],
+    globalCatalog: [],
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length < 2) return empty
+    const cn = parsed[0] as readonly [unknown, unknown, unknown]
+    const global = parsed[1] as readonly [unknown, unknown, unknown]
+    return {
+      accounts: [...readRoutingAccounts(cn[0], 'cn'), ...readRoutingAccounts(global[0], 'global')],
+      cnServed: readRoutingIds(cn[1]),
+      cnCatalog: readRoutingIds(cn[2]),
+      globalServed: readRoutingIds(global[1]),
+      globalCatalog: readRoutingIds(global[2]),
+    }
+  } catch {
+    return empty
+  }
+}
+
+/**
+ * The models that make a mixed order unsafe: ones a variant offers while the
+ * OTHER variant's catalogue does not declare them at all.
+ *
+ * A side whose catalogue the store has never seen contributes no offenders —
+ * an empty catalogue would make every model look one-sided, and a warning that
+ * cannot name a single model is worse than no warning.
+ */
+function mixedRoutingOffenders(facts: RoutingFacts): { cn: readonly string[]; global: readonly string[] } {
+  const globalCatalog = new Set(facts.globalCatalog)
+  const cnCatalog = new Set(facts.cnCatalog)
+  return {
+    cn: facts.globalCatalog.length === 0 ? [] : facts.cnServed.filter(id => !globalCatalog.has(id)),
+    global: facts.cnCatalog.length === 0 ? [] : facts.globalServed.filter(id => !cnCatalog.has(id)),
+  }
+}
+
+/**
+ * The order the routing list shows: what the user chose, then every account
+ * they have not placed yet, in save order.
+ *
+ * The fallback is load-bearing. The stored order is only ever the user's own
+ * list, so an account saved AFTER that list was written would otherwise vanish
+ * from the very controls meant to order it — and a list that silently drops a
+ * member is worse than one that appends it.
+ */
+function mergeRoutingOrder(chosen: readonly string[], saveOrder: readonly string[]): readonly string[] {
+  const known = new Set(saveOrder)
+  const placed: string[] = []
+  for (const id of chosen) {
+    if (known.has(id) && !placed.includes(id)) placed.push(id)
+  }
+  return [...placed, ...saveOrder.filter(id => !placed.includes(id))]
+}
+
+/**
+ * POST one auth action and report whether the host accepted it.
+ *
+ * Every auth action answers the same shape — `{ ok: true }`, or
+ * `{ ok: false, error }` / a 5xx — so the transport is shared and a refused id
+ * stays a VERDICT rather than a transport failure. Callers re-read the document
+ * afterwards instead of trusting the reply to describe the new state.
+ */
+async function postAuthAction(
+  path: string,
+  key: string,
+  body: QoderAuthRequest,
+  signal: AbortSignal,
+): Promise<{ ok: boolean; detail: string }> {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Qoder-Auth-Key': key },
+    credentials: 'same-origin',
+    signal,
+    body: JSON.stringify(body),
+  })
+  const value: unknown = await response.json().catch(() => undefined)
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  if (response.ok && record['ok'] === true) return { ok: true, detail: '' }
+  return {
+    ok: false,
+    detail: typeof record['error'] === 'string' ? record['error'] : `HTTP ${response.status}`,
+  }
+}
+
+/**
+ * The upstream "model not serviceable" notice.
+ *
+ * This is deliberately NOT an error alert. A saturated per-model queue (or a
+ * service that is switched off) resolves by waiting, and the one action a user
+ * must not take is re-generating a perfectly good PAT — the old rendering put
+ * this text where credential errors go and users reasonably concluded their
+ * token was broken. So the block carries the upstream's own words for the user
+ * to quote, states a retry delay only when the upstream supplied one, claims a
+ * wait ONLY when `waited` records that one actually happened, and says outright
+ * that the credential is not the problem.
+ */
+function UpstreamNoticeBlock({ notice, t }: {
+  notice: QoderWebUpstreamNotice
+  t: QoderPluginCardInjected['t']
+}): ReactNode {
+  // Milliseconds are the wire unit; a countdown the user reads is seconds, and
+  // rounding a sub-second ask down to 0 would read as "retry now". Only a
+  // FINITE number becomes a countdown: a document carrying a string (or NaN)
+  // would otherwise paint "NaN s", and a missing `at` would throw out of
+  // `Intl.DateTimeFormat` and take the whole page down with it.
+  const retrySeconds = typeof notice.retryAfterMs === 'number' && Number.isFinite(notice.retryAfterMs)
+    ? Math.max(1, Math.round(notice.retryAfterMs / 1000))
+    : undefined
+  const at = typeof notice.at === 'number' && Number.isFinite(notice.at) ? notice.at : undefined
+  const occurrences = typeof notice.occurrences === 'number' && Number.isFinite(notice.occurrences)
+    ? notice.occurrences
+    : 1
+  return (
+    <div className="qdp-notice" role="status" data-notice-kind={notice.kind}>
+      <div className="qdp-noticeHead">
+        <QdpTag tone="warn">
+          {notice.kind === 'queued' ? t('upstreamNoticeKindQueued') : t('upstreamNoticeKindUnavailable')}
+        </QdpTag>
+        <span className="qdp-noticeTitle">{t('upstreamNoticeHeading')}</span>
+        {at === undefined ? null : <span className="qdp-noticeAt">{t('upstreamNoticeAt', { time: formatTime(at) })}</span>}
+      </div>
+      {notice.upstreamMessage === undefined ? null : (
+        <p className="qdp-noticeQuote">{t('upstreamNoticeMessage', { message: notice.upstreamMessage })}</p>
+      )}
+      {notice.waited
+        ? (
+          <p className="qdp-body">
+            {retrySeconds === undefined
+              ? t('upstreamNoticeWaitedNoDelay')
+              : t('upstreamNoticeWaited', { seconds: retrySeconds })}
+          </p>
+        )
+        : (retrySeconds === undefined ? null : <p className="qdp-body">{t('upstreamNoticeRetry', { seconds: retrySeconds })}</p>)}
+      <p className="qdp-body">{t('upstreamNoticeNotAuth')}</p>
+      <p className="qdp-caption">
+        {occurrences > 1
+          ? `${t('upstreamNoticeAdvice')} · ${t('upstreamNoticeRecurrence', { count: occurrences })}`
+          : t('upstreamNoticeAdvice')}
+      </p>
+    </div>
+  )
 }
 
 /**
@@ -286,6 +662,18 @@ interface CheckInSettings {
   variantGlobal: boolean
   status: 'loading' | 'ready' | 'unavailable'
   writable: boolean
+  /** Whether a connection failure may walk on to the next account. */
+  autoFailoverEnabled: boolean
+  queueWaitAttempts: number
+  queueWaitSeconds: number
+  routingStrategy: QoderRoutingStrategy
+  /** The user's own priority list, account ids, highest priority first. */
+  routingOrder: readonly string[]
+  stickinessRounds: number
+  stickinessRequests: number
+  stickinessMinutes: number
+  /** The last write the host refused, or '' when the last one landed. */
+  writeError: string
 }
 
 const UNAVAILABLE_SETTINGS: CheckInSettings = {
@@ -297,6 +685,15 @@ const UNAVAILABLE_SETTINGS: CheckInSettings = {
   variantGlobal: true,
   status: 'unavailable',
   writable: false,
+  autoFailoverEnabled: true,
+  queueWaitAttempts: QUEUE_WAIT_ATTEMPTS_DEFAULT,
+  queueWaitSeconds: QUEUE_WAIT_SECONDS_DEFAULT,
+  routingStrategy: 'save-order',
+  routingOrder: [],
+  stickinessRounds: STICKINESS_ROUNDS_DEFAULT,
+  stickinessRequests: STICKINESS_REQUESTS_DEFAULT,
+  stickinessMinutes: STICKINESS_MINUTES_DEFAULT,
+  writeError: '',
 }
 
 /**
@@ -325,6 +722,22 @@ function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): str
     typeof value.quotaPollMs === 'number' ? value.quotaPollMs : POLL_DEFAULT_MS,
     value.variantEnabledCN !== false,
     value.variantEnabledGlobal !== false,
+    // The failover/routing policy. `routingOrder` is compared by VALUE: the
+    // face hands back a fresh array per document, and a reference comparison
+    // would re-render the card on every read.
+    value.autoFailoverEnabled !== false,
+    typeof value.queueWaitAttempts === 'number' ? value.queueWaitAttempts : QUEUE_WAIT_ATTEMPTS_DEFAULT,
+    typeof value.queueWaitSeconds === 'number' ? value.queueWaitSeconds : QUEUE_WAIT_SECONDS_DEFAULT,
+    value.routingStrategy === 'custom' ? 'custom' : 'save-order',
+    Array.isArray(value.routingOrder) ? value.routingOrder : [],
+    typeof value.stickinessRounds === 'number' ? value.stickinessRounds : STICKINESS_ROUNDS_DEFAULT,
+    typeof value.stickinessMinutes === 'number' ? value.stickinessMinutes : STICKINESS_MINUTES_DEFAULT,
+    // Appended rather than inserted: the tuple is positional, and a new field in
+    // the middle would silently re-label every field after it.
+    typeof value.stickinessRequests === 'number' ? value.stickinessRequests : STICKINESS_REQUESTS_DEFAULT,
+    // The last refusal, so a control that did not take says so. Appended for
+    // the same positional reason as the field above.
+    snapshot.error ?? '',
   ])
 }
 
@@ -338,6 +751,9 @@ function parseSettingsKey(raw: string): CheckInSettings {
     const minute = typeof parsed[2] === 'number' ? parsed[2] : CHECK_IN_MINUTE_DEFAULT
     const status = parsed[3] === 'ready' || parsed[3] === 'loading' ? parsed[3] : 'unavailable'
     const pollMs = typeof parsed[5] === 'number' ? parsed[5] : POLL_DEFAULT_MS
+    const routingOrder = Array.isArray(parsed[12])
+      ? parsed[12].filter((id): id is string => typeof id === 'string')
+      : []
     return {
       autoCN,
       autoGlobal,
@@ -347,6 +763,15 @@ function parseSettingsKey(raw: string): CheckInSettings {
       variantGlobal: parsed[7] !== false,
       status,
       writable: parsed[4] === true,
+      autoFailoverEnabled: parsed[8] !== false,
+      queueWaitAttempts: typeof parsed[9] === 'number' ? parsed[9] : QUEUE_WAIT_ATTEMPTS_DEFAULT,
+      queueWaitSeconds: typeof parsed[10] === 'number' ? parsed[10] : QUEUE_WAIT_SECONDS_DEFAULT,
+      routingStrategy: parsed[11] === 'custom' ? 'custom' : 'save-order',
+      routingOrder,
+      stickinessRounds: typeof parsed[13] === 'number' ? parsed[13] : STICKINESS_ROUNDS_DEFAULT,
+      stickinessMinutes: typeof parsed[14] === 'number' ? parsed[14] : STICKINESS_MINUTES_DEFAULT,
+      stickinessRequests: typeof parsed[15] === 'number' ? parsed[15] : STICKINESS_REQUESTS_DEFAULT,
+      writeError: typeof parsed[16] === 'string' ? parsed[16] : '',
     }
   } catch {
     return UNAVAILABLE_SETTINGS
@@ -371,6 +796,135 @@ function parseSettingsKey(raw: string): CheckInSettings {
  * model preferences for an account nobody is signed into would be settings the
  * user cannot exercise yet.
  */
+/**
+ * The custom routing order, top to bottom.
+ *
+ * The list is what the failover walk follows, so a row's position is its
+ * priority and the only two edits are 「上移 / 下移」. Both ends are disabled
+ * rather than hidden: the buttons stay where the eye left them, and a disabled
+ * up-arrow on the first row IS the statement that it is already first.
+ */
+function RoutingOrderList(props: {
+  ids: readonly string[]
+  nameOf: (id: string) => string
+  variantOf: (id: string) => 'cn' | 'global' | undefined
+  accountOf: (id: string) => RoutingAccount | undefined
+  disabled: boolean
+  t: QoderPluginCardInjected['t']
+  onMove: (from: number, to: number) => void
+}): ReactNode {
+  const { ids, nameOf, variantOf, accountOf, disabled, t, onMove } = props
+  if (ids.length === 0) return <p className="qdp-caption">{t('routingOrderMissing')}</p>
+  return (
+    <ol className="qdp-routingList">
+      {ids.map((id, index) => {
+        const name = nameOf(id)
+        const side = variantOf(id)
+        const account = accountOf(id)
+        /*
+         * Balance and state follow the name, exactly as they do in the account
+         * list above. A row's position in this list is a routing decision, and
+         * the two facts that make that decision are what the seat still has and
+         * whether it is currently serving — showing them here is what turns the
+         * order from a list of names into a list of choices.
+         *
+         * A seat the host has no figure for shows the same words the account
+         * list uses (`accountCreditsUnknown` / the read's own error), so the
+         * two views never disagree about a seat.
+         */
+        const creditsText = account === undefined ? undefined : accountRowCredits(account, t)
+        /*
+         * Same rule as the account list: an enabled seat the plugin has not
+         * observed reads as 正常 (nothing has failed), and a parked seat shows
+         * no service state at all — it is out of the walk, so calling it
+         * healthy would be a promise this list will not keep.
+         */
+        const health = account === undefined || account.enabled === false
+          ? undefined
+          : (account.health ?? 'normal')
+        return (
+          <li className="qdp-routingItem" key={id} data-account-id={id}>
+            {/* Name and balance share one growing cell so the balance sits
+                right after the name instead of being pushed to the far edge by
+                the action buttons. */}
+            <span className="qdp-routingWho">
+              <span className="qdp-routingName">{name}</span>
+              {creditsText === undefined ? null : (
+                <span className="qdp-routingCredits">{creditsText}</span>
+              )}
+            </span>
+            {health === undefined ? null : (
+              <QdpTag tone={health === 'normal' ? 'success' : 'warn'}>
+                {accountHealthLabel(health, t)}
+              </QdpTag>
+            )}
+            {side === undefined ? null : (
+              <QdpTag tone="neutral">{side === 'cn' ? t('variantTabCN') : t('variantTabGlobal')}</QdpTag>
+            )}
+            {account?.enabled === false ? <QdpTag tone="neutral">{t('accountParked')}</QdpTag> : null}
+            <span className="qdp-routingItemActions">
+              <QdpButton
+                variant="outline"
+                size="sm"
+                disabled={disabled || index === 0}
+                aria-label={t('routingOrderMoveUpAria', { name })}
+                onClick={() => { onMove(index, index - 1) }}
+              >
+                {t('routingOrderMoveUp')}
+              </QdpButton>
+              <QdpButton
+                variant="outline"
+                size="sm"
+                disabled={disabled || index === ids.length - 1}
+                aria-label={t('routingOrderMoveDownAria', { name })}
+                onClick={() => { onMove(index, index + 1) }}
+              >
+                {t('routingOrderMoveDown')}
+              </QdpButton>
+            </span>
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
+/**
+ * The mixed-variant routing warning.
+ *
+ * A custom order that interleaves the two variants can send a request to a
+ * variant that does not offer the model at all. This is stated as a fact, not a
+ * gate: the user asked for the order and the walk skips accounts that cannot
+ * serve the model anyway, so the banner exists to explain what will happen —
+ * never to hold the write back or to ask for an acknowledgement.
+ */
+function MixedRoutingWarning(props: {
+  offendersCN: readonly string[]
+  offendersGlobal: readonly string[]
+  t: QoderPluginCardInjected['t']
+}): ReactNode {
+  const { offendersCN, offendersGlobal, t } = props
+  return (
+    <div className="qdp-alert qdp-routingWarning" role="alert">
+      <span className="qdp-routingWarningTitle">{t('routingMixedHeading')}</span>
+      <span>{t('routingMixedBody')}</span>
+      {offendersCN.length + offendersGlobal.length === 0 ? null : (
+        <span>
+          {t('routingMixedOffenders')}
+          <span className="qdp-routingOffenders">
+            {offendersCN.length === 0
+              ? null
+              : <span>{t('routingMixedOffenderCN', { models: offendersCN.join('、') })}</span>}
+            {offendersGlobal.length === 0
+              ? null
+              : <span>{t('routingMixedOffenderGlobal', { models: offendersGlobal.join('、') })}</span>}
+          </span>
+        </span>
+      )}
+    </div>
+  )
+}
+
 /** 14px stroke refresh glyph, so the icon-button matches the host's icon set. */
 function RefreshGlyph(): ReactNode {
   return (
@@ -400,12 +954,30 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    * requires.
    */
   const readout = useSyncExternalStore(onQuotaSettingsChange, quotaReadout)
+  /**
+   * Both variants' account pools and catalogues, as a stable snapshot.
+   *
+   * The custom routing order spans BOTH variants, so the warning that guards a
+   * mixed order has to read the other variant's document too — not just the one
+   * this card is showing. It comes from the shared store rather than a fetch:
+   * the card never asks the host for a variant the user is not looking at.
+   */
+  const routing = useSyncExternalStore(onQuotaSettingsChange, routingFacts)
   /** The check-in half of the settings face, as a stable projection string. */
   const settingsSubscribe = useCallback((onStoreChange: () => void) => {
     return scope?.subscribe(onStoreChange) ?? (() => {})
   }, [scope])
   const settingsRaw = useSyncExternalStore(settingsSubscribe, () => settingsKeyOf(scope))
   const settings = parseSettingsKey(settingsRaw)
+  /*
+   * Ask the face for its document once, on mount, when it has not answered yet.
+   *
+   * The browser half can activate before the host route is registered, and a
+   * page that came up in that window used to stay on its defaults — every
+   * control enabled and inert — for the life of the tab. This is a no-op when
+   * the document is already loaded or a read is in flight.
+   */
+  useEffect(() => { scope?.ensureLoaded?.() }, [scope])
 
   const [activeVariantId, setActiveVariantId] = useState<QoderVariantId>('qoder')
   const currentVariant = isUnified
@@ -425,7 +997,30 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const [checkInNotice, setCheckInNotice] = useState<string>()
   /** 「删除 PAT」的内联确认：点一次进入确认，再点一次才真正清除。 */
   const [confirmingClear, setConfirmingClear] = useState(false)
-  /** The model pane's batched save: its own busy flag, separate from a refresh. */
+  /**
+   * The account-pool actions: one busy flag for switch/remove, the id whose
+   * row is asking for a remove confirmation, and one message pair.
+   *
+   * `accountError` is deliberately NOT `patError`: the PAT entry can be closed
+   * when a row action fails, and an error parked inside a hidden box is an
+   * error the user never sees.
+   */
+  const [accountBusy, setAccountBusy] = useState(false)
+  const [confirmingRemoveId, setConfirmingRemoveId] = useState<string>()
+  const [accountError, setAccountError] = useState<string>()
+  const [accountNotice, setAccountNotice] = useState<string>()
+  /**
+   * The ids with an in-flight park/unpark write.
+   *
+   * A SET, not one flag: parking two seats is two independent writes to two
+   * accounts, and a single shared busy flag would make the second click a
+   * silent no-op. It is separate from `accountBusy` (switch/remove) because the
+   * two gestures touch different rows and must not block each other.
+   */
+  const [togglingIds, setTogglingIds] = useState<readonly string[]>([])
+  /**
+   * The model pane's batched save: its own busy flag, separate from a refresh.
+   */
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaveError, setModelsSaveError] = useState<string>()
   const mounted = useRef(true)
@@ -493,6 +1088,12 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     setReplacing(false)
     setPatError(undefined)
     setPatNotice(undefined)
+    // Pool state is per-variant: CN and Global keep separate account lists, so a
+    // switch must not leave the other product's confirmation, refusal, or armed
+    // remove-confirm sitting under the new variant's rows.
+    setAccountError(undefined)
+    setAccountNotice(undefined)
+    setConfirmingRemoveId(undefined)
     setConfirmingClear(false)
     setCheckInNotice(undefined)
     setCheckInNotice(undefined)
@@ -851,6 +1452,100 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   }, [authKey, currentVariant.authPath, patBusy, refresh, t, trackController])
 
   /**
+   * 「切换使用」/「删除账号」: the two pool writes, addressed by the account id
+   * the status document handed us.
+   *
+   * The id is the credential's one-way hash, never the token, so a card can
+   * only ever name an account the host already told it about and the host
+   * re-checks it against the pool it owns. The route answers the same shape as
+   * save/clear (`{ ok: true }`, or `{ ok: false, error }` / a 5xx), and a
+   * refused id is a verdict rather than a transport failure — so it is reported
+   * and the pool is re-read, because an unknown id means another surface
+   * changed the list under this card.
+   *
+   * A successful write is not trusted to describe itself: `refresh` re-reads
+   * the document, which is what makes the active dot, the summary strip, and
+   * the credit figure all move together.
+   */
+  const accountAction = useCallback(async (
+    action: Extract<QoderAuthAction, 'activate-account' | 'remove-account'>,
+    accountId: string,
+    name: string,
+  ): Promise<void> => {
+    const key = authKey
+    if (key === undefined || accountBusy) return
+    setAccountBusy(true)
+    setAccountError(undefined)
+    setAccountNotice(undefined)
+    setConfirmingRemoveId(undefined)
+    const controller = trackController()
+    try {
+      const body: QoderAuthRequest = { action, accountId }
+      const result = await postAuthAction(currentVariant.authPath, key, body, controller.signal)
+      if (!result.ok) {
+        setAccountError(t('accountActionFailed', { message: result.detail }))
+      } else {
+        setAccountNotice(action === 'activate-account' ? t('accountSwitched', { name }) : t('accountRemoved'))
+      }
+      await refresh(controller.signal)
+    } catch (error: unknown) {
+      if (mounted.current && controller.signal.aborted !== true) {
+        setAccountError(t('accountActionFailed', {
+          message: error instanceof Error ? error.message : t('requestFailed'),
+        }))
+      }
+    } finally {
+      manualControllers.current.delete(controller)
+      if (mounted.current) setAccountBusy(false)
+    }
+  }, [accountBusy, authKey, currentVariant.authPath, refresh, t, trackController])
+
+  /**
+   * Park or unpark one pooled account.
+   *
+   * The checkbox is bound to the DOCUMENT (`enabled !== false`), never to an
+   * optimistic local copy. Flipping it in state would show a value the host may
+   * refuse, and the row's own re-read would then snap it back — a flicker users
+   * read as a lost click. So the row reports itself busy and the value moves
+   * only when the document says it did; a refusal keeps the previous value and
+   * surfaces the host's reason in the shared account error line.
+   *
+   * Pending state is per account (see `togglingIds`), so one seat's write never
+   * freezes another's checkbox.
+   */
+  const accountToggle = useCallback(async (
+    accountId: string,
+    enabled: boolean,
+    name: string,
+  ): Promise<void> => {
+    const key = authKey
+    if (key === undefined || togglingIds.includes(accountId)) return
+    setTogglingIds(ids => [...ids, accountId])
+    setAccountError(undefined)
+    setAccountNotice(undefined)
+    const controller = trackController()
+    try {
+      const body: QoderAuthRequest = { action: 'set-account-enabled', accountId, enabled }
+      const result = await postAuthAction(currentVariant.authPath, key, body, controller.signal)
+      if (!result.ok) {
+        setAccountError(t('accountActionFailed', { message: result.detail }))
+      } else {
+        setAccountNotice(enabled ? t('accountEnabledNotice', { name }) : t('accountParkedNotice', { name }))
+      }
+      await refresh(controller.signal)
+    } catch (error: unknown) {
+      if (mounted.current && controller.signal.aborted !== true) {
+        setAccountError(t('accountActionFailed', {
+          message: error instanceof Error ? error.message : t('requestFailed'),
+        }))
+      }
+    } finally {
+      manualControllers.current.delete(controller)
+      if (mounted.current) setTogglingIds(ids => ids.filter(id => id !== accountId))
+    }
+  }, [authKey, currentVariant.authPath, refresh, t, togglingIds, trackController])
+
+  /**
    * The inline PAT entry: a password field plus save (and cancel while
    * replacing). The save control beside the field is the retry: an invalid PAT
    * is a value problem, not a transport one.
@@ -980,6 +1675,17 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     void scope.set(field, value)
   }
   /**
+   * Write a field whose value is not a boolean or number.
+   *
+   * Kept separate from {@link writeSetting} so the scalar path above can never
+   * be handed an array by mistake — a routing order posted through it would be
+   * silently dropped by the host's own typing.
+   */
+  const writeStructuredSetting = (field: keyof QuotaSection, value: string | readonly string[]): void => {
+    if (settings.status === 'unavailable' || scope === undefined) return
+    void scope.set(field, value)
+  }
+  /**
    * The automatic check-in controls write the same fields the advanced card
    * always wrote; a variant with no PAT cannot arm a timer it could never fire,
    * so the switch stays disabled until that variant signs in.
@@ -1026,6 +1732,85 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     writeSetting('quotaPollMs', Math.max(POLL_MIN_MS, minutes * 60_000))
   }
 
+  // ── routing policy ────────────────────────────────────────────────────
+  /**
+   * The routing controls write the host's OWN failover fields, so a settings
+   * face that does not serve them gets no controls at all — a switch whose
+   * value the host drops is a lie the user would only discover after a
+   * failover went the wrong way.
+   */
+  const routingWritable = settings.status !== 'unavailable' && scope !== undefined
+  /**
+   * Whether the settings face has actually answered.
+   *
+   * While it is still loading the card renders the schema defaults, so every
+   * control looks live but a write would be dropped (there is no document to
+   * authorize it). Such controls are disabled instead of silently inert: a
+   * control that accepts a click and forgets it is the exact failure this
+   * state exists to prevent.
+   */
+  const settingsReady = settings.status === 'ready'
+  const routingStrategy = settings.routingStrategy
+  const routingStoredOrder = settings.routingOrder
+  const routingNameOf = (id: string): string => {
+    const account = routing.accounts.find(entry => entry.id === id)
+    if (account === undefined) return id
+    return account.name === '' ? t('accountSlot', { order: account.order }) : account.name
+  }
+  const routingVariantOf = (id: string): 'cn' | 'global' | undefined =>
+    routing.accounts.find(entry => entry.id === id)?.variant
+  /** Every variant holding this id: one token saved to both counts as both. */
+  const routingSidesOf = (id: string): readonly ('cn' | 'global')[] => {
+    const sides: ('cn' | 'global')[] = []
+    if (routing.accounts.some(entry => entry.id === id && entry.variant === 'cn')) sides.push('cn')
+    if (routing.accounts.some(entry => entry.id === id && entry.variant === 'global')) sides.push('global')
+    return sides
+  }
+  const routingSaveOrder = routing.accounts.map(entry => entry.id)
+  const routingOrderIds = mergeRoutingOrder(routingStoredOrder, routingSaveOrder)
+  /*
+   * The warning is scoped to a CUSTOM order on purpose.
+   *
+   * A pool that spans both variants is the normal state for anyone with
+   * accounts on both sides, and under save order the user never authored that
+   * interleaving — it is just the order the tokens were saved in. Warning about
+   * it would put a banner on the ordinary pool that names models and offers no
+   * change to make, which is the noise this card avoids elsewhere. What the
+   * warning has to catch is the order the user is BUILDING here: that one can
+   * hand a request to the variant that does not serve the model, and it is
+   * exactly the order this control is about to write.
+   */
+  const routingMixed = routingStrategy === 'custom' && new Set(routingOrderIds.flatMap(routingSidesOf)).size > 1
+  const routingOffenders = routingMixed ? mixedRoutingOffenders(routing) : { cn: [], global: [] }
+  /**
+   * Apply a routing change.
+   *
+   * The mixed-variant banner is informational: the order the user builds is
+   * written straight through, because the walk simply skips an account whose
+   * variant does not serve the model. Nothing here may hold a write back — the
+   * user has already been told what the interleaving costs.
+   */
+  const applyRouting = (
+    next: { strategy: 'save-order' | 'custom'; order: readonly string[] },
+  ): void => {
+    if (!routingWritable) return
+    if (next.strategy !== settings.routingStrategy) writeStructuredSetting('routingStrategy', next.strategy)
+    if (next.order.join('\u0000') !== routingStoredOrder.join('\u0000')) {
+      writeStructuredSetting('routingOrder', [...next.order])
+    }
+  }
+  const moveRoutingAccount = (from: number, to: number): void => {
+    const ids = [...routingOrderIds]
+    if (from < 0 || from >= ids.length || to < 0 || to >= ids.length) return
+    const moved = ids.splice(from, 1)[0]
+    if (moved === undefined) return
+    ids.splice(to, 0, moved)
+    applyRouting({ strategy: 'custom', order: ids })
+  }
+  const chooseRoutingStrategy = (next: 'save-order' | 'custom'): void => {
+    applyRouting({ strategy: next, order: routingOrderIds })
+  }
+
   // ── check-in strip data ───────────────────────────────────────────────
   const checkIn = signedInDoc?.checkIn
   /**
@@ -1070,6 +1855,32 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     ].filter(part => part !== null).join(' · ')
   const signedOutStatus = status?.status === 'signed-out' ? status : undefined
   const patEntryOpen = replacing || signedOutStatus !== undefined
+  /**
+   * The account pool, when the host serves one.
+   *
+   * `accounts` is present even with a single account (`entries.length === 1`),
+   * and the list below renders from it alone — a synthesized one-row shape
+   * would be a second code path that only ever shows one row. An EMPTY pool is
+   * treated as absent on purpose: `accounts()` omits an env-only credential by
+   * design, and that credential still needs the single-credential row to
+   * describe it.
+   */
+  const servedAccounts = signedInDoc?.accounts
+  /**
+   * Rows whose `id` is missing are dropped rather than rendered.
+   *
+   * The id IS the write key (`{action, accountId}`) and the row's React key, so
+   * an entry without one can only offer a control that sends `undefined` — and
+   * a hostile or newer-host document must not be able to paint a dead button or
+   * crash the page on `entries` itself.
+   */
+  const poolEntries = (Array.isArray(servedAccounts?.entries) ? servedAccounts.entries : []).filter(
+    entry => typeof entry?.id === 'string' && entry.id.length > 0,
+  )
+  const pool = servedAccounts !== undefined && poolEntries.length > 0
+    ? { ...servedAccounts, entries: poolEntries }
+    : undefined
+  const upstreamNotice = signedInDoc?.upstreamNotice
 
   return (
     <div className="qdp-page">
@@ -1095,7 +1906,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                       type="checkbox"
                       className="qdp-segCheck"
                       checked={settings.variantCN}
-                      disabled={settings.status === 'unavailable'}
+                      disabled={!settingsReady}
                       aria-label={`${t('variantTabCN')} — ${t('variantEnable')}`}
                       title={t('variantEnable')}
                       onClick={event => { event.stopPropagation() }}
@@ -1116,7 +1927,7 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                       type="checkbox"
                       className="qdp-segCheck"
                       checked={settings.variantGlobal}
-                      disabled={settings.status === 'unavailable'}
+                      disabled={!settingsReady}
                       aria-label={`${t('variantTabGlobal')} — ${t('variantEnable')}`}
                       title={t('variantEnable')}
                       onClick={event => { event.stopPropagation() }}
@@ -1178,7 +1989,156 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
             </div>
           )}
           {checkInNotice === undefined ? null : <p className="qdp-body">{checkInNotice}</p>}
-          {signedInDoc?.pat === undefined || replacing ? null : (
+          {upstreamNotice === undefined ? null : <UpstreamNoticeBlock notice={upstreamNotice} t={t} />}
+          {pool === undefined ? null : (
+            <div className="qdp-accountPool">
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">
+                    <span>{t('accountsHeading')}</span>
+                    <QdpTag tone={pool.autoFailover ? 'success' : 'neutral'}>
+                      {pool.autoFailover ? t('accountsFailoverOn') : t('accountsFailoverOff')}
+                    </QdpTag>
+                  </span>
+                  <span className="qdp-rowDesc">{t('accountsHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  <QdpButton
+                    variant="outline"
+                    size="sm"
+                    disabled={busy || patBusy || accountBusy || authKey === undefined}
+                    onClick={() => {
+                      // The pool's "add" is the same entry the single-credential
+                      // row uses: `save` upserts by identity and activates, so a
+                      // re-pasted token refreshes its row instead of duplicating it.
+                      setPatError(undefined)
+                      setPatNotice(undefined)
+                      setReplacing(true)
+                    }}
+                  >
+                    {t('accountAdd')}
+                  </QdpButton>
+                </div>
+              </div>
+              <ul className="qdp-accountList">
+                {pool.entries.map(entry => {
+                  const name = entry.accountName ?? t('accountSlot', { order: entry.order })
+                  const armed = confirmingRemoveId === entry.id
+                  /*
+                   * The seat's state, always shown.
+                   *
+                   * `entry.health` is absent until the transport observes a
+                   * failure, and an absent state is not the same as a healthy
+                   * one — but the account list exists to answer "which of these
+                   * can serve me right now" at a glance, so an enabled seat with
+                   * no observation reads as 正常 (nothing has failed) rather than
+                   * as a blank cell. A parked seat shows no state at all: it is
+                   * out of the walk, so calling it healthy would be a promise
+                   * this list will not keep.
+                   */
+                  const health = entry.enabled === false ? undefined : (entry.health ?? 'normal')
+                  return (
+                    <li
+                      className={entry.enabled === false ? 'qdp-accountItem is-off' : 'qdp-accountItem'}
+                      key={entry.id}
+                      data-account-id={entry.id}
+                    >
+                      {/* The park checkbox is FIRST, before the name: it is the
+                          only control that says whether this row takes part in
+                          automatic switching at all, and the answer has to be
+                          readable before the actions beside it. */}
+                      <label className="qdp-accountCheck">
+                        <input
+                          type="checkbox"
+                          checked={entry.enabled !== false}
+                          disabled={busy || accountBusy || togglingIds.includes(entry.id)}
+                          aria-label={t('accountEnabledAria', { name })}
+                          onChange={event => { void accountToggle(entry.id, event.target.checked, name) }}
+                        />
+                      </label>
+                      <div className="qdp-accountItemInfo">
+                        <span className="qdp-accountItemName">
+                          <QdpStateDot state={entry.active ? 'done' : 'idle'} />
+                          <span>{name}</span>
+                          {/*
+                            Balance and state sit on the name line, right after
+                            the name: they are how the user tells two seats
+                            apart ("which of these still has credits"), so they
+                            must be readable without scanning down each row.
+                            A parked seat reports `accountCreditsParked` instead
+                            of a figure: it is excluded from the walk, so a
+                            spendable-looking number beside it would be a
+                            promise this list will never keep.
+                          */}
+                          <span className="qdp-accountItemCredits">{accountRowCredits(entry, t)}</span>
+                          {health === undefined ? null : (
+                            <span className="qdp-accountHealth" title={t('accountHealthAria')}>
+                              <QdpTag tone={health === 'normal' ? 'success' : 'warn'}>
+                                {accountHealthLabel(health, t)}
+                              </QdpTag>
+                            </span>
+                          )}
+                          {entry.active ? <QdpTag tone="success">{t('accountCurrent')}</QdpTag> : null}
+                          {entry.enabled === false ? <QdpTag tone="neutral">{t('accountParked')}</QdpTag> : null}
+                        </span>
+                        <span className="qdp-accountItemMeta">{accountRowMeta(entry, t)}</span>
+                      </div>
+                      <div className="qdp-rowControl">
+                        <QdpButton
+                          variant="outline"
+                          size="sm"
+                          disabled={entry.active || busy || accountBusy}
+                          aria-label={t('accountSwitchAria', { name })}
+                          onClick={() => { void accountAction('activate-account', entry.id, name) }}
+                        >
+                          {t('accountSwitch')}
+                        </QdpButton>
+                        <QdpButton
+                          variant="dangerQuiet"
+                          size="sm"
+                          disabled={busy || accountBusy}
+                          aria-label={t('accountRemoveAria', { name })}
+                          onClick={() => { setConfirmingRemoveId(entry.id) }}
+                        >
+                          {t('patRemove')}
+                        </QdpButton>
+                      </div>
+                      {armed ? (
+                        <div className="qdp-alert qdp-accountItemConfirm" role="alert">
+                          <span>{t('accountRemoveConfirm')}</span>
+                          <div className="qdp-actions">
+                            <QdpButton
+                              variant="danger"
+                              disabled={busy || accountBusy}
+                              onClick={() => { void accountAction('remove-account', entry.id, name) }}
+                            >
+                              {t('accountRemoveConfirmYes')}
+                            </QdpButton>
+                            <QdpButton disabled={accountBusy} onClick={() => { setConfirmingRemoveId(undefined) }}>
+                              {t('cancel')}
+                            </QdpButton>
+                          </div>
+                        </div>
+                      ) : null}
+                    </li>
+                  )
+                })}
+              </ul>
+              {pool.lastFailoverAt === undefined ? null : (
+                <p className="qdp-caption">
+                  {t('accountsLastFailover', { time: formatTime(pool.lastFailoverAt) })}
+                  {pool.lastFailoverReason === undefined
+                    ? null
+                    : ` · ${t('accountsLastFailoverReason', { reason: pool.lastFailoverReason })}`}
+                </p>
+              )}
+            </div>
+          )}
+          {accountError === undefined ? null : (
+            <div className="qdp-alert qdp-alertError" role="alert">{accountError}</div>
+          )}
+          {accountNotice === undefined ? null : <p className="qdp-body">{accountNotice}</p>}
+          {pool !== undefined || signedInDoc?.pat === undefined || replacing ? null : (
             <div className="qdp-row">
               <div className="qdp-rowText">
                 <span className="qdp-rowTitle">{t('patHeading')}</span>
@@ -1277,6 +2237,26 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
           <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
         </div>
         <div className="qdp-sectionBody">
+          {/* The face has not answered yet: the controls below show the schema
+              defaults and are disabled, so say so instead of leaving the user
+              to click a switch that cannot take. A read that failed outright
+              says why — "loading…" forever is indistinguishable from broken. */}
+          {settings.status !== 'loading' ? null : settings.writeError === '' ? (
+            <p className="qdp-note" role="status" data-settings-state="loading">
+              {t('settingsLoading')}
+            </p>
+          ) : (
+            <p className="qdp-note qdp-noteDanger" role="alert" data-settings-state="unreadable">
+              {t('settingsUnavailable', { message: settings.writeError })}
+            </p>
+          )}
+          {/* The host refused the last write: the value on screen is not the
+              one it holds, so the refusal is shown rather than swallowed. */}
+          {settings.status === 'loading' || settings.writeError === '' ? null : (
+            <p className="qdp-note qdp-noteDanger" role="alert" data-settings-state="write-failed">
+              {t('settingsWriteFailed', { message: settings.writeError })}
+            </p>
+          )}
           <div className="qdp-row">
             <div className="qdp-rowText">
               <span className="qdp-rowTitle">{t('quotaReadoutEnabledLabel')}</span>
@@ -1299,17 +2279,14 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                 <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
               </div>
               <div className="qdp-rowControl">
-                <QdpInput
-                  className="qdp-inputShort"
-                  type="number"
+                <QdpNumberField
+                  marker="quota-poll-minutes"
                   min={1}
-                  step={1}
+                  max={POLL_MINUTES_MAX}
                   value={pollMinutes}
-                  aria-label={t('quotaPollLabel')}
-                  onChange={event => {
-                    const minutes = Number.parseInt(event.target.value, 10)
-                    if (Number.isFinite(minutes) && minutes >= 1) writePollMinutes(minutes)
-                  }}
+                  label={t('quotaPollLabel')}
+                  disabled={!settingsReady}
+                  onCommit={minutes => { writePollMinutes(minutes) }}
                 />
                 <span className="qdp-caption">{t('quotaPollUnit')}</span>
               </div>
@@ -1347,6 +2324,168 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               />
             </div>
           </div>
+          {/*
+            ── Daily check-in ──
+            Above the failover block on purpose: check-in is a once-a-day
+            housekeeping action, while the rows below change how a running
+            conversation is served. Reading the card top to bottom should put
+            the routine first and the routing policy second.
+          */}
+          {/*
+            ── Failover and routing ──
+            These rows write the host Config's own fields. They are omitted
+            entirely on a settings face that does not carry them, because a
+            control the host silently drops is worse than no control: the user
+            would set a policy and only find out at the next failover that
+            nothing recorded it.
+          */}
+          {settings.status === 'unavailable' ? null : (
+            <>
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">{t('autoFailoverLabel')}</span>
+                  <span className="qdp-rowDesc">{t('autoFailoverHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  <QdpSwitch
+                    checked={settings.autoFailoverEnabled}
+                    label={t('autoFailoverLabel')}
+                    disabled={!settingsReady}
+                    onChange={next => { writeSetting('autoFailoverEnabled', next) }}
+                  />
+                </div>
+              </div>
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">{t('queueWaitAttemptsLabel')}</span>
+                  <span className="qdp-rowDesc">{t('queueWaitAttemptsHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  <QdpNumberField
+                    marker="queue-wait-attempts"
+                    min={0}
+                    max={QUEUE_WAIT_ATTEMPTS_MAX}
+                    value={settings.queueWaitAttempts}
+                    label={t('queueWaitAttemptsLabel')}
+                    disabled={!settingsReady}
+                    // 0 is meaningful — report the queue answer at once — so the
+                    // bound is 0..MAX, never a truthiness check.
+                    onCommit={attempts => { writeSetting('queueWaitAttempts', attempts) }}
+                  />
+                </div>
+              </div>
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">{t('queueWaitSecondsLabel')}</span>
+                  <span className="qdp-rowDesc">{t('queueWaitSecondsHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  <QdpNumberField
+                    marker="queue-wait-seconds"
+                    min={QUEUE_WAIT_SECONDS_MIN}
+                    max={QUEUE_WAIT_SECONDS_MAX}
+                    value={settings.queueWaitSeconds}
+                    label={t('queueWaitSecondsLabel')}
+                    disabled={!settingsReady}
+                    onCommit={seconds => { writeSetting('queueWaitSeconds', seconds) }}
+                  />
+                  <span className="qdp-caption">{t('queueWaitSecondsUnit')}</span>
+                </div>
+              </div>
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">{t('routingStrategyLabel')}</span>
+                  <span className="qdp-rowDesc">{t('routingStrategyHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  {/*
+                    A select rather than the card's segmented control: that
+                    control is a tablist, and the variant switcher has to stay
+                    the card's only level of tabs. Routing strategy is a plain
+                    settings choice, and a select says exactly that.
+                  */}
+                  <select
+                    className="qdp-select"
+                    value={routingStrategy}
+                    disabled={!routingWritable || !settingsReady}
+                    aria-label={t('routingStrategyLabel')}
+                    onChange={event => {
+                      chooseRoutingStrategy(event.target.value === 'custom' ? 'custom' : 'save-order')
+                    }}
+                  >
+                    <option value="save-order">{t('routingStrategySaveOrder')}</option>
+                    <option value="custom">{t('routingStrategyCustom')}</option>
+                  </select>
+                </div>
+              </div>
+              {/* The order list only exists for the custom strategy: on save
+                  order the list IS the account list above, and showing a
+                  second, uneditable copy of it would only invite the user to
+                  try reordering something that cannot move. */}
+              {routingStrategy !== 'custom' ? null : (
+                <div className="qdp-row qdp-rowStack">
+                  <div className="qdp-rowText">
+                    <span className="qdp-rowTitle">{t('routingOrderHeading')}</span>
+                    <span className="qdp-rowDesc">{t('routingOrderHint')}</span>
+                  </div>
+                  <RoutingOrderList
+                    ids={routingOrderIds}
+                    nameOf={routingNameOf}
+                    variantOf={routingVariantOf}
+                    accountOf={id => routing.accounts.find(entry => entry.id === id)}
+                    disabled={!routingWritable || !settingsReady}
+                    t={t}
+                    onMove={moveRoutingAccount}
+                  />
+                </div>
+              )}
+              {routingMixed ? (
+                <MixedRoutingWarning
+                  offendersCN={routingOffenders.cn}
+                  offendersGlobal={routingOffenders.global}
+                  t={t}
+                />
+              ) : null}
+              <div className="qdp-row">
+                <div className="qdp-rowText">
+                  <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
+                  <span className="qdp-rowDesc">{t('stickinessHint')}</span>
+                </div>
+                <div className="qdp-rowControl">
+                  <QdpNumberField
+                    marker="stickiness-rounds"
+                    min={0}
+                    max={STICKINESS_ROUNDS_MAX}
+                    value={settings.stickinessRounds}
+                    label={t('stickinessRoundsLabel')}
+                    disabled={!settingsReady}
+                    onCommit={rounds => { writeSetting('stickinessRounds', rounds) }}
+                  />
+                  <span className="qdp-caption">{t('stickinessRoundsLabel')}</span>
+                  <QdpNumberField
+                    marker="stickiness-requests"
+                    min={0}
+                    max={STICKINESS_REQUESTS_MAX}
+                    value={settings.stickinessRequests}
+                    label={t('stickinessRequestsLabel')}
+                    disabled={!settingsReady}
+                    onCommit={requests => { writeSetting('stickinessRequests', requests) }}
+                  />
+                  <span className="qdp-caption">{t('stickinessRequestsLabel')}</span>
+                  <QdpNumberField
+                    marker="stickiness-minutes"
+                    min={0}
+                    max={STICKINESS_MINUTES_MAX}
+                    value={settings.stickinessMinutes}
+                    label={t('stickinessMinutesLabel')}
+                    disabled={!settingsReady}
+                    onCommit={minutes => { writeSetting('stickinessMinutes', minutes) }}
+                  />
+                  <span className="qdp-caption">{t('stickinessMinutesLabel')}</span>
+                </div>
+              </div>
+            </>
+          )}
           {settings.status === 'ready' && !settings.writable ? (
             <p className="qdp-error">{t('quotaSettingsSaveFailed')}</p>
           ) : null}

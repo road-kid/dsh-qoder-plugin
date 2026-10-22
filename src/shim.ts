@@ -64,6 +64,29 @@ function isJsonContentType(req: IncomingMessage): boolean {
   return typeof type === 'string' && type.trim().toLowerCase().startsWith('application/json')
 }
 
+/**
+ * The session the caller asked this request to stick to, or `undefined`.
+ *
+ * pi-ai sends the affinity headers only when the model descriptor opts in (see
+ * `toPiModel` in `src/adapter.ts`), and it sends them rather than the identity
+ * in the body: the id belongs to the harness conversation, which the OpenAI
+ * chat-completions schema has no field for. `x-session-affinity` is pi-ai's
+ * `openai`-format spelling and the one this shim checks; `session_id` is the
+ * same value under the OpenRouter-style bare key, accepted because a caller
+ * that sets only one of them should not lose its session.
+ *
+ * A blank value is treated as absent: an empty string would otherwise become a
+ * pin key shared by every session that sent it, which would quietly couple
+ * conversations that have nothing to do with each other.
+ */
+function sessionIdOf(req: IncomingMessage): string | undefined {
+  const raw = req.headers['x-session-affinity'] ?? req.headers['session_id']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
+}
+
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) })
@@ -220,7 +243,7 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())
-    const result = await client.chatStream(raw, controller.signal)
+    const result = await client.chatStream(raw, controller.signal, sessionIdOf(req))
 
     if (!result.ok) {
       // The message quotes the shim's OUTBOUND status, never the upstream's

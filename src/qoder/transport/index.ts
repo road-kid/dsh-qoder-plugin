@@ -6,6 +6,7 @@ import type { QoderAccountInfo } from '../account.ts'
 import type { QoderCatalogModel } from '../catalog.ts'
 import type { QoderRegion } from '../region.ts'
 import type { QoderCheckInResult } from './checkin.ts'
+import type { QoderQueueFacts } from '../queue-notice.ts'
 import { DefaultQoderTransport, defaultStreamIdleTimeoutMs } from './default-transport.ts'
 import { defaultResponseHeaderTimeoutMs } from './request.ts'
 import type { QoderLogger } from './logging.ts'
@@ -16,8 +17,73 @@ export type { QoderCheckInResult }
 export interface QoderTransport {
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk>
   discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]>
-  readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined }): Promise<QoderAccountInfo>
+  /**
+   * Read one account's billing answer.
+   *
+   * `pat` names the account to read; without it the ambient credential signs,
+   * which is what the card's single-account quota read does. With it, the host
+   * can price every pooled account in one status document without switching the
+   * active pointer — the read is a plain GET, it does not adopt the credential.
+   */
+  readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; pat?: string | undefined }): Promise<QoderAccountInfo>
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>
+}
+
+/**
+ * The credential pool's seam into the transport: which account signs now, which
+ * one to try next, and how a switch is announced.
+ *
+ * The transport never reads the credential store itself — it asks. That keeps
+ * "which account is active" a single decision owned by the host, and lets a
+ * signed-out or env-only variant expose no pool at all.
+ */
+export interface QoderFailoverHooks {
+  /** Whether automatic switching is on for this transport right now. */
+  enabled(): boolean
+  /** The pooled account that should sign the request, when there is one. */
+  activeAccount(): Promise<{ id: string; pat: string } | undefined>
+  /** The account after `id` in save order; `undefined` ends the walk. */
+  nextAccount(id: string): Promise<{ id: string; pat: string } | undefined>
+  /**
+   * Resolve one stored account id to its credential, `undefined` when the id
+   * names no account any more.
+   *
+   * `nextAccount` can only answer "who comes after this one in save order",
+   * which is enough for a plain walk but not for the two features that name an
+   * account directly: a custom `routing.order` picks ids in the user's order,
+   * and a sticky session starts from the account the session was pinned to.
+   * Both must also be able to find out that an id is gone — a removed account
+   * would otherwise keep signing, because the pin remembered its credential.
+   *
+   * Optional so the plain walk keeps working without it: with no resolver the
+   * transport falls back to save order (routing) and to the credential it
+   * captured when the session was pinned (stickiness).
+   */
+  accountById?(id: string): Promise<{ id: string; pat: string } | undefined>
+  /**
+   * Announce a switch, before the retry is made.
+   *
+   * Awaiting it is load-bearing: the retry signs with the PAT this hook handed
+   * over, but a mid-request credential refresh (the image publisher's) resolves
+   * the store's active account, so the host's adoption has to have landed by
+   * the time that path can run.
+   */
+  switched(info: { fromId: string; toId: string; reason: string }): void | Promise<void>
+  /**
+   * Report that one pooled account could not serve a request at all.
+   *
+   * Fired for the failures that advance the walk (a connection-level failure
+   * the account could not self-heal: transport error, timeout, dropped stream,
+   * an upstream 5xx or a rate limit) — never for a refused request, which says
+   * the upstream answered and judged it, and never for a queue answer, which is
+   * a busy model rather than a broken credential.
+   *
+   * The distinction is the host's evidence for the card's 限流 label: a pile of
+   * these against one account is what "this account cannot connect" looks like
+   * from inside the plugin, and there is nowhere else that observation exists.
+   * Optional so a host that tracks no health simply does not listen.
+   */
+  failed?(info: { accountId: string; reason: string; at: number }): void
 }
 
 export interface QoderTransportOptions {
@@ -37,6 +103,49 @@ export interface QoderTransportOptions {
   /** Whether prior assistant reasoning content is preserved across turns. */
   preserveThinking?: boolean
   /**
+   * Automatic next-account failover for the chat path.
+   *
+   * Absent, or present with `enabled()` false, is exactly the pre-failover
+   * behavior: the ambient credential signs, and a failure propagates untouched.
+   */
+  failover?: QoderFailoverHooks
+  /**
+   * Called when a request ends on the upstream's "model not serviceable"
+   * answer (a saturated per-model queue), with the facts the body carried.
+   *
+   * Reported on the *final* failure of a request, after any same-account
+   * self-heal and any account failover have had their chance: a request that
+   * recovered needs no explanation, and a queue the user never saw resolved
+   * itself. The host turns this into the visible notice, so the explanation is
+   * built from the body that actually caused the failure rather than from a
+   * status code guessed at the surface.
+   *
+   * @param accountId - The pooled account whose attempt produced this terminal
+   *   failure, `undefined` when no pooled account signed (an env-only
+   *   credential, or switching turned off). The id travels WITH the attempt
+   *   rather than being remembered on the transport: requests run concurrently,
+   *   and a shared "last account" field would let one request's failure be
+   *   blamed on another request's account.
+   */
+  onUpstreamQueue?: (facts: QoderQueueFacts, accountId?: string) => void
+  /**
+   * Called when the upstream accepted a chat — its first chunk is about to be
+   * forwarded — so any condition an earlier failure notice described is over.
+   *
+   * The counterpart of `onUpstreamQueue`: that one announces a saturated queue
+   * on the request's final failure, and this one is the only honest way to take
+   * the announcement back, because acceptance is the one moment "the model
+   * serves requests again" is actually known. The host turns it into the end of
+   * the visible notice. A rejected chat throws before any chunk exists, so this
+   * never fires on a failing attempt.
+   *
+   * @param accountId - The pooled account whose attempt the upstream accepted,
+   *   `undefined` when no pooled account signed. Carried per attempt for the
+   *   same reason as `onUpstreamQueue`'s id, and it is what lets the host mark
+   *   the right account healthy while other requests are failing on others.
+   */
+  onChatAccepted?: (accountId?: string) => void
+  /**
    * Called once per successful re-auth refresh, right after a fresh job token
    * was exchanged and accepted following a 401 rejection. The plugin host
    * surfaces this as a visible "token auto-refreshed" notice on its card.
@@ -52,6 +161,71 @@ export interface QoderTransportOptions {
    * accepted), so a long rejection storm does not print a row per retry.
    */
   onJobTokenRefreshFailed?: (info: { region: QoderRegion; at: number; status?: number }) => void
+  /**
+   * Retry a queued chat on the same account instead of giving up on it.
+   *
+   * A queue answer is not an account failure — the credential behind it is
+   * fine — so switching identity would neither shorten the wait nor be fair to
+   * the account that would receive the request. The wait *is* the recovery, so
+   * it happens inside the attempt and before any failover decision, and a retry
+   * that succeeds leaves no notice behind, because no error ever escapes.
+   *
+   * Both values are providers rather than plain numbers so the host can project
+   * the live settings of each request instead of freezing them at construction.
+   */
+  queueWait?: {
+    /** How many times one attempt may wait a queue answer out. */
+    attempts: () => number
+    /**
+     * Fallback wait in seconds, used only when the queue answer advertises no
+     * window of its own: the upstream's advice is the better estimate of when
+     * the line moves, so it wins and is capped at five minutes.
+     */
+    seconds: () => number
+  }
+  /**
+   * Keep a session on one account, and change account when a bound is reached.
+   *
+   * The three bounds are independent: whichever a conversation reaches first
+   * moves it on. "Moves it on" means the next request of that session starts on
+   * the NEXT account of the walk order — a rotation, not just losing the pin,
+   * because a lapsed pin that fell back to the active account would keep the
+   * conversation on the same account forever and the setting would look
+   * ignored.
+   *
+   * All three providers returning zero disables stickiness, which is the only
+   * way to get the pre-stickiness behaviour of always using the active account.
+   */
+  stickiness?: {
+    /**
+     * Conversation rounds one account serves before the session moves on.
+     *
+     * A round is one chat whose output the host consumed to the end: a request
+     * that fails, or that the caller abandons mid-stream, is not a round.
+     */
+    rounds: () => number
+    /** Requests one account serves before the session moves on. */
+    requests: () => number
+    /** Wall-clock minutes one account serves before the session moves on. */
+    minutes: () => number
+  }
+  /**
+   * The order the failover walk visits the remaining accounts in.
+   *
+   * `order` is consulted only for `'custom'`. Ids it names that resolve to no
+   * account (through `failover.accountById`) are skipped, and an order that can
+   * serve nobody falls back to save order rather than ending the walk on a list
+   * the user has since edited.
+   */
+  routing?: {
+    strategy: () => 'save-order' | 'custom'
+    order: () => readonly string[]
+  }
+  /**
+   * Clock used for the stickiness windows. Injectable so a test can age a pin
+   * out without waiting for real minutes, and so the host can share one clock.
+   */
+  now?: () => number
 }
 
 export function createQoderTransport(options: QoderTransportOptions): QoderTransport {

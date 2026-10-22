@@ -118,6 +118,50 @@ describe('card variants', () => {
       expect(zh[key]).toBeTruthy()
     }
   })
+
+  it('carries the account-pool and upstream-notice key groups in both languages', () => {
+    // The pool and the notice are the two surfaces added for account failover.
+    // Every key here is rendered by the card whenever the host serves a pool or
+    // records an upstream refusal, so a missing zh string would ship a blank
+    // row to half the users.
+    const poolKeys = [
+      'accountsHeading', 'accountsHint', 'accountsFailoverOn', 'accountsFailoverOff',
+      'accountsLastFailover', 'accountsLastFailoverReason', 'accountSlot',
+      'accountCurrent', 'accountSwitch', 'accountSwitchAria', 'patRemove',
+      'accountRemoveAria', 'accountRemoveConfirm', 'accountRemoveConfirmYes',
+      'accountAdd', 'accountSwitched', 'accountRemoved', 'accountActionFailed',
+    ] as const satisfies readonly QoderSettingsKey[]
+    const noticeKeys = [
+      'upstreamNoticeKindQueued', 'upstreamNoticeKindUnavailable',
+      'upstreamNoticeHeading', 'upstreamNoticeAt', 'upstreamNoticeMessage',
+      'upstreamNoticeWaited', 'upstreamNoticeWaitedNoDelay', 'upstreamNoticeRetry',
+      'upstreamNoticeNotAuth', 'upstreamNoticeAdvice', 'upstreamNoticeRecurrence',
+    ] as const satisfies readonly QoderSettingsKey[]
+    for (const key of [...poolKeys, ...noticeKeys]) {
+      expect(en[key]).toBeTruthy()
+      expect(zh[key]).toBeTruthy()
+    }
+
+    // The interpolated strings must keep their placeholders in BOTH languages —
+    // the card fills them positionally, so a dropped `{seconds}` would render a
+    // sentence with no number rather than fail loudly.
+    for (const key of ['upstreamNoticeWaited', 'upstreamNoticeRetry'] as const) {
+      expect(en[key]).toContain('{seconds}')
+      expect(zh[key]).toContain('{seconds}')
+    }
+    for (const key of ['accountSwitchAria', 'accountRemoveAria', 'accountSwitched'] as const) {
+      expect(en[key]).toContain('{name}')
+      expect(zh[key]).toContain('{name}')
+    }
+    expect(en.accountActionFailed).toContain('{message}')
+    expect(zh.accountActionFailed).toContain('{message}')
+    expect(en.upstreamNoticeMessage).toContain('{message}')
+    expect(zh.upstreamNoticeMessage).toContain('{message}')
+
+    // Real translations, not the English text copied into the Chinese map.
+    expect(zh.accountsHeading).not.toBe(en.accountsHeading)
+    expect(zh.upstreamNoticeNotAuth).not.toBe(en.upstreamNoticeNotAuth)
+  })
 })
 
 describe('plugin card per variant', () => {

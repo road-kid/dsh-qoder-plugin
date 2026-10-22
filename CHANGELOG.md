@@ -2,6 +2,116 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.0 — 2026-10-22
+
+The first stable release. It bundles the four capability rounds since 0.6.0 —
+the account pool, the upstream not-serviceable notice, automatic account
+failover, and per-account pricing — plus the settings face that shapes them, and
+it is the first version whose documented behaviour is covered end to end by the
+test suite.
+
+### Added — account pool, upstream notice, automatic failover, and the settings that shape them
+
+Everything below applies to **both** variants (国内版 and 国际版) and to both
+surfaces that read them: the settings card and the composer credit panel.
+
+- **Multiple PATs per variant, with switching.** The credential files now hold an
+  account pool (`version: 3`, with an `activeId` pointer) instead of one token;
+  `version: 2` files are read as a single account and upgraded in place on the
+  next write, so an existing install keeps its token. The account card lists
+  every saved account — order, token tail, account name, plan, remaining credit
+  — each with *switch* and *remove*. Saving a token that is already in the pool
+  updates that row instead of duplicating it. Removing the account in use moves
+  the pointer to the next one; removing the last one signs out.
+- **A notice, in the conversation, when the upstream cannot serve a model.**
+  When Qoder answers *model queued / not serviceable* (the `10605` /
+  `RESOURCE_LIMIT` family, whether it arrives as 200, 401 or 403), the plugin
+  inserts an explanation where the user is looking — reusing its existing
+  `command/run` + `command/done` notice row, the insertion approach
+  [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy#readme)
+  settled on. It says this is neither a sign-in nor a quota problem, names the
+  delay the upstream advises, quotes the upstream's own message, and mentions
+  risk control only when the same answer recurs inside one outage window. The
+  sentence claiming a wait appears only when the request really sat out the
+  advised window and was still refused. One notice per turn, not a stack; a
+  later accepted chat retires it.
+- **Automatic switch to the next account.** On a connection-level failure
+  (network error, timeout, a stream that breaks before its first byte, upstream
+  5xx, rate limit) the request advances to the next account in order and retries
+  — at most one pass over the pool, never after the first byte has reached the
+  client. A refused request and a queued model do not switch: another account
+  would answer the same thing, and the queue is a fact about the model.
+  `enabled() === false`, or a single-account pool, reproduces the old
+  behaviour exactly.
+- **Per-account park checkbox and health chip.** Unticking an account's checkbox
+  parks it — the token stays, nothing is deleted, but it takes no part in the
+  save-order walk, the custom routing order or a re-resolved pinned session, and
+  the composer panel shows its credits as parked instead of as a spendable
+  figure. Each row shows **正常 / 排队 / 限流**: a queued answer marks it queued;
+  a second queued answer more than an hour later, or three consecutive failures,
+  escalates to limited; an accepted chat clears it.
+- **Advanced settings for the walk.** An *auto-failover* switch, *queue wait
+  attempts* (0–10) and *queue wait seconds* (1–300, default 30), a *routing
+  strategy* (save order, or a custom order that may mix both variants — mixing
+  lists the models enabled in only one of them as an explanation, without
+  gating the save, and an account whose variant cannot serve the requested
+  model is simply skipped), and *conversation stickiness* in rounds (0–100,
+  default 1), requests (0–10000, default 60) and minutes (0–1440, default 180).
+  All of them are read live on every request: a settings write never re-mints
+  the transport, and a captured value would freeze at whatever the file held at
+  startup.
+- **Stickiness rotates the conversation, it does not lock it.** One account
+  serves a conversation until any of the three bounds is spent; the next request
+  in that conversation then starts on the **next account of the walk order**
+  rather than on the same account forever, which is what "固定用同一个账号" used
+  to do in practice. A round is one chat whose model output was consumed to the
+  end — a failed request never counts, so a flapping account cannot spend the
+  bound for the account that replaced it.
+
+### Fixed — 国内版 one-click check-in reporting a raw 409
+
+`一键签到` on the China variant could surface
+`Failed to execute Qoder ClaimCampaign with status 409.` A 409 from
+`ClaimCampaign` is the upstream refusing the write — the benefit is already
+accounted for or the window has moved — not a transport failure, so the result
+is now re-read into a truthful state and reported as such instead of as an error
+string. If the claim did land, the card says so; if it did not, it says that too.
+
+### Fixed — session affinity never reached the transport
+
+Conversation stickiness needs the host's session id, and it was being dropped
+before the wire: the adapter did not ask for it and the shim did not forward it.
+The adapter now sets `sendSessionAffinityHeaders`, the shim forwards
+`x-session-affinity` (or a bare `session_id`) into the upstream request, and the
+transport can finally pin a conversation to one account.
+
+### Fixed — settings controls that silently refused input
+
+Several controls on the settings card could not be changed: the three 会话粘性
+fields (轮数 / 请求次数 / 分钟), the queue-wait and refresh-interval numbers, and
+the toggles and routing-strategy select beside them. The panel mounted a *second*
+settings store that no control wrote through, so a switch flipped back and a
+typed number vanished on blur — the values on screen were never the values being
+saved. The panel now edits the same store the page serves, so every control on
+both the main card and the 积分设置 card reads and writes one document; number
+fields commit on blur as well as on Enter, and a rejected value reverts to what
+is stored instead of pretending it took.
+
+### Added — remaining credit and account status on every account row
+
+The account list and the 自定义优先级 rows now carry the same three facts next to
+each account name: its remaining credit (or a dash when the read failed), its
+service state (正常 / 排队 / 限流, and 已停用 for a parked account), and — in
+the routing list — its variant. A parked account is never labelled healthy,
+because the walk skips it while the label would still say 正常.
+
+### Changed — daily check-in sits above the failover policy
+
+The two check-in rows (自动签到 and 签到时间) moved above 账号自动切换 on the
+advanced card. Check-in is a once-a-day housekeeping action; the rows below it
+change how a running conversation is served. Reading the card top to bottom now
+puts the routine first and the routing policy second.
+
 ## 0.6.0
 
 ### Changed — row id, account summary strip, official-style buttons, snap slider

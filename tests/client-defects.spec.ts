@@ -333,6 +333,67 @@ describe('QoderPluginCard', () => {
       expect(calls.filter(call => call.init?.method === undefined).length).toBeGreaterThan(1)
     })
   })
+
+  describe('#12 hostile account-pool and notice documents', () => {
+    const pool = (entries: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+      accounts: { entries, autoFailover: true, ...extra },
+    })
+
+    it('drops a row whose id is missing or blank instead of painting a dead control', async () => {
+      statusReply = {
+        ok: true,
+        body: doc(pool([
+          { id: 'pat:good', source: 'card', active: true, order: 1, patTail: 'good' },
+          { source: 'card', active: false, order: 2, patTail: 'noid' },
+          { id: '', source: 'card', active: false, order: 3, patTail: 'blank' },
+        ])),
+      }
+      await mountCard()
+      const tree = rendered()
+      // The id is the write key: a row without one could only send `undefined`.
+      expect(tree).toContain('pat:good')
+      expect(tree).not.toContain('noid')
+      expect(tree).not.toContain('blank')
+      expect(view!.root.findAll(node => node.props.className === 'qdp-accountItem')).toHaveLength(1)
+    })
+
+    it('treats a pool of only-invalid rows as no pool at all', async () => {
+      statusReply = {
+        ok: true,
+        body: doc(pool([{ source: 'card', active: true, order: 1, patTail: 'ghost' }])),
+      }
+      await mountCard()
+      // Falling back to the single-credential row is the honest rendering: an
+      // empty pool is how the host reports an env-only credential.
+      expect(rendered()).toContain(en.patHeading)
+      expect(view!.root.findAll(node => node.props.className === 'qdp-accountPool')).toHaveLength(0)
+    })
+
+    it('survives an entries value that is not a list', async () => {
+      statusReply = { ok: true, body: doc({ accounts: { entries: 'nope', autoFailover: true } }) }
+      await expect(mountCard()).resolves.toBeUndefined()
+      expect(rendered()).toContain(en.patHeading)
+    })
+
+    it('renders a notice with no timestamp and no numbers without throwing or printing NaN', async () => {
+      statusReply = {
+        ok: true,
+        body: doc({
+          ...pool([{ id: 'pat:a', source: 'card', active: true, order: 1 }]),
+          upstreamNotice: { kind: 'queued', waited: true, retryAfterMs: 'soon', occurrences: 'lots' },
+        }),
+      }
+      await expect(mountCard()).resolves.toBeUndefined()
+      const tree = rendered()
+      expect(tree).toContain(en.upstreamNoticeHeading)
+      expect(tree).toContain(en.upstreamNoticeWaitedNoDelay)
+      expect(tree).not.toContain('NaN')
+      expect(tree).not.toContain('Invalid Date')
+      expect(tree).not.toContain(en.upstreamNoticeAt.split('{time}')[0]!)
+      // An unusable count is a first sighting, not a recurrence.
+      expect(tree).not.toContain(en.upstreamNoticeRecurrence.split('{count}')[0]!)
+    })
+  })
 })
 
 describe('QoderProbeControl', () => {

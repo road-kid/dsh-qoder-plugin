@@ -1,3 +1,6 @@
 node_modules/
 *.tgz
 .npm-cache/
+
+# local scratch (reference tarballs, baseline worktrees)
+.tmp/

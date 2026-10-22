@@ -215,8 +215,12 @@ function toPiModel(info: QoderModelInfo, baseUrl: string, observed?: QoderProbeR
     contextWindow: info.contextWindow,
     maxTokens: info.maxTokens,
     // pi-ai cannot infer the shim's field spelling from a random loopback
-    // URL, so name the upstream-required field explicitly.
-    compat: { maxTokensField: 'max_tokens' },
+    // URL, so name the upstream-required field explicitly. Session affinity
+    // is opted into for the same reason: pi-ai only sends the session headers
+    // when the model asks for them, and the shim needs one of them to give
+    // session sticky routing a key (see `src/shim.ts`). Without this flag
+    // pi-ai drops `options.sessionId` on the floor before the wire.
+    compat: { maxTokensField: 'max_tokens', sendSessionAffinityHeaders: true },
   } as unknown as Model<Api>
 }
 

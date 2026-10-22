@@ -72,11 +72,15 @@ export interface QoderCheckInResult {
    * A stable reason code for a failed attempt, when one applies.
    *
    * Carried alongside `message` so the card can localize the one failure the
-   * user can actually act on — `no-client` means this machine has no Qoder
-   * client to mint the device identity the international campaign requires —
-   * instead of matching on English prose.
+   * user can actually act on instead of matching on English prose:
+   * - `no-client` — this machine has no Qoder client to mint the device
+   *   identity the international campaign requires.
+   * - `claim-conflict` — the claim endpoint answered HTTP 409 and the
+   *   authoritative campaign read afterwards still says the benefit was not
+   *   granted (window closed, or the campaign is not claimable right now).
+   *   The card must not read that as a granted benefit.
    */
-  reasonCode?: 'no-client' | undefined
+  reasonCode?: 'no-client' | 'claim-conflict' | undefined
 }
 
 export interface QoderCheckInServiceOptions {
@@ -119,6 +123,25 @@ function riskHeaders(identity: QoderRiskIdentity | undefined): Record<string, st
     'cosy-machinecode': identity.machineCode,
     'cosy-machinetype': identity.machineType,
   }
+}
+
+/**
+ * Whether a thrown failure is the claim endpoint refusing the write with HTTP 409.
+ *
+ * 409 is the upstream's way of saying "this benefit is already accounted for
+ * or is no longer claimable", not "your request was malformed" and not "your
+ * credential is bad". The transport renders any non-2xx as
+ * `Failed to execute Qoder ClaimCampaign with status 409.`, which is the
+ * mechanism of the failure rather than its meaning, so the claim path is the
+ * only place that can turn it into an honest answer: the status is inspected
+ * here and the campaign list — the authoritative record of whether the benefit
+ * was granted — is re-read.
+ *
+ * Only 409 qualifies. Every other status keeps its existing behaviour
+ * (401/403 still reach the single token-heal retry; 5xx/429 still surface).
+ */
+function isClaimConflict(error: unknown): boolean {
+  return error instanceof QoderLlmError && error.failure.status === 409
 }
 
 /**
@@ -281,8 +304,73 @@ export class QoderCheckInService {
         }
       }
 
-      // Claim it
-      const claimResult = await this.claimCampaign(authToken, benefitCampaign.campaignId, signal, identity)
+      // Claim it. A 409 is handled inside: it is a refusal, not a transport
+      // failure, and only the campaign list can say what it meant.
+      let claimResult: QoderClaimResponse
+      try {
+        claimResult = await this.claimCampaign(authToken, benefitCampaign.campaignId, signal, identity)
+      } catch (claimError) {
+        if (!isClaimConflict(claimError)) throw claimError
+        // The upstream refused the write as a conflict. Re-read the campaign
+        // list EXACTLY ONCE: it is the authoritative record of whether the
+        // benefit exists in a granted state, and it is the only reading that can
+        // distinguish "you already have it today" (the common, benign case —
+        // a double click, a scheduled run that overlapped a manual one, or a
+        // China account whose claim was already applied server-side) from "the
+        // window closed / the campaign is not claimable". No second claim is
+        // ever issued, so a 409 here cannot recurse.
+        let settled: QoderCampaign | undefined
+        let settledListRead = false
+        try {
+          const refreshed = await this.fetchCampaigns(authToken, signal, identity)
+          settled = refreshed.find(c => c.actionType === 'CLAIM_BENEFIT')
+          settledListRead = true
+        } catch (readError) {
+          // The re-read itself failed. That does not change what is known: the
+          // claim was refused and nothing says it was granted. Fall through to
+          // the conflict answer rather than letting a diagnostic error replace
+          // an honest one — and never retry, so this stays bounded.
+          this.logger?.warn?.(
+            `[Qoder CheckIn] Claim conflict, campaign re-read failed: ${readError instanceof Error ? readError.message : String(readError)}`,
+          )
+        }
+
+        if (settledListRead && settled?.claimStatus === 'CLAIMED') {
+          // Refused because it was already granted; report it as such, with the
+          // same fields the ordinary already-claimed path carries.
+          const expiresAtMs = resolveExpiryMs(undefined, settled.benefit?.validity, nowMs)
+          this.logger?.warn?.('[Qoder CheckIn] Claim conflict resolved as already-claimed by the campaign read')
+          return {
+            variantId: this.variantId,
+            date: today,
+            timestamp: nowMs,
+            status: 'already-claimed',
+            campaignKey: settled.campaignKey ?? benefitCampaign.campaignKey,
+            amount: settled.benefit?.amount ?? benefitCampaign.benefit?.amount ?? 100,
+            message: 'Already claimed today',
+            ...expiresAtMs === undefined ? {} : { expiresAtMs },
+          }
+        }
+
+        // "Conflict" resolved against us: no granted benefit. Say what the
+        // upstream did instead of echoing the transport string, and take care
+        // not to imply the credits were granted.
+        const observed = settled === undefined
+          ? settledListRead
+            ? 'the campaign is no longer listed'
+            : 'the campaign list could not be re-read'
+          : `the campaign still reports ${settled.claimStatus ?? 'an unknown status'}`
+        this.logger?.warn?.(`[Qoder CheckIn] Claim refused with 409; ${observed}`)
+        return {
+          variantId: this.variantId,
+          date: today,
+          timestamp: nowMs,
+          status: 'error',
+          reasonCode: 'claim-conflict',
+          campaignKey: settled?.campaignKey ?? benefitCampaign.campaignKey,
+          message: `Qoder refused the daily benefit claim as a conflict and ${observed}, so no credits were granted. Retry once the campaign shows a claimable benefit.`,
+        }
+      }
       const isClaimed = claimResult.status === 'CLAIMED'
       const replayed = Boolean(claimResult.replayed)
       const amount = claimResult.benefit?.amount ?? benefitCampaign.benefit?.amount ?? 100

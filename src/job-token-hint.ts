@@ -54,6 +54,19 @@ let lastRunningAgent: HintAgent | undefined
 /** Monotonic suffix keeping appended ids unique within this process. */
 let hintSeq = 0
 
+/** Monotonic mark for the latest observed turn, and the turn each agent is in. */
+let turnSeq = 0
+const turnByAgent = new Map<string, number>()
+
+/**
+ * The last upstream notice printed, per agent, with the turn it was printed in.
+ *
+ * The host retries a RATE_LIMIT several times inside one turn and the queue
+ * answer is identical on every attempt, so without this the conversation would
+ * collect the same row once per retry.
+ */
+const lastNoticeByAgent = new Map<string, { turn: number; text: string }>()
+
 /**
  * Start tracking which agent is running.
  *
@@ -62,11 +75,18 @@ let hintSeq = 0
  * owes the chain its `next()` call). The self-heal fires inside that agent's
  * request, so the most recently running agent is the conversation to print
  * into.
+ *
+ * The same event also advances the turn mark the upstream-notice guard is
+ * scoped to: a `running` status is what opens a turn, so the identical notice
+ * is suppressed inside one and allowed again in the next — which is exactly the
+ * recurrence the notice wording reports as a risk-control signal.
  */
 export function installJobTokenHint(ctx: Context): void {
   ctx.on('agent/status' as never, ((payload: { agent?: HintAgent, status?: string }) => {
     if (payload.status === 'running' && payload.agent !== undefined) {
       lastRunningAgent = payload.agent
+      turnSeq += 1
+      turnByAgent.set(String(payload.agent.id), turnSeq)
     }
   }) as never)
 }
@@ -105,6 +125,41 @@ export function emitJobTokenHint(at: number, text: string): void {
 export function emitJobTokenRefreshFailedHint(at: number, text: string): void {
   const agent = lastRunningAgent
   if (agent?.session === undefined) return
+  appendHintRow(agent, 'error', text)
+}
+
+/**
+ * Print one upstream "model not serviceable" notice into the running agent's
+ * conversation.
+ *
+ * The same best-effort printer as the job-token rows. The request it describes
+ * has already been answered with the upstream's own queue/unserviceable body,
+ * so a missing agent session must never turn a diagnostics line into a second
+ * failure: no agent, no row, and the chat keeps whatever outcome it had.
+ *
+ * Guarded per turn. The host retries a `RATE_LIMIT` several times inside one
+ * turn and the upstream's queue answer is byte-identical on each attempt, so
+ * without the guard the conversation would stack one identical row per retry.
+ * Identical text is the key, not "any notice": a turn that first reports the
+ * queue without waiting and later reports the waited-out retry has two
+ * different facts to tell and prints both. The turn mark advances on every
+ * `agent/status` `running`, so the same notice may legitimately surface again
+ * in a later turn — and that recurrence is what the wording reports as a
+ * possible risk-control signal.
+ *
+ * @param text - The rendered notice line (see `formatQueueNotice`).
+ */
+export function emitUpstreamNotice(text: string): void {
+  const agent = lastRunningAgent
+  if (agent?.session === undefined || text === '') return
+  const id = String(agent.id)
+  const turn = turnByAgent.get(id) ?? 0
+  const printed = lastNoticeByAgent.get(id)
+  if (printed !== undefined && printed.turn === turn && printed.text === text) return
+  // Recorded before the append, which swallows its own failures: a row that
+  // could not be written must not be retried by a later identical attempt in
+  // the same turn.
+  lastNoticeByAgent.set(id, { turn, text })
   appendHintRow(agent, 'error', text)
 }
 

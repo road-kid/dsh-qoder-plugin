@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { QoderUpstreamClient } from '../src/upstream.ts'
+import { webPlan } from '../src/web-status.ts'
 import type { QoderAccountInfo } from '../src/qoder/account.ts'
 import type { QoderTransport } from '../src/qoder/transport/index.ts'
 
@@ -125,5 +126,104 @@ describe('fetchCredits shapes', () => {
   it('propagates an upstream failure for the status route to classify', async () => {
     const reader = vi.fn(async () => { throw new Error('AUTH 401') })
     await expect(clientFor(undefined, reader as never).fetchCredits()).rejects.toThrow('AUTH 401')
+  })
+})
+
+/**
+ * `fetchAccountBilling` prices a SPECIFIC pooled token — the composer panel
+ * shows what every saved account still holds, not just the one that signs.
+ *
+ * The invariant under test is that reading a spare account is a pure read: it
+ * must not relabel the ambient credential the headline row describes, and it
+ * must not force a fresh upstream call (the panel re-reads on every status
+ * poll, so the account reader's per-token cache is what keeps that bounded).
+ */
+describe('fetchAccountBilling: per-account pricing without adoption', () => {
+  function clientWith(reader: QoderTransport['readAccount']) {
+    const transport = {
+      stream: () => { throw new Error('not used') },
+      discoverModels: async () => [],
+      readAccount: reader,
+    } as unknown as QoderTransport
+    return new QoderUpstreamClient({
+      region: 'china',
+      providerId: 'qoder',
+      getPat: async () => 'pt-ambient',
+      transport,
+    })
+  }
+
+  it('names the account it reads and lets the reader cache answer', async () => {
+    const readAccount = vi.fn(async () => account({
+      userQuota: { total: 100, used: 25, remaining: 75, percentage: 25, unit: 'credits' },
+    }))
+    await clientWith(readAccount as never).fetchAccountBilling('pt-spare')
+    // `pat` names the account; no `force`, so the reader's TTL cache and
+    // single-flight absorb the panel's repeated polls.
+    expect(readAccount).toHaveBeenCalledWith({ pat: 'pt-spare' })
+  })
+
+  it('reports the spare account name without relabelling the ambient one', async () => {
+    const reader = vi.fn(async (options?: { pat?: string }) => ({
+      profile: {
+        id: 'u1',
+        name: options?.pat === 'pt-spare' ? 'Spare Saver' : 'Ambient Owner',
+        email: 'u@example.com',
+      },
+      updatedAt: '2026-09-18T00:00:00Z',
+    }))
+    const client = clientWith(reader as never)
+    // The ambient read is what the card's headline row describes.
+    await client.fetchCredits()
+    expect(client.accountName).toBe('Ambient Owner')
+
+    const billing = await client.fetchAccountBilling('pt-spare')
+    expect(billing.accountName).toBe('Spare Saver')
+    // Load-bearing: the spare account's name must not become the ambient
+    // credential's name, or the card would relabel the account in use.
+    expect(client.accountName).toBe('Ambient Owner')
+  })
+
+  it('omits a name the upstream did not report and keeps the plan beside it', async () => {
+    const reader = vi.fn(async () => ({
+      profile: { id: 'u1', name: '', email: 'u@example.com' },
+      plan: { planTierName: 'Pro', endDate: '2026-12-31T00:00:00Z' },
+      usage: { userQuota: { total: 100, used: 0, remaining: 100, percentage: 0, unit: 'credits' } },
+      updatedAt: '2026-09-18T00:00:00Z',
+    }))
+    const billing = await clientWith(reader as never).fetchAccountBilling('pt-spare')
+    expect(billing.accountName).toBeUndefined()
+    expect(billing.plan?.planTierName).toBe('Pro')
+    expect(billing.credits).toMatchObject({ totalSize: 100 })
+  })
+
+  it('propagates a failure so one broken account can be priced as unknown', async () => {
+    const reader = vi.fn(async () => { throw new Error('AUTH 401') })
+    await expect(clientWith(reader as never).fetchAccountBilling('pt-dead')).rejects.toThrow('AUTH 401')
+  })
+})
+
+/**
+ * `webPlan` is the one projection both the headline row and every pooled row
+ * use; two projections would let the same subscription appear under two names.
+ */
+describe('webPlan projection', () => {
+  it('carries only the rendered fields and reduces the organization to a name', () => {
+    expect(webPlan({
+      userType: 'personal',
+      planTierName: 'Pro',
+      isPersonalVersion: true,
+      organization: { orgName: 'Acme', orgId: 'org-1' },
+      endDate: '2026-12-31T00:00:00Z',
+    })).toEqual({ planTierName: 'Pro', organizationName: 'Acme', endDate: '2026-12-31T00:00:00Z' })
+  })
+
+  it('omits fields the upstream did not send instead of inventing them', () => {
+    expect(webPlan({ userType: 'personal', planTierName: 'Free', isPersonalVersion: true }))
+      .toEqual({ planTierName: 'Free' })
+  })
+
+  it('answers undefined for an account with no plan', () => {
+    expect(webPlan(undefined)).toBeUndefined()
   })
 })

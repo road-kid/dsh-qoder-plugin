@@ -49,6 +49,18 @@ async function mount(deps?: Partial<QoderAuthRouteOptions>): Promise<{ origin: s
       calls.push(['save', pat])
       return { ok: true, status: configuredStatus(pat) }
     },
+    // Account-pool actions the suites below exercise explicitly override these;
+    // the defaults keep every other case honest about what it is testing —
+    // these tests are about save/clear, and an unrecorded switch would be a
+    // silent no-op rather than a test failure.
+    activate: async accountId => {
+      calls.push(['activate', accountId])
+      return configuredStatus('pt-1')
+    },
+    remove: async accountId => {
+      calls.push(['remove', accountId])
+      return configuredStatus('pt-1')
+    },
     clear: async () => { calls.push(['clear']) },
     ...deps,
   }, key)
@@ -259,7 +271,12 @@ describe('route identity is the variant', () => {
   }
 
   it('mounts the China path by default and the called path verbatim', () => {
-    const deps: QoderAuthRouteOptions = { save: async () => ({ ok: true, status: configuredStatus('pt-1') }), clear: async () => {} }
+    const deps: QoderAuthRouteOptions = {
+      save: async () => ({ ok: true, status: configuredStatus('pt-1') }),
+      activate: async () => configuredStatus('pt-1'),
+      remove: async () => configuredStatus('pt-1'),
+      clear: async () => {},
+    }
     const china = fakeCtx()
     registerQoderAuthRoute(china.ctx as never, deps, 'k')
     expect(china.registered).toEqual([{ path: QODER_AUTH_PATH, kind: 'exact' }])
@@ -323,5 +340,90 @@ describe('save wiring: validateApiKey decides what reaches the store', () => {
     expect(accepted.body).toMatchObject({ ok: true })
     expect(store.saved).toEqual(['pt-valid'])
     expect(validate).toHaveBeenCalledWith('pt-wrong', 'china')
+  })
+})
+
+describe('account-pool actions', () => {
+  // Switching and removing rows by id are the only ways the pool changes
+  // without a new token. The id is the credential hash the status document
+  // handed the card, so the route's whole job is to carry it through verbatim
+  // and answer with the status its store produced — including when the row is
+  // already gone, which is a stale card state rather than a server fault.
+
+  it('activating an account passes the id through and answers with the new status', async () => {
+    const seen: string[] = []
+    const { origin, key } = await mount({
+      activate: async accountId => {
+        seen.push(accountId)
+        return configuredStatus('pt-second')
+      },
+    })
+    const { status, body } = await post(
+      origin,
+      { action: 'activate-account', accountId: 'pat:0011223344556677' },
+      { 'X-Qoder-Auth-Key': key },
+    )
+    expect(status).toBe(200)
+    expect(seen).toEqual(['pat:0011223344556677'])
+    expect(body).toEqual({ ok: true, status: configuredStatus('pt-second') })
+  })
+
+  it('removing an account passes the id through and answers with the status after removal', async () => {
+    const seen: string[] = []
+    const { origin, key } = await mount({
+      remove: async accountId => {
+        seen.push(accountId)
+        return configuredStatus('pt-remaining')
+      },
+    })
+    const { status, body } = await post(
+      origin,
+      { action: 'remove-account', accountId: 'pat:8899aabbccddeeff' },
+      { 'X-Qoder-Auth-Key': key },
+    )
+    expect(status).toBe(200)
+    expect(seen).toEqual(['pat:8899aabbccddeeff'])
+    expect(body).toEqual({ ok: true, status: configuredStatus('pt-remaining') })
+  })
+
+  it('trims the id it forwards, so a padded id from the card still matches', async () => {
+    const seen: string[] = []
+    const { origin, key } = await mount({
+      activate: async accountId => {
+        seen.push(accountId)
+        return configuredStatus(accountId)
+      },
+    })
+    await post(origin, { action: 'activate-account', accountId: '  pat:trimmed  ' }, { 'X-Qoder-Auth-Key': key })
+    expect(seen).toEqual(['pat:trimmed'])
+  })
+
+  it('rejects a pool action without an id instead of guessing a row', async () => {
+    const { origin, key, calls } = await mount()
+    for (const action of ['activate-account', 'remove-account']) {
+      const { status, body } = await post(origin, { action }, { 'X-Qoder-Auth-Key': key })
+      expect(status).toBe(400)
+      expect(body).toEqual({ error: 'invalid action' })
+    }
+    // Neither default stub ran: an id-less request must not reach the store at
+    // all, so it cannot switch or delete whichever row happens to be active.
+    expect(calls).toEqual([])
+  })
+
+  it('answers a stale id as a result, not as a transport error', async () => {
+    const { origin, key } = await mount({
+      activate: async accountId => {
+        throw new Error(`qoder: no stored account matches ${accountId}`)
+      },
+    })
+    const { status, body } = await post(
+      origin,
+      { action: 'activate-account', accountId: 'pat:gone' },
+      { 'X-Qoder-Auth-Key': key },
+    )
+    // 200 with ok:false is the route's result shape; a 500 would read as a
+    // plugin bug and hide the real story (the row no longer exists).
+    expect(status).toBe(200)
+    expect(body).toEqual({ ok: false, error: 'qoder: no stored account matches pat:gone' })
   })
 })

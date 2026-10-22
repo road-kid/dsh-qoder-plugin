@@ -21,10 +21,12 @@ import {
 import { CHINA_VARIANT, GLOBAL_VARIANT, type QoderVariant } from '../src/variants.ts'
 
 /**
- * The Qoder credential store: one Personal Access Token per variant, one small
- * JSON document on disk, and an environment fallback. There is no device flow,
- * no refresh, and no expiry — so the cases below are exactly those three
- * surfaces plus the stale-file refusal the WorkBuddy era leaves behind.
+ * The Qoder credential store: a pool of Personal Access Tokens per variant,
+ * one small JSON document on disk, and an environment fallback. There is no
+ * device flow, no refresh, and no expiry — so the cases below are the pool's
+ * own rules (save order, upsert, activation, removal, the failover walk), the
+ * three ways a token can be found, and the stale-file refusal the WorkBuddy
+ * era leaves behind.
  */
 
 const CLEANUP: (() => Promise<void>)[] = []
@@ -213,18 +215,44 @@ describe('QoderCredentialStore: environment fallback', () => {
 })
 
 describe('QoderCredentialStore: save, clear, and the on-disk layout', () => {
-  it('writes the v2 document and reads it back', async () => {
+  it('writes the v3 pool document and reads it back', async () => {
     const dir = await tempDir()
     const own = join(dir, 'own.json')
     const before = Date.now()
     const credential = await storeAt(own).save('  pt-saved-99  ')
     const document = JSON.parse(await readFile(own, 'utf8')) as Record<string, unknown>
-    expect(Object.keys(document).sort()).toEqual(['pat', 'region', 'savedAt', 'version'])
-    expect(document).toMatchObject({ version: 2, pat: 'pt-saved-99', region: 'china' })
-    expect(typeof document.savedAt).toBe('number')
-    expect(document.savedAt as number).toBeGreaterThanOrEqual(before)
+    // The single-account file is the pool with one row, not a second layout:
+    // one code path writes and reads accounts, and a one-account install is
+    // simply the smallest pool.
+    expect(Object.keys(document).sort()).toEqual(['accounts', 'activeId', 'version'])
+    expect(document.version).toBe(3)
+    const accounts = document.accounts as Record<string, unknown>[]
+    expect(accounts).toHaveLength(1)
+    expect(Object.keys(accounts[0]!).sort()).toEqual(['id', 'pat', 'region', 'savedAt'])
+    expect(accounts[0]).toMatchObject({ pat: 'pt-saved-99', region: 'china' })
+    // The pointer names the row it signs with, by that row's own id.
+    expect(document.activeId).toBe(accounts[0]!.id)
+    expect(typeof accounts[0]!.savedAt).toBe('number')
+    expect(accounts[0]!.savedAt as number).toBeGreaterThanOrEqual(before)
     expect(credential).toMatchObject({ pat: 'pt-saved-99', source: 'card' })
     await expect(storeAt(own).current()).resolves.toMatchObject({ pat: 'pt-saved-99' })
+  })
+
+  it('reads the v2 document a pre-pool build wrote', async () => {
+    // Upgrading must not sign anyone out: every existing install has the
+    // single-token shape on disk, and the pool reader has to accept it. The
+    // next write rewrites the file, so the old shape only has to be READ.
+    const dir = await tempDir()
+    const own = join(dir, 'own.json')
+    await writeFile(own, JSON.stringify({ version: 2, pat: 'pt-old-1', region: 'china', savedAt: 1_700_000_000_000 }))
+    await expect(storeAt(own).current()).resolves.toMatchObject({ pat: 'pt-old-1', savedAtMs: 1_700_000_000_000 })
+    await expect(storeAt(own).accounts()).resolves.toMatchObject([{ order: 1, active: true }])
+    // A later save rewrites the whole file in the pool shape, keeping the
+    // migrated token as a row.
+    await storeAt(own).save('pt-new-2')
+    const document = JSON.parse(await readFile(own, 'utf8')) as { version: number; accounts: { pat: string }[] }
+    expect(document.version).toBe(3)
+    expect(document.accounts.map(account => account.pat)).toEqual(['pt-old-1', 'pt-new-2'])
   })
 
   it('records cli provenance when the CLI saves', async () => {
@@ -401,5 +429,233 @@ describe('resolve and patPromise', () => {
     await expect(store.resolve()).rejects.toThrow(/MISSING_CREDENTIAL/)
     await expect(store.resolve()).rejects.toThrow(/settings card/)
     await expect(store.patPromise()).rejects.toThrow(/MISSING_CREDENTIAL/)
+  })
+})
+
+describe('QoderCredentialStore: the account pool', () => {
+  // The pool is the whole point of the multi-PAT feature, and its rules are all
+  // about the ORDER of the rows: which one signs, which one inherits when one is
+  // removed, and which one failover reaches next. A v2 file upgraded to the pool
+  // shape is covered above; these cases pin the behaviour that only exists once a
+  // second token has been saved.
+
+  it('upserts a token that is already stored instead of adding a second row', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    const duplicate = qoderCredentialIdentity({ pat: 'pt-dup-1' })
+    await store.save('pt-dup-1')
+    await store.save('pt-other-2')
+    // Pasting the first token again means "use this one", not "add a copy of
+    // it": a duplicate row would fail over into itself and pay for the same
+    // request twice. The row keeps its position and becomes active.
+    await store.save('  pt-dup-1  ')
+    await expect(store.accounts()).resolves.toMatchObject([
+      { id: duplicate, order: 1, active: true },
+      { id: qoderCredentialIdentity({ pat: 'pt-other-2' }), order: 2, active: false },
+    ])
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-dup-1' })
+  })
+
+  it('re-stamps a foreign region from the variant on the next write', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const foreign = 'pt-copied-from-global'
+    const id = qoderCredentialIdentity({ pat: foreign })
+    // A row can claim the other arm's region: the file was hand-copied between
+    // the two stores, or written by a build that stored the wrong one. This
+    // store can only ever present a token to its own region, so keeping the
+    // claim would be a lie the file tells about itself.
+    await writeFile(own, JSON.stringify({
+      version: 3,
+      activeId: id,
+      accounts: [{ id, pat: foreign, region: 'global', savedAt: 1_700_000_000_000 }],
+    }))
+    await storeAt(own).save('pt-china-own')
+    const document = JSON.parse(await readFile(own, 'utf8')) as {
+      accounts: { pat: string; region: string }[]
+    }
+    expect(document.accounts.map(account => [account.pat, account.region])).toEqual([
+      [foreign, 'china'],
+      ['pt-china-own', 'china'],
+    ])
+  })
+
+  it('switches the active pointer on activate, durably', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    const first = qoderCredentialIdentity({ pat: 'pt-first' })
+    await store.save('pt-first')
+    await store.save('pt-second') // saving selects, so 'second' signs requests
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-second' })
+    await expect(store.activate(first)).resolves.toMatchObject({ pat: 'pt-first' })
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-first' })
+    await expect(store.status()).resolves.toMatchObject({ pat: { patTail: 'irst' } })
+    await expect(store.accounts()).resolves.toMatchObject([
+      { id: first, active: true },
+      { active: false },
+    ])
+    // A fresh store over the same file must agree: the pointer is on disk, not
+    // in the instance that performed the switch.
+    await expect(storeAt(own).current()).resolves.toMatchObject({ pat: 'pt-first' })
+  })
+
+  it('rejects an unknown account id rather than switching to another one', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    await store.save('pt-known')
+    const stranger = qoderCredentialIdentity({ pat: 'pt-never-saved' })
+    // The card's id came from a status document that may have gone stale (the
+    // row was removed in another tab). Switching to a DIFFERENT account than
+    // the one asked for is the surprise this feature exists to remove.
+    await expect(store.activate(stranger)).rejects.toBeInstanceOf(Error)
+    await expect(store.activate(stranger)).rejects.toThrow(stranger)
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-known' })
+  })
+
+  it('removing the active account activates the next one in save order', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    await store.save('pt-a')
+    await store.save('pt-b')
+    await store.save('pt-c')
+    const [first] = await store.accounts()
+    await store.activate(first!.id)
+    await expect(store.remove(first!.id)).resolves.toBe(true)
+    // The successor is the account failover would have picked next, so deleting
+    // a dead token lands on a live one while other tokens remain.
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-b' })
+    await expect(store.accounts()).resolves.toMatchObject([
+      { order: 1, active: true },
+      { order: 2, active: false },
+    ])
+  })
+
+  it('removing the last account in save order falls back to the one before it', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    await store.save('pt-a')
+    await store.save('pt-b')
+    // 'b' is active because save selects it, and it has no successor: the
+    // account before it is the only remaining candidate.
+    const last = qoderCredentialIdentity({ pat: 'pt-b' })
+    await expect(store.remove(last)).resolves.toBe(true)
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-a' })
+  })
+
+  it('reports a removal that matched nothing instead of pretending success', async () => {
+    const store = storeAt(join(await tempDir(), 'own.json'))
+    await store.save('pt-only')
+    await expect(store.remove('pat:0000000000000000')).resolves.toBe(false)
+    await expect(store.accounts()).resolves.toHaveLength(1)
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-only' })
+  })
+
+  it('removing the last account signs out and leaves no file, like clear', async () => {
+    const dir = await tempDir()
+    const own = join(dir, 'own.json')
+    const store = storeAt(own)
+    await store.save('pt-last')
+    await expect(store.remove(qoderCredentialIdentity({ pat: 'pt-last' }))).resolves.toBe(true)
+    await expect(store.current()).resolves.toBeUndefined()
+    await expect(store.accounts()).resolves.toEqual([])
+    await expect(store.status()).resolves.toMatchObject({ state: 'missing' })
+    // An empty pool document is indistinguishable from a configured store to
+    // anything that inspects the path, while the user is in exactly the state
+    // clear() produces. So it goes the way clear() leaves it.
+    expect(await readdir(dir)).toEqual([])
+  })
+
+  it('lists no accounts when there is no document at all', async () => {
+    const store = storeAt(join(await tempDir(), 'absent.json'))
+    await expect(store.accounts()).resolves.toEqual([])
+    await expect(store.list()).resolves.toEqual([])
+  })
+
+  it('does not list an env-only credential as a pool account', async () => {
+    vi.stubEnv(QODER_PAT_ENV_CN, 'pt-env-only')
+    const store = storeAt(join(await tempDir(), 'absent.json'))
+    await expect(store.current()).resolves.toMatchObject({ pat: 'pt-env-only', source: 'env' })
+    // The pool is what is on disk. The environment token is a fallback the card
+    // cannot switch away from or remove, so it is deliberately not a row.
+    await expect(store.accounts()).resolves.toEqual([])
+  })
+
+  it('walks the pool in save order and wraps, so a tried-set can stop it', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    const only = qoderCredentialIdentity({ pat: 'pt-one' })
+    await store.save('pt-one')
+    // One account is nothing else to try: failover must not retry the token
+    // that just failed.
+    await expect(store.nextAfter(only)).resolves.toBeUndefined()
+    await store.save('pt-two')
+    const [first, second] = await store.accounts()
+    await expect(store.nextAfter(first!.id)).resolves.toMatchObject({ pat: 'pt-two' })
+    // Wrapping is pinned explicitly: the transport walks with a tried-set and
+    // stops when the successor is an id it has already used, which is what makes
+    // a full pass over the pool end instead of looping.
+    await expect(store.nextAfter(second!.id)).resolves.toMatchObject({ pat: 'pt-one' })
+    await expect(store.nextAfter(undefined)).resolves.toMatchObject({ pat: 'pt-one' })
+  })
+})
+
+describe('QoderCredentialStore mutation queue', () => {
+  /*
+   * Every mutator loads the document, edits it in memory, and writes it back, so
+   * two overlapping mutators would drop one of the two edits: the second write
+   * republishes a list that never contained the first one's change. The card can
+   * produce exactly that (a double-submitted save, or two tabs), so the store
+   * serializes the sections instead of trusting its callers to.
+   */
+
+  it('keeps both accounts when two saves overlap', async () => {
+    const store = storeAt(join(await tempDir(), 'own.json'))
+    await Promise.all([store.save('pt-race-a'), store.save('pt-race-b')])
+    const tails = (await store.accounts()).map(account => account.patTail).sort()
+    expect(tails).toEqual(['ce-a', 'ce-b'])
+  })
+
+  it('does not let a save resurrect an account removed beside it', async () => {
+    const store = storeAt(join(await tempDir(), 'own.json'))
+    await store.save('pt-keep')
+    await store.save('pt-doomed')
+    await Promise.all([
+      store.remove(qoderCredentialIdentity({ pat: 'pt-doomed' })),
+      store.save('pt-fresh'),
+    ])
+    // Neither edit may be lost: the removal must not be undone by the concurrent
+    // write, and the saved account must not be dropped by it.
+    const tails = (await store.accounts()).map(account => account.patTail).sort()
+    expect(tails).toEqual(['keep', 'resh'])
+    await expect(store.patPromise()).resolves.toBe('pt-fresh')
+  })
+
+  it('leaves the document whole when activation and saving overlap', async () => {
+    const own = join(await tempDir(), 'own.json')
+    const store = storeAt(own)
+    const first = await store.save('pt-first')
+    await store.save('pt-second')
+    await Promise.all([
+      store.activate(qoderCredentialIdentity({ pat: first.pat })),
+      store.save('pt-third'),
+    ])
+    // Whichever order the queue chose, the file is parseable and the active
+    // pointer names an account that is really in the pool.
+    const parsed = JSON.parse(await readFile(own, 'utf8')) as {
+      activeId?: string
+      accounts?: { id: string }[]
+    }
+    const ids = (parsed.accounts ?? []).map(account => account.id)
+    expect(ids).toHaveLength(3)
+    expect(ids).toContain(parsed.activeId)
+  })
+
+  it('keeps running later mutators after one of them rejects', async () => {
+    const store = storeAt(join(await tempDir(), 'own.json'))
+    await store.save('pt-survivor')
+    // A rejected section must not leave the queue settled on a rejected promise,
+    // which would fail every later call with this error instead of running it.
+    await expect(store.activate('pat:does-not-exist')).rejects.toThrow(/no stored account matches/u)
+    await expect(store.save('pt-later')).resolves.toMatchObject({ pat: 'pt-later' })
+    await expect(store.patPromise()).resolves.toBe('pt-later')
   })
 })

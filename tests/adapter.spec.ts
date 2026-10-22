@@ -23,7 +23,7 @@ interface PiModelDescriptor {
   thinkingLevelMap?: Record<string, string | null>
   contextWindow?: number
   maxTokens?: number
-  compat?: { maxTokensField?: string }
+  compat?: { maxTokensField?: string, sendSessionAffinityHeaders?: boolean }
 }
 
 interface AdapterSnapshot {
@@ -77,6 +77,11 @@ describe('Qoder adapter model descriptors', () => {
     const snapshot = (adapter as unknown as { current(): AdapterSnapshot }).current()
     const descriptor = snapshot.models.getModel(QODER_PROVIDER, 'model')
     expect(descriptor?.compat?.maxTokensField).toBe('max_tokens')
+    // Session affinity must be opted into on the descriptor: pi-ai only emits
+    // `x-session-affinity` for a model carrying this flag, and the shim needs
+    // that header to give session stickiness a pin key. Without it the
+    // harness session id never leaves pi-ai.
+    expect(descriptor?.compat?.sendSessionAffinityHeaders).toBe(true)
     // The OpenAI SDK appends `/chat/completions`, so the shim sees `/v1`.
     expect(descriptor?.baseUrl).toBe('http://127.0.0.1:40001/v1')
     expect(descriptor?.provider).toBe('qoder')

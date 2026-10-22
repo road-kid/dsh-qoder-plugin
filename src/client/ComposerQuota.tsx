@@ -10,7 +10,9 @@
  * this plugin's (`qoder` / `qoder-global`). A later round added the switches —
  * "输入框中显示额度应该加入开关" — and made the panel speak about ONE product only
  * (m01963): the panel lists just the variant the session model is drawn from,
- * and the chip disappears when that variant's readout switch is off.
+ * and the chip disappears when that variant's readout switch is off. The latest
+ * round made the readout multi-account (m01197): 对话框的积分显示界面 must show
+ * every saved account's credits and let the user click a username to switch.
  *
  * Shape:
  *
@@ -21,6 +23,15 @@
  *   flipping/clamping when there is not;
  * - the panel has one row for the active variant: name, plan tag,
  *   `remaining / total`, a thin bar and the percent + expiry caption;
+ * - when the host reports an account pool (`status.accounts.entries`), those
+ *   rows become per-account instead: the username IS the switch control, the
+ *   active seat carries the in-use marker, and every row shows its OWN plan and
+ *   credits — a spare account is priced before the user moves to it. The chip
+ *   headline still speaks only for the ACTIVE account (a spare's figures must
+ *   never leak upward), a row whose billing read failed keeps its name and its
+ *   switch and says "unavailable" rather than borrowing a neighbour's number,
+ *   and an env-only credential (no pool at all) renders the single row it
+ *   always did;
  * - documents are shared, not owned: successful reads publish through
  *   `noteQuotaStatus` (the same store the settings surfaces read), failed reads
  *   keep the last good document and surface a one-line error instead of
@@ -50,7 +61,7 @@ import {
   type ReactNode,
 } from 'react'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
-import { QODER_CARD_VARIANTS, type QoderCardVariant, type QoderPluginCardInjected } from './QoderPluginCard.tsx'
+import { QODER_CARD_VARIANTS, accountHealthLabel, type QoderCardVariant, type QoderPluginCardInjected } from './QoderPluginCard.tsx'
 import { cx, QdpIconButton, QdpTag } from './controls.tsx'
 import { clampPercent, creditSummary } from './quota-merge.ts'
 import { isQoderWebStatus } from './status-document.ts'
@@ -64,7 +75,13 @@ import {
   quotaStatusFetchedAt,
   quotaStatusIsFresh,
 } from './quota-settings-store.ts'
-import type { QoderWebCredits, QoderWebStatus } from '../status-paths.ts'
+import type {
+  QoderAccountSummary,
+  QoderAuthRequest,
+  QoderWebCredits,
+  QoderWebPlan,
+  QoderWebStatus,
+} from '../status-paths.ts'
 
 /** Injected props; `directory` resolves the session's current model selection. */
 export interface ComposerQuotaInjected {
@@ -127,14 +144,28 @@ function chipNameKey(card: QoderCardVariant): 'quotaChipCN' | 'quotaChipGlobal' 
 }
 
 /**
+ * The credit document the chip headline must speak for.
+ *
+ * The chip belongs to the account that pays for the session's requests, so when
+ * the host reports a pool the ACTIVE entry's own price is the headline figure.
+ * A spare account's numbers belong to its panel row and must never leak upward
+ * (m01197). Documents without a pool — the env-only credential — keep the
+ * document-level `credits` they always used.
+ */
+function activeCredits(status: QoderWebStatus | undefined): QoderWebCredits | undefined {
+  if (status === undefined || status.status !== 'signed-in') return undefined
+  const active = status.accounts?.entries.find(entry => entry.active)
+  return active?.credits ?? status.credits
+}
+
+/**
  * The chip's remaining-credit readout: a number, "Unlimited", or an em dash.
  *
  * The em dash is the not-ready state (no document yet, signed out, or an
  * upstream error document) rather than "0", which would claim an empty account.
  */
 function chipReadout(status: QoderWebStatus | undefined, t: QoderPluginCardInjected['t']): string {
-  if (status === undefined || status.status !== 'signed-in') return '—'
-  const credits = status.credits
+  const credits = activeCredits(status)
   if (credits === undefined) return '—'
   const summary = creditSummary(credits)
   return summary.unlimited ? t('quotaUnlimited') : formatNumber(summary.remain)
@@ -151,29 +182,38 @@ interface VariantFigures {
 }
 
 /**
- * Project a status document into the row's figures.
+ * Project one plan + credits pair into a row's figures.
  *
- * `undefined` means "no figures to draw" (no document, signed out, or the
- * upstream error arm) — the row renders an empty/error state instead of
- * inventing zeroes. The credit figures follow {@link creditSummary}; the
- * denominator is the summed package size (the reported total only when the
- * packages carry no size at all).
+ * Shared by the single-account row (the document's `plan`/`credits`) and the
+ * per-account rows (each entry's own pair), so the account that pays cannot be
+ * priced differently in the two layouts. `undefined` means "no figures to draw"
+ * (the upstream error arm, or a pool row whose billing read failed) — the row
+ * renders an unavailable state instead of inventing zeroes. The credit figures
+ * follow {@link creditSummary}; the denominator is the summed package size (the
+ * reported total only when the packages carry no size at all).
  */
-function variantFigures(status: QoderWebStatus | undefined): VariantFigures | undefined {
-  if (status === undefined || status.status !== 'signed-in') return undefined
-  const credits = status.credits
+function figuresFrom(
+  plan: QoderWebPlan | undefined,
+  credits: QoderWebCredits | undefined,
+): VariantFigures | undefined {
   if (credits === undefined) return undefined
   const summary = creditSummary(credits)
   return {
-    planName: status.plan?.planTierName,
+    planName: plan?.planTierName,
     unlimited: summary.unlimited,
     remain: summary.remain,
     total: summary.total,
     // `clampPercent` returns undefined for an unknown denominator: the row then
     // draws no bar rather than an invented full one.
     percent: summary.unlimited ? undefined : clampPercent(summary.remain, summary.total),
-    expiry: credits.cycleResetTime ?? status.plan?.endDate,
+    expiry: credits.cycleResetTime ?? plan?.endDate,
   }
+}
+
+/** The active variant's figures, from the document-level plan and credits. */
+function variantFigures(status: QoderWebStatus | undefined): VariantFigures | undefined {
+  if (status === undefined || status.status !== 'signed-in') return undefined
+  return figuresFrom(status.plan, status.credits)
 }
 
 /** The row-head value copy: unlimited, `remain / size`, or "remain only". */
@@ -214,6 +254,33 @@ function containsTarget(container: HTMLElement | null, target: EventTarget | nul
   return typeof Node !== 'undefined' && target instanceof Node && container.contains(target)
 }
 
+/**
+ * The thin remaining-credit bar plus its percent/expiry caption.
+ *
+ * Shared by the single-account row and the per-account rows so both draw the
+ * same bar geometry (the only inline size is the bar's percent `width`, which
+ * is geometry, not appearance).
+ */
+function CreditBar({ figures, t }: {
+  figures: VariantFigures
+  t: QoderPluginCardInjected['t']
+}): ReactNode {
+  return (
+    <>
+      <div className="qdp-popBar">
+        <div
+          className={cx(
+            'qdp-popBarFill',
+            figures.percent !== undefined && figures.percent < WARN_PERCENT && 'qdp-popWarn',
+          )}
+          style={{ width: `${figures.percent === undefined ? 100 : Math.max(2, figures.percent)}%` }}
+        />
+      </div>
+      <span className="qdp-popCaption">{captionText(figures, t)}</span>
+    </>
+  )
+}
+
 /** The active variant's panel row. */
 function VariantRow({ card, status, failed, t }: {
   card: QoderCardVariant
@@ -242,16 +309,7 @@ function VariantRow({ card, status, failed, t }: {
         )
       ) : (
         <>
-          <div className="qdp-popBar">
-            <div
-              className={cx(
-                'qdp-popBarFill',
-                figures.percent !== undefined && figures.percent < WARN_PERCENT && 'qdp-popWarn',
-              )}
-              style={{ width: `${figures.percent === undefined ? 100 : Math.max(2, figures.percent)}%` }}
-            />
-          </div>
-          <span className="qdp-popCaption">{captionText(figures, t)}</span>
+          <CreditBar figures={figures} t={t} />
           {failed || failedDocument ? (
             // The stale-but-useful figures stay on screen; the failure is
             // reported beside them so "old number" never passes for "fresh".
@@ -259,6 +317,145 @@ function VariantRow({ card, status, failed, t }: {
           ) : null}
         </>
       )}
+    </div>
+  )
+}
+
+/**
+ * The name one pooled account is listed under.
+ *
+ * The subscriber name is the real answer; the token tail is the honest fallback
+ * (two tokens saved for the same person are told apart by nothing else), and the
+ * failover slot is the last resort — the same order the settings card's pool
+ * list uses, so one account reads the same in both surfaces.
+ */
+function accountDisplayName(entry: QoderAccountSummary, t: QoderPluginCardInjected['t']): string {
+  return entry.accountName ?? entry.patTail ?? t('accountSlot', { order: entry.order })
+}
+
+/**
+ * One pooled account's row in the panel.
+ *
+ * The USERNAME is the switch control (m01197: 「点击用户名切换账号」): the active
+ * seat's name is inert text carrying the in-use marker, every other name is a
+ * button that activates that account. A row whose billing read failed keeps its
+ * name and its switch — an account the user may need to move to is exactly the
+ * one a failed price must not hide — and states the figure as unavailable
+ * rather than borrowing a neighbour's number.
+ */
+function AccountRow({ entry, busy, canSwitch, onActivate, t }: {
+  entry: QoderAccountSummary
+  busy: boolean
+  canSwitch: boolean
+  onActivate: (accountId: string, name: string) => void
+  t: QoderPluginCardInjected['t']
+}): ReactNode {
+  const name = accountDisplayName(entry, t)
+  /*
+   * A parked account publishes no figure.
+   *
+   * The parked switch means "do not route here", so the seat is out of the
+   * walk and out of this panel's arithmetic; a spendable-looking number beside
+   * it would promise a balance the plugin will never spend. Saying
+   * `accountCreditsParked` explains the absence instead of printing an em dash
+   * that reads as a failed read.
+   */
+  const parked = entry.enabled === false
+  const figures = parked ? undefined : figuresFrom(entry.plan, entry.credits)
+  // No auth key means no write is possible (an old host, or an error document):
+  // the row then shows the name as text instead of offering a dead control.
+  const switchable = !entry.active && canSwitch
+  return (
+    <li
+      className={cx('qdp-popAccount', entry.active && 'qdp-popAccountActive', parked && 'qdp-popAccountParked')}
+      data-account-id={entry.id}
+    >
+      <div className="qdp-popAccountHead">
+        {switchable ? (
+          <button
+            type="button"
+            className="qdp-popAccountName qdp-popAccountSwitch"
+            aria-label={t('accountSwitchAria', { name })}
+            disabled={busy}
+            onClick={() => {
+              onActivate(entry.id, name)
+            }}
+          >
+            {name}
+          </button>
+        ) : (
+          <span className="qdp-popAccountName">{name}</span>
+        )}
+        {entry.active ? <QdpTag tone="success">{t('accountCurrent')}</QdpTag> : null}
+        {parked ? <QdpTag tone="neutral">{t('accountParked')}</QdpTag> : null}
+        {figures?.planName === undefined ? null : <QdpTag>{figures.planName}</QdpTag>}
+        {/*
+          The account's observed service state, on the same terms as the card's
+          account list: `undefined` is "nothing observed", which renders
+          nothing rather than an invented 正常.
+        */}
+        {entry.health === undefined ? null : (
+          <span className="qdp-popAccountHealth" title={t('accountHealthAria')}>
+            <QdpTag tone={entry.health === 'normal' ? 'success' : 'warn'}>
+              {accountHealthLabel(entry.health, t)}
+            </QdpTag>
+          </span>
+        )}
+        <span className="qdp-popValue">
+          {parked
+            ? t('accountCreditsParked')
+            : figures === undefined ? '—' : valueText(figures, t)}
+        </span>
+      </div>
+      {parked ? null : figures === undefined ? (
+        <span className="qdp-popAccountUnavailable">
+          <QdpTag tone="error">{t('quotaError')}</QdpTag>
+        </span>
+      ) : (
+        <CreditBar figures={figures} t={t} />
+      )}
+    </li>
+  )
+}
+
+/**
+ * The pooled-account section of the panel.
+ *
+ * It replaces the single-variant row rather than sitting under it: with a pool
+ * the per-account rows carry the same plan/credit/bar facts, and rendering both
+ * would show the active account's numbers twice.
+ */
+function AccountPool({ entries, busy, canSwitch, onActivate, t }: {
+  entries: readonly QoderAccountSummary[]
+  busy: boolean
+  canSwitch: boolean
+  onActivate: (accountId: string, name: string) => void
+  t: QoderPluginCardInjected['t']
+}): ReactNode {
+  return (
+    <div className="qdp-popAccounts">
+      <div className="qdp-popAccountsHead">
+        <span className="qdp-popAccountsTitle">{t('accountsHeading')}</span>
+        {/*
+          The rows' affordance is the name itself, so the panel says so once
+          above them — and only while a switch is actually possible, which is
+          also what explains an older host's names being inert.
+        */}
+        {canSwitch ? <span className="qdp-popAccountsSwitchHint">{t('accountsSwitchHint')}</span> : null}
+      </div>
+      <span className="qdp-popAccountsHint">{t('accountsHint')}</span>
+      <ul className="qdp-popAccountList">
+        {entries.map(entry => (
+          <AccountRow
+            key={entry.id}
+            entry={entry}
+            busy={busy}
+            canSwitch={canSwitch}
+            onActivate={onActivate}
+            t={t}
+          />
+        ))}
+      </ul>
     </div>
   )
 }
@@ -301,6 +498,11 @@ function ComposerQuota({ card, t }: {
   const [refreshing, setRefreshing] = useState(false)
   /** Whether the most recent read for this variant failed; cleared by success. */
   const [failed, setFailed] = useState(false)
+  /** A pooled-account switch in flight; every switch control disables meanwhile. */
+  const [accountBusy, setAccountBusy] = useState(false)
+  /** The last switch's verdict: the failure line, or the confirmation line. */
+  const [accountError, setAccountError] = useState<string | undefined>(undefined)
+  const [accountNotice, setAccountNotice] = useState<string | undefined>(undefined)
   /** Fixed-panel geometry, measured from the chip; `null` until first measured. */
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
@@ -323,6 +525,16 @@ function ComposerQuota({ card, t }: {
   // The subscribed poll interval restarts the timer when 刷新间隔 changes, so a
   // saved interval takes effect without remounting the composer.
   const pollMs = useSyncExternalStore(onQuotaSettingsChange, quotaPollMs, quotaPollMs)
+  // The document this variant currently shows. Declared here rather than beside
+  // the render because the chip headline and the account switch below both need
+  // it, and because the switch key must come from the same read as the rows.
+  const currentStatus = quotaStatus(card.id)
+  // The write key the auth route demands. An error document carries no key and
+  // an older host may never send one; the pool then lists names without a
+  // switch control instead of offering a button that cannot work.
+  const authKey = currentStatus === undefined || currentStatus.status === 'error'
+    ? undefined
+    : currentStatus.authKey
 
   /**
    * Read the active variant's status route.
@@ -497,10 +709,64 @@ function ComposerQuota({ card, t }: {
     }
   }, [fetchStatus, refreshing])
 
-  const currentStatus = quotaStatus(card.id)
+  /**
+   * Move the sign-in to another pooled account.
+   *
+   * The request mirrors the settings card's `accountAction` field for field —
+   * same route, same capitalized `X-Qoder-Auth-Key`, same same-origin
+   * credentials — because the host treats both surfaces as one caller and the
+   * key is the only proof the write is ours. The body names the account by its
+   * id (the credential's one-way hash), never the token.
+   *
+   * The re-read is what moves the in-use marker and the chip headline: the route
+   * answers `{ok}` only, so the new active seat is a fact of the status
+   * document, not of the response. A refusal is re-read too — an unknown id
+   * means another surface changed the pool under this panel.
+   */
+  const activateAccount = useCallback(async (accountId: string, name: string): Promise<void> => {
+    const key = authKey
+    if (key === undefined || accountBusy) return
+    setAccountBusy(true)
+    setAccountError(undefined)
+    setAccountNotice(undefined)
+    try {
+      const body: QoderAuthRequest = { action: 'activate-account', accountId }
+      const response = await fetch(card.authPath, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Qoder-Auth-Key': key },
+        credentials: 'same-origin',
+        body: JSON.stringify(body),
+      })
+      const value: unknown = await response.json().catch((): undefined => undefined)
+      if (!mounted.current) return
+      const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+      if (!response.ok || record['ok'] !== true) {
+        const detail = typeof record['error'] === 'string' ? record['error'] : `HTTP ${response.status}`
+        setAccountError(t('accountActionFailed', { message: detail }))
+      } else {
+        setAccountNotice(t('accountSwitched', { name }))
+      }
+      await fetchStatus(true)
+    } catch (error: unknown) {
+      if (mounted.current) {
+        setAccountError(t('accountActionFailed', {
+          message: error instanceof Error ? error.message : t('requestFailed'),
+        }))
+      }
+    } finally {
+      if (mounted.current) setAccountBusy(false)
+    }
+  }, [accountBusy, authKey, card.authPath, fetchStatus, t])
+
   const name = t(chipNameKey(card))
   const readout = chipReadout(currentStatus, t)
   const fetchedAt = quotaStatusFetchedAt(card.id)
+  // The stored pool, if the host reported one. Absent or empty means the
+  // credential came from the environment, which has exactly one seat: the
+  // single-variant row below then renders precisely as it always has.
+  const poolEntries = currentStatus?.status === 'signed-in'
+    ? currentStatus.accounts?.entries ?? []
+    : []
 
   return (
     <>
@@ -556,7 +822,28 @@ function ComposerQuota({ card, t }: {
             </QdpIconButton>
           </div>
           <div className="qdp-popList">
-            <VariantRow card={card} status={currentStatus} failed={failed} t={t} />
+            {poolEntries.length > 0 ? (
+              <>
+                <AccountPool
+                  entries={poolEntries}
+                  busy={accountBusy}
+                  canSwitch={authKey !== undefined}
+                  onActivate={(accountId, accountName) => {
+                    void activateAccount(accountId, accountName)
+                  }}
+                  t={t}
+                />
+                {failed ? <p className="qdp-alert qdp-alertError">{t('quotaError')}</p> : null}
+              </>
+            ) : (
+              <VariantRow card={card} status={currentStatus} failed={failed} t={t} />
+            )}
+            {accountError !== undefined ? (
+              <p className="qdp-alert qdp-alertError" role="alert">{accountError}</p>
+            ) : null}
+            {accountNotice !== undefined ? (
+              <p className="qdp-caption" role="status">{accountNotice}</p>
+            ) : null}
           </div>
           <div className="qdp-popFoot">
             <span>

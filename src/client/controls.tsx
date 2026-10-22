@@ -18,8 +18,10 @@
  */
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type KeyboardEvent,
@@ -237,6 +239,90 @@ export interface QdpInputProps extends InputHTMLAttributes<HTMLInputElement> {}
 /** Single-line text field on the official 32px/R12 geometry. */
 export function QdpInput({ className, ...rest }: QdpInputProps): ReactNode {
   return <input {...rest} className={cx('qdp-input', className)} />
+}
+
+/* ----------------------------------------------------------- number field */
+
+export interface QdpNumberFieldProps {
+  /** The committed value the host holds. */
+  value: number
+  /** Lowest acceptable value; a smaller entry is clamped to it. */
+  min: number
+  /** Highest acceptable value; a larger entry is clamped to it. */
+  max: number
+  /** Accessible name; the visible label is owned by the surrounding row. */
+  label: string
+  disabled?: boolean
+  className?: string
+  /** A `data-*` marker the tests can key on. */
+  marker?: string
+  /** Called once, with a clamped value, when the field is committed. */
+  onCommit: (value: number) => void
+}
+
+/**
+ * A bounded number field that writes on commit, never on a keystroke.
+ *
+ * The card's other number fields used to call `onChange` for every character,
+ * which cannot work: clearing the field to retype it yields `''`, the parse
+ * fails, the write is skipped, and the controlled input snaps straight back to
+ * the stored number — so the field reads as "cannot be edited". Here the typed
+ * text is local state; blur or Enter parses it, clamps it into `[min, max]`, and
+ * commits only a value that differs from the stored one. Escape reverts.
+ */
+export function QdpNumberField({
+  value,
+  min,
+  max,
+  label,
+  disabled,
+  className,
+  marker,
+  onCommit,
+}: QdpNumberFieldProps): ReactNode {
+  const [draft, setDraft] = useState(String(value))
+
+  // Re-seed whenever the stored value changes underneath us (a save landing,
+  // another surface editing it). Editing itself does not write, so this cannot
+  // fight the typist.
+  useEffect(() => { setDraft(String(value)) }, [value])
+
+  const commit = (): void => {
+    const parsed = Number.parseInt(draft, 10)
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(value))
+      return
+    }
+    const clamped = Math.min(max, Math.max(min, parsed))
+    setDraft(String(clamped))
+    if (clamped !== value) onCommit(clamped)
+  }
+
+  return (
+    <input
+      type="number"
+      inputMode="numeric"
+      className={cx('qdp-input', 'qdp-inputShort', className)}
+      min={min}
+      max={max}
+      step={1}
+      value={draft}
+      disabled={disabled === true}
+      aria-label={label}
+      data-number-field={marker}
+      onChange={event => { setDraft(event.target.value) }}
+      onBlur={commit}
+      onKeyDown={event => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          commit()
+        } else if (event.key === 'Escape') {
+          event.preventDefault()
+          setDraft(String(value))
+        }
+      }}
+    />
+  )
 }
 
 /* -------------------------------------------------------------- icon button */

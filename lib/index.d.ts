@@ -84,15 +84,147 @@ declare const QODER_GLOBAL_AUTH_PATH = "/plugins/dsh-qoder-plugin/global/auth";
  * One action the PAT route accepts.
  *
  * `save-pat` validates the pasted token against the variant's region and, only
- * on success, persists it; `clear` removes the stored credential. There is no
- * device flow and no credential import: the token is the whole auth surface.
+ * on success, persists it (an already-stored token is re-selected rather than
+ * duplicated); `activate-account` switches which stored token signs requests;
+ * `remove-account` drops one stored token; `set-account-enabled` parks one
+ * stored token without deleting it — the failover walk skips it and the
+ * composer panel leaves its credits out, yet it stays saved and stays
+ * hand-signable; `clear` removes every stored credential. There is no device
+ * flow and no credential import: the token is the whole auth surface.
  */
-type QoderAuthAction = 'save-pat' | 'clear';
+type QoderAuthAction = 'save-pat' | 'clear' | 'activate-account' | 'remove-account' | 'set-account-enabled';
 /** Request body accepted by the PAT route. */
 interface QoderAuthRequest {
   action: QoderAuthAction;
   /** The token to validate and store; required for `save-pat`. */
   pat?: string;
+  /**
+   * The stable id of the stored account to act on; required for
+   * `activate-account`, `remove-account` and `set-account-enabled`.
+   *
+   * Never the token itself: the id is the credential's one-way hash
+   * (`qoderCredentialIdentity`), which is what the status document hands the
+   * card, so a card can only ever name an account the host told it about.
+   */
+  accountId?: string;
+  /**
+   * The new enablement for `set-account-enabled`.
+   *
+   * Required for that action and rejected for every other one: a missing value
+   * there is a malformed request, not "keep it as it is", because a card that
+   * lost the value would otherwise silently re-enable an account the user had
+   * just parked.
+   */
+  enabled?: boolean;
+}
+/**
+ * One stored account, as the card lists it.
+ *
+ * A variant may hold several PATs (the user's own, a colleague's, a spare), and
+ * which one signs a request is a choice rather than a constant. This is the
+ * browser-safe projection of one entry: the display facts plus the two pieces
+ * of identity the card needs to act on it — never the token.
+ */
+interface QoderAccountSummary {
+  /** Stable account id: the credential's one-way hash, safe to display. */
+  id: string;
+  /** Last four characters of the token, enough to tell two of them apart. */
+  patTail?: string;
+  /** The subscriber name the upstream reported for this account, when known. */
+  accountName?: string;
+  /** When this token was saved, epoch milliseconds. */
+  savedAtMs?: number;
+  /** Where this credential came from when it was stored. */
+  source: QoderCredentialSource;
+  /** Whether this is the account that currently signs requests. */
+  active: boolean;
+  /**
+   * 1-based position in the order automatic failover walks.
+   *
+   * The switch order is the order the accounts were saved in, which is the
+   * only ordering the plugin can honestly claim: it has no per-account health
+   * ranking to sort by, and inventing one would reorder a user's list behind
+   * their back.
+   */
+  order: number;
+  /**
+   * This account's own plan, when the host could read it.
+   *
+   * The composer panel prices every pooled account, not just the one that
+   * signs; each row carries the plan its credits belong to so a spare seat's
+   * tier is visible before the user switches to it.
+   */
+  plan?: QoderWebPlan;
+  /** This account's own credits, from that account's billing answer. */
+  credits?: QoderWebCredits;
+  /**
+   * Why this account's billing answer is missing, when the read failed.
+   *
+   * A failed price must not hide an account the user can still switch to, so
+   * the row survives with an explanation instead of disappearing or showing a
+   * stale figure borrowed from another account.
+   */
+  creditsError?: string;
+  /**
+   * Whether automatic switching may pick this account.
+   *
+   * A disabled account stays saved and stays signable when the user activates
+   * it by hand; it is simply never chosen by the failover walk, and the
+   * composer panel leaves its credits out. Absent means enabled — documents
+   * written before this field existed must keep every account usable.
+   */
+  enabled?: boolean;
+  /**
+   * This account's observed service state, from its own request outcomes.
+   *
+   * `normal`: nothing wrong was seen. `queued`: the last thing the upstream
+   * said about this account was its per-model queue answer. `limited`: the
+   * account keeps queueing or keeps failing to connect — two queue answers at
+   * least an hour apart, or repeated connection failures — which is what the
+   * card shows as 限流. Absent when the plugin has observed nothing yet.
+   */
+  health?: QoderAccountHealth;
+}
+/** One account's observed service state (see {@link QoderAccountSummary.health}). */
+type QoderAccountHealth = 'normal' | 'queued' | 'limited';
+/**
+ * The account pool and its failover policy, as the card displays them.
+ *
+ * `autoFailover` is a user preference, not a derived fact: switching accounts
+ * changes which subscription pays for a request, so it is opt-out-able even
+ * though it is on by default.
+ */
+interface QoderWebAccounts {
+  entries: readonly QoderAccountSummary[];
+  /** Whether a connection failure moves on to the next account automatically. */
+  autoFailover: boolean;
+  /**
+   * The last automatic switch, epoch ms; absent when none has happened in this
+   * process. The card renders it so an otherwise silent account change shows.
+   */
+  lastFailoverAt?: number;
+  /** Why the last automatic switch happened, a short redacted reason. */
+  lastFailoverReason?: string;
+  /**
+   * Whether the user enabled automatic switching at all.
+   *
+   * Distinct from {@link autoFailover}: that one reports whether a failure
+   * COULD be absorbed right now (two or more usable accounts, switching on).
+   * This one is the raw preference, which the advanced settings render as a
+   * switch even when only one account is saved.
+   */
+  autoFailoverEnabled?: boolean;
+  /**
+   * The account ids in the order the walk tries them, as configured.
+   *
+   * Empty when the user never reordered anything, in which case the walk uses
+   * save order. Ids that name accounts of the other variant are carried here
+   * too: one list spans both variants, and each variant's walk simply skips
+   * the ids that are not its own.
+   */
+  routingOrder?: readonly string[];
+  /** Which strategy the walk follows: the save order, or {@link routingOrder}. */
+  routingStrategy?: 'save-order' | 'custom';
 }
 /** Where the credential in effect came from. */
 type QoderCredentialSource = 'card' | 'env' | 'cli';
@@ -258,6 +390,37 @@ interface QoderCatalogModelSnapshot {
   /** Upstream provenance marker (`system` / `user`), when reported. */
   source?: string;
 }
+/**
+ * One upstream "this model is not serviceable" answer, as the card shows it.
+ *
+ * Qoder answers a saturated per-model queue (or a region whose service is off)
+ * with HTTP 401/403/200 whose body carries `code: 10605`, `isQueued`,
+ * `serviceAvailable`, and `retryAfterSeconds`. That answer is emphatically NOT
+ * a credential or quota problem, and the two ways it used to be misreported
+ * were both actively misleading: as `AUTH` it sent the user to replace a
+ * perfectly good token, and as a bare `RATE_LIMIT` it said "throttled" while
+ * hiding the one fact that matters — the model is unavailable, and coming back
+ * later is the whole remedy. This carries the explanation, and the upstream's
+ * own words, to the surfaces that show it.
+ */
+interface QoderWebUpstreamNotice {
+  /** `queued`: a saturated per-model queue. `unavailable`: the service is off. */
+  kind: 'queued' | 'unavailable';
+  /** The upstream's own message, verbatim and bounded, for the user to quote. */
+  upstreamMessage?: string;
+  /** The delay the upstream asked for, milliseconds. */
+  retryAfterMs?: number;
+  /**
+   * Whether the plugin actually waited that delay and retried before
+   * reporting. The notice's own wording claims a wait, so the claim is carried
+   * as a fact rather than assumed by the renderer.
+   */
+  waited: boolean;
+  /** When the notice was recorded, epoch milliseconds. */
+  at: number;
+  /** How many times this same notice has recurred in this process. */
+  occurrences: number;
+}
 /** The JSON document the plugin card renders. */
 type QoderWebStatus = {
   status: 'signed-in';
@@ -265,6 +428,19 @@ type QoderWebStatus = {
   region?: QoderRegion;
   /** Redacted summary of the PAT in effect. */
   pat?: QoderPatSummary;
+  /**
+   * The account pool and its failover policy.
+   *
+   * Present even with a single account (`entries.length === 1`): the card
+   * renders the list from this alone, so a separate single-account shape
+   * would be a second code path that only ever shows one row.
+   */
+  accounts?: QoderWebAccounts;
+  /**
+   * The most recent upstream "not serviceable" answer, when one is in effect.
+   * Absent when the upstream has not refused a model on this variant.
+   */
+  upstreamNotice?: QoderWebUpstreamNotice;
   /**
    * The subscriber's coding plan, when the upstream described one.
    *
@@ -417,6 +593,42 @@ interface QoderCredential {
   savedAtMs?: number;
   source: QoderCredentialSource;
 }
+/**
+ * One token in the pool, named by the identity that survives across rewrites.
+ *
+ * `id` is derived from the token itself rather than assigned, so the same
+ * token re-pasted later lands on the same row instead of accumulating
+ * duplicates — and so the id can be shown, stored in probe records, and sent
+ * to the card without carrying anything that could be replayed.
+ */
+interface QoderStoredAccount {
+  id: string;
+  pat: string;
+  region: QoderRegion;
+  /**
+   * When the token was saved, epoch milliseconds.
+   *
+   * Optional because the FILE may legitimately lack it: a v2 document written
+   * by a build that omitted it, or a hand-edited file, reads as "unknown" — and
+   * unknown must stay absent all the way to the card rather than being
+   * invented. Stamp 0 would render as 1970 and claim a save time nobody
+   * recorded.
+   */
+  savedAtMs?: number;
+  /**
+   * Whether this account may sign requests, when the user has parked it.
+   *
+   * Absent means ENABLED, and the distinction is load-bearing rather than
+   * cosmetic: this file is user data written by earlier builds that knew no
+   * such field, so reading "absent" as "disabled" would park every account of
+   * every existing installation on upgrade. The writer therefore round-trips
+   * the field as it found it — a row that never carried the flag is written
+   * back without it, and only an explicit park materializes `false`. That
+   * keeps the on-disk shape as small as it was for the overwhelmingly common
+   * case while still letting the parked case survive a restart.
+   */
+  enabled?: boolean;
+}
 /** Read-only sign-in summary for status, the PAT route, and doctor output. */
 interface QoderAuthStatus {
   state: 'configured' | 'missing';
@@ -454,16 +666,39 @@ declare class QoderCredentialStore {
   private readonly logger;
   /** The legacy-file warning is emitted once per process, not per read. */
   private legacyWarned;
+  /** Tail of the mutator queue; see {@link QoderCredentialStore.exclusive}. */
+  private chain;
   constructor(options: QoderStoreOptions);
   /** Absolute path of this variant's credential file, for display and tests. */
   ownAuthPath(): string;
   /**
+   * Every stored account, in save order.
+   *
+   * The pool without the projection: callers that must act on a token (the
+   * transport's failover, the CLI) need the secret; callers that only render
+   * it use {@link QoderCredentialStore.accounts}.
+   */
+  list(): Promise<readonly QoderStoredAccount[]>;
+  /**
+   * The browser-safe account list for the card.
+   *
+   * An environment-sourced token is deliberately absent: it is not a stored
+   * account, cannot be switched away from or removed here, and listing it
+   * beside removable rows would offer actions that cannot work. It still signs
+   * requests when no file exists — that is `current()`'s job, not this list's.
+   *
+   * `source` is always `card`: the file does not record who typed the token,
+   * because "card vs cli" only says which entry point ran the same save and a
+   * file left by any other tool is indistinguishable from the card's.
+   */
+  accounts(): Promise<readonly QoderAccountSummary[]>;
+  /**
    * The credential currently in effect, or `undefined` when there is none.
    *
-   * Resolution order: the plugin-owned file, then the arm's environment
-   * variable (only when no file exists — a saved token always wins over a
-   * stray env), then nothing. There is no refresh and no expiry check: a PAT
-   * lives until revoked.
+   * Resolution order: the active account in the plugin-owned file, then the
+   * arm's environment variable (only when no file account exists — a saved
+   * token always wins over a stray env), then nothing. There is no refresh and
+   * no expiry check: a PAT lives until revoked.
    */
   current(): Promise<QoderCredential | undefined>;
   /**
@@ -477,12 +712,100 @@ declare class QoderCredentialStore {
   /** The token in effect as a bare string, rejecting when there is none. */
   patPromise(): Promise<string>;
   /**
-   * Persist a token for this variant. The caller is responsible for having
-   * validated it against the region first (`validateApiKey` upstream).
+   * Persist a token for this variant, and make it the active account.
+   *
+   * The caller is responsible for having validated it against the region first
+   * (`validateApiKey` upstream). Saving a token that is already stored updates
+   * it in place and selects it: pasting the same token again means "use this
+   * one", not "add a second copy of it".
    */
   save(pat: string, source?: QoderCredentialSource): Promise<QoderCredential>;
-  /** Remove the stored credential. A missing file is not an error. */
+  /**
+   * Make one stored account sign requests.
+   *
+   * Throws on an unknown id rather than quietly selecting something else: the
+   * only caller is the card, whose id came from a status document that may
+   * have gone stale (the row was removed in another tab), and silently
+   * switching to a *different* account than the one asked for is exactly the
+   * surprise this feature exists to remove.
+   */
+  activate(accountId: string): Promise<QoderCredential>;
+  /**
+   * Drop one stored account. Returns whether one was actually removed.
+   *
+   * Removing the active account hands the role to the account that followed it
+   * in save order (falling back to the one before it when it was last), which
+   * is the same successor automatic failover would have picked — so a user who
+   * deletes a dead account lands on a usable one instead of being signed out
+   * while other tokens sit in the file.
+   */
+  remove(accountId: string): Promise<boolean>;
+  /**
+   * Park or un-park one stored account. Returns whether the id was found.
+   *
+   * An unknown id answers `false` rather than throwing: the caller is a card
+   * acting on a row it read a moment ago, and the row may legitimately have
+   * been removed in another tab — that is a stale click, not a broken request.
+   *
+   * Parking never touches `activeId`. The account in effect keeps signing until
+   * the user (or a failover) moves the pointer, because a checkbox that
+   * silently changed which subscription pays would be a much larger action
+   * than the one word on it.
+   */
+  setEnabled(accountId: string, enabled: boolean): Promise<boolean>;
+  /**
+   * The account after `accountId` in save order, for automatic failover.
+   *
+   * Wraps, so a caller that tracks the ids it has already tried walks the whole
+   * pool exactly once and then stops when the successor is one it has seen.
+   * `undefined` means there is nothing else to try: no accounts at all, or only
+   * the one that just failed.
+   *
+   * Parked accounts are skipped. That is the whole point of parking one: it
+   * takes an account out of the automatic walk without deleting the token, so
+   * a dead subscription stops absorbing half of every failover. The walk is
+   * still bounded to one lap of the pool, and a starting id that is itself
+   * parked still walks FORWARD from its position — otherwise parking the
+   * account that just failed would end the walk instead of moving past it.
+   */
+  nextAfter(accountId: string | undefined): Promise<QoderStoredAccount | undefined>;
+  /**
+   * Resolve one stored account by id, token included.
+   *
+   * The custom routing order and a pinned session both name accounts by id
+   * rather than by position, and both need the PAT to actually sign with. This
+   * is the accessor that answers "which token is that id", the counterpart of
+   * {@link QoderCredentialStore.accounts}, which deliberately carries no token.
+   *
+   * `undefined` for an id that names nothing — the card's order may be a poll
+   * behind the file, and the walk must skip a removed account instead of
+   * failing on it.
+   */
+  byId(accountId: string): Promise<QoderStoredAccount | undefined>;
+  /** Remove every stored credential. A missing file is not an error. */
   clear(): Promise<void>;
+  /**
+   * Delete the credential file, if any.
+   *
+   * Split out of {@link QoderCredentialStore.clear} because `remove` has to do
+   * the same deletion from *inside* the mutator queue, and calling `clear` there
+   * would wait on a queue its own caller already holds.
+   */
+  private deleteDocument;
+  /**
+   * Run one read-modify-write section with the file to itself.
+   *
+   * Every mutator here loads the document, edits the array in memory, and writes
+   * it back. Two of them interleaving lose an account: both read the same list,
+   * and whichever writes second drops the other's addition — the atomic rename
+   * inside `writeDocument` makes each write whole, but says nothing about the
+   * read that preceded it. The card can fire two saves from one click (a double
+   * submit, or a second tab) and the PAT route holds no lock of its own, so the
+   * exclusion lives here instead. Reads stay outside the queue: they either see
+   * the old document or the new one, never a torn one, and serializing them
+   * would make every status poll wait on someone else's save.
+   */
+  private exclusive;
   /** Alias kept for call-site readability (`logout` is just clearing). */
   logout(): Promise<void>;
   /** Redacted summary for the card, the PAT route, and doctor output. */
@@ -490,11 +813,11 @@ declare class QoderCredentialStore {
   /** Set when a read found a stale WorkBuddy-era file; consumed once. */
   private pendingLegacyReason;
   private fromEnvironment;
-  private readOwn;
-  private writeOwn;
+  private readDocument;
+  private writeDocument;
 }
 /**
- * The plugin-owned credential path for one variant's default filename.
+ * The plugin-owned credential path for one variant.
  * Kept as a free function for the CLI, which builds no store per display line.
  */
 declare function qoderOwnAuthPath(variant: QoderVariant): string;
@@ -824,20 +1147,33 @@ interface QoderCheckInResult {
    * A stable reason code for a failed attempt, when one applies.
    *
    * Carried alongside `message` so the card can localize the one failure the
-   * user can actually act on — `no-client` means this machine has no Qoder
-   * client to mint the device identity the international campaign requires —
-   * instead of matching on English prose.
+   * user can actually act on instead of matching on English prose:
+   * - `no-client` — this machine has no Qoder client to mint the device
+   *   identity the international campaign requires.
+   * - `claim-conflict` — the claim endpoint answered HTTP 409 and the
+   *   authoritative campaign read afterwards still says the benefit was not
+   *   granted (window closed, or the campaign is not claimable right now).
+   *   The card must not read that as a granted benefit.
    */
-  reasonCode?: 'no-client' | undefined;
+  reasonCode?: 'no-client' | 'claim-conflict' | undefined;
 }
 //#endregion
 //#region src/qoder/transport/index.d.ts
 interface QoderTransport {
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk>;
   discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]>;
+  /**
+   * Read one account's billing answer.
+   *
+   * `pat` names the account to read; without it the ambient credential signs,
+   * which is what the card's single-account quota read does. With it, the host
+   * can price every pooled account in one status document without switching the
+   * active pointer — the read is a plain GET, it does not adopt the credential.
+   */
   readAccount(options?: {
     force?: boolean | undefined;
     signal?: AbortSignal | undefined;
+    pat?: string | undefined;
   }): Promise<QoderAccountInfo>;
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>;
 }
@@ -923,6 +1259,22 @@ declare function kindFromQoderFailure(failure: {
   code: string;
   status?: number | undefined;
 }): UpstreamErrorKind;
+/**
+ * One pooled account's billing answer, host-side.
+ *
+ * Shared by the ambient credential's read ({@link QoderUpstreamClient.fetchCredits},
+ * which also caches the name and plan for the card) and the per-account read
+ * ({@link QoderUpstreamClient.fetchAccountBilling}) so both price an account
+ * identically — a pooled row must never disagree with the headline row about
+ * the same upstream answer.
+ */
+interface QoderAccountBilling {
+  /** The subscriber name, absent when the upstream reported none. */
+  accountName?: string;
+  /** The plan these credits belong to, when the upstream described one. */
+  plan?: QoderSubscriberPlan;
+  credits: QoderCredits;
+}
 /** Constructor options for {@link QoderUpstreamClient}. */
 interface QoderUpstreamClientOptions {
   /** Which upstream region this client's transport talks to. */
@@ -995,17 +1347,31 @@ declare class QoderUpstreamClient {
    */
   fetchModels(signal?: AbortSignal): Promise<QoderModelInfo[]>;
   /**
-   * The subscriber's quota answer, mapped onto the card's credit shape.
+   * One named account's plan and credits, without adopting it.
    *
-   * Qoder reports one personal quota and an optional organization resource
-   * package; each becomes a package row the card already knows how to draw.
-   * An unbounded personal allowance (`total === 0`, not exceeded) is the
-   * account's "unlimited" state.
+   * {@link fetchCredits} prices the credential that currently signs and caches
+   * its name for the card; this reads a SPECIFIC pooled token so the composer
+   * panel can price every account the user holds. The distinction is
+   * load-bearing: reading a spare account must not relabel the ambient one, so
+   * neither `accountName` nor `accountPlan` is touched here — the caller
+   * projects the answer onto the row it belongs to.
    *
-   * `expiresAt` 是账号级的周期边界（喂给 `cycleResetTime`），不是任何资源包
-   * 自己的效期。此前三个包行都借用它作 `packageEndTime`，把同一个 9999 哨兵
-   * 同时印在三行上 —— 官方页各包效期互不相同。`quota/usage` 不含 per-bucket
-   * 效期字段，所以包行不携带效期，渲染为「无到期」，绝不猜日期。
+   * `force` is deliberately not offered: the account reader already caches per
+   * token with single-flight, and pricing a whole pool on every status poll is
+   * exactly the case that cache exists for.
+   */
+  fetchAccountBilling(pat: string, signal?: AbortSignal): Promise<QoderAccountBilling>;
+  /**
+   * The ambient credential's quota answer, plus the name and plan it belongs
+   * to, cached for the next status document.
+   *
+   * `force: true` is deliberate here and only here: this is the read the user
+   * is looking at, and a cached figure that lags the account they just switched
+   * to is the one staleness the card must not show. The per-account pool read
+   * ({@link fetchAccountBilling}) is the opposite case and uses the cache.
+   *
+   * The mapping itself lives in {@link creditsFromUsage}, shared with the pool
+   * read so both price an account identically.
    */
   fetchCredits(signal?: AbortSignal): Promise<QoderCredits>;
   /**
@@ -1022,8 +1388,13 @@ declare class QoderUpstreamClient {
    * status, not as a 200 whose first frame is an error. Once streaming has
    * begun, failures degrade to the error-frame-then-`[DONE]` form the
    * {@link ChunkEncoder} documents.
+   *
+   * `sessionId` is the harness conversation this request belongs to, taken
+   * from the affinity header the shim reads. It rides `GenerateOptions` so the
+   * transport can keep one session on one account (session stickiness); an
+   * absent id simply means the request is not sticky.
    */
-  chatStream(bodyJson: string, signal?: AbortSignal): Promise<QoderChatResult>;
+  chatStream(bodyJson: string, signal?: AbortSignal, sessionId?: string): Promise<QoderChatResult>;
   /** Drive the SSE body from an already-started chunk iterator. */
   private bodyStream;
   /**
@@ -1375,6 +1746,30 @@ interface QoderAuthRouteOptions {
    * success, persist it. The route never decides validity itself.
    */
   save: (pat: string) => Promise<QoderAuthSaveResult>;
+  /**
+   * Make one stored account the one that signs requests.
+   *
+   * Resolves to the status *after* the switch so the card can re-render the
+   * list from one round trip; rejecting an unknown id is the caller's job,
+   * and the route turns that rejection into its ordinary failure shape.
+   */
+  activate: (accountId: string) => Promise<QoderAuthStatus>;
+  /**
+   * Drop one stored account, resolving to the status after the removal.
+   *
+   * Removal is by id, never by position: the card's list may be a poll behind
+   * the file, and acting on "the second row" would delete whichever account
+   * happened to be second by the time the request landed.
+   */
+  remove: (accountId: string) => Promise<QoderAuthStatus>;
+  /**
+   * Park or un-park one stored account, resolving to the status after the write.
+   *
+   * Optional so the two halves can land independently: a host that has not been
+   * wired for parking yet answers the request with the route's ordinary failure
+   * shape instead of crashing or silently reporting success.
+   */
+  setEnabled?: (accountId: string, enabled: boolean) => Promise<QoderAuthStatus>;
   /** Remove the stored credential. */
   clear: () => Promise<void>;
   /**
@@ -1550,6 +1945,48 @@ interface Config {
    * endpoint, which serves no cache.
    */
   quotaPollMs?: number;
+  /**
+   * Whether a failure may move the request to the next account.
+   *
+   * On by default, but a real setting rather than an implicit constant: with
+   * one account it changes nothing, yet the user must be able to turn the
+   * behaviour off without deleting accounts.
+   */
+  autoFailoverEnabled?: boolean;
+  /**
+   * How many times a queued answer is retried before it is reported.
+   *
+   * 0 means "report immediately" (the pre-existing behaviour); each retry
+   * waits {@link Config.queueWaitSeconds} first. Bounded so a typo cannot pin
+   * a request in the transport for hours.
+   */
+  queueWaitAttempts?: number;
+  /** How long each queue retry waits, in seconds. */
+  queueWaitSeconds?: number;
+  /** Which order the failover walk follows. */
+  routingStrategy?: 'save-order' | 'custom';
+  /**
+   * Account ids in the walk order, when `routingStrategy` is `custom`.
+   *
+   * One list spans BOTH variants: an id names its own variant, and each
+   * variant's walk skips ids that are not its own. That is what "mixed
+   * ordering" means here — the list can express "global account first, China
+   * account second", while a single request still has to be served by the
+   * region its model belongs to.
+   */
+  routingOrder?: string[];
+  /**
+   * Conversation stickiness: how many completed rounds one account serves
+   * before the session moves to the next account. 0 disables round counting.
+   */
+  stickinessRounds?: number;
+  /**
+   * Conversation stickiness: how many requests one account serves before the
+   * session moves to the next account. 0 disables request counting.
+   */
+  stickinessRequests?: number;
+  /** Conversation stickiness: how many minutes one account serves. 0 disables. */
+  stickinessMinutes?: number;
 }
 /**
  * Quota poll interval: default 5 minutes, floor 1 minute. The status route
@@ -1575,7 +2012,7 @@ declare const Config: z<Config>;
  */
 declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindowCN", "modelContextWindowsCN", "disabledModelsCN", "variantEnabledCN"];
 declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels", "variantEnabledGlobal"];
-declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs"];
+declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
 /**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their

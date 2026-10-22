@@ -29,15 +29,17 @@ import { QoderUpstreamClient, validateApiKey } from './upstream.ts'
 import { createQoderTransport, type QoderCheckInResult, type QoderTransport } from './qoder/transport/index.ts'
 import { getMachineId } from './qoder/transport/machine-id.ts'
 import { qoderMachineIdPath } from './paths.ts'
-import { registerQoderStatusRoute } from './web-status.ts'
+import { registerQoderStatusRoute, webPlan } from './web-status.ts'
 import { createProbeKey, registerQoderProbeRoute } from './probe-route.ts'
 import { CheckInScheduler, DEFAULT_CHECK_IN_MINUTE, JsonFileCheckInStore, normalizeCheckInMinute } from './checkin-scheduler.ts'
 import { getClaimWindowDateString } from './claim-window.ts'
 import type { QoderModelInfo } from './catalog.ts'
-import type { QoderWebCatalog, QoderWebProbeSection } from './status-paths.ts'
+import type { QoderAccountHealth, QoderWebCatalog, QoderWebProbeSection, QoderWebUpstreamNotice } from './status-paths.ts'
 import { QODER_SETTINGS_FACE_PATH } from './status-paths.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
-import { emitJobTokenHint, emitJobTokenRefreshFailedHint, installJobTokenHint } from './job-token-hint.ts'
+import { emitJobTokenHint, emitJobTokenRefreshFailedHint, emitUpstreamNotice, installJobTokenHint } from './job-token-hint.ts'
+import { formatQueueNotice } from './qoder/queue-notice.ts'
+import { QoderAccountHealthTracker } from './account-health.ts'
 import { SettingsStore } from './settings-store.ts'
 import { QODER_CONNECT_VERSION } from './version.ts'
 import { CHINA_VARIANT, GLOBAL_VARIANT, QODER_VARIANTS, type QoderVariant } from './variants.ts'
@@ -274,6 +276,48 @@ export interface Config {
    * endpoint, which serves no cache.
    */
   quotaPollMs?: number
+  /**
+   * Whether a failure may move the request to the next account.
+   *
+   * On by default, but a real setting rather than an implicit constant: with
+   * one account it changes nothing, yet the user must be able to turn the
+   * behaviour off without deleting accounts.
+   */
+  autoFailoverEnabled?: boolean
+  /**
+   * How many times a queued answer is retried before it is reported.
+   *
+   * 0 means "report immediately" (the pre-existing behaviour); each retry
+   * waits {@link Config.queueWaitSeconds} first. Bounded so a typo cannot pin
+   * a request in the transport for hours.
+   */
+  queueWaitAttempts?: number
+  /** How long each queue retry waits, in seconds. */
+  queueWaitSeconds?: number
+  /** Which order the failover walk follows. */
+  routingStrategy?: 'save-order' | 'custom'
+  /**
+   * Account ids in the walk order, when `routingStrategy` is `custom`.
+   *
+   * One list spans BOTH variants: an id names its own variant, and each
+   * variant's walk skips ids that are not its own. That is what "mixed
+   * ordering" means here — the list can express "global account first, China
+   * account second", while a single request still has to be served by the
+   * region its model belongs to.
+   */
+  routingOrder?: string[]
+  /**
+   * Conversation stickiness: how many completed rounds one account serves
+   * before the session moves to the next account. 0 disables round counting.
+   */
+  stickinessRounds?: number
+  /**
+   * Conversation stickiness: how many requests one account serves before the
+   * session moves to the next account. 0 disables request counting.
+   */
+  stickinessRequests?: number
+  /** Conversation stickiness: how many minutes one account serves. 0 disables. */
+  stickinessMinutes?: number
 }
 
 /**
@@ -406,6 +450,49 @@ const QUOTA_POLL_FIELD = volatileField(z.number()
   .min(QUOTA_POLL_MIN_MS)
   .description('Sidebar quota card refresh interval in milliseconds (default 300000, minimum 60000)'))
 
+/** Automatic failover master switch (on by default; one account makes it inert). */
+const AUTO_FAILOVER_FIELD = volatileField(z.boolean().default(true)
+  .description('账号连接失败时自动切换到下一个账号（默认开启）'))
+/** Queue wait retry count: 0 = report at once, 1..10 retries. */
+const QUEUE_WAIT_ATTEMPTS_FIELD = volatileField(z.number()
+  .default(0)
+  .min(0)
+  .max(10)
+  .description('上游排队时的重试次数（0 = 不重试，最多 10 次）'))
+/** Queue wait seconds per retry: 1..300. */
+const QUEUE_WAIT_SECONDS_FIELD = volatileField(z.number()
+  .default(30)
+  .min(1)
+  .max(300)
+  .description('每次排队重试前等待的秒数（1–300）'))
+/** Routing strategy: save order, or the user's own order. */
+const ROUTING_STRATEGY_FIELD = volatileField(z.union([
+  z.const('save-order'),
+  z.const('custom'),
+]).default('save-order')
+  .description('账号试用顺序：save-order = 保存顺序，custom = 自定义优先级'))
+/** The user's own account order (ids across both variants). */
+const ROUTING_ORDER_FIELD = volatileField(z.array(z.string()).default([])
+  .description('自定义账号优先级（可跨国内/国际版混排，顺序即试用顺序）'))
+/** Stickiness rounds: 0 disables. Default 1 — one round per account. */
+const STICKINESS_ROUNDS_FIELD = volatileField(z.number()
+  .default(1)
+  .min(0)
+  .max(100)
+  .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号（0 = 不限制）'))
+/** Stickiness requests: 0 disables. Default 60. */
+const STICKINESS_REQUESTS_FIELD = volatileField(z.number()
+  .default(60)
+  .min(0)
+  .max(10_000)
+  .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号（0 = 不限制）'))
+/** Stickiness minutes: 0 disables. Default 180. */
+const STICKINESS_MINUTES_FIELD = volatileField(z.number()
+  .default(180)
+  .min(0)
+  .max(1440)
+  .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号（0 = 不限制）'))
+
 export const Config: z<Config> = z.object({
   probeConsent: PROBE_CONSENT_FIELD,
   useMaximumContextWindow: MAXIMUM_CONTEXT_WINDOW_FIELD,
@@ -429,6 +516,14 @@ export const Config: z<Config> = z.object({
   autoCheckInGlobal: AUTO_CHECK_IN_FIELD,
   checkInMinute: CHECK_IN_MINUTE_FIELD,
   quotaPollMs: QUOTA_POLL_FIELD,
+  autoFailoverEnabled: AUTO_FAILOVER_FIELD,
+  queueWaitAttempts: QUEUE_WAIT_ATTEMPTS_FIELD,
+  queueWaitSeconds: QUEUE_WAIT_SECONDS_FIELD,
+  routingStrategy: ROUTING_STRATEGY_FIELD,
+  routingOrder: ROUTING_ORDER_FIELD,
+  stickinessRounds: STICKINESS_ROUNDS_FIELD,
+  stickinessRequests: STICKINESS_REQUESTS_FIELD,
+  stickinessMinutes: STICKINESS_MINUTES_FIELD,
 })
 
 /**
@@ -465,6 +560,14 @@ export const QUOTA_SECTION_KEYS = [
   'autoCheckInGlobal',
   'checkInMinute',
   'quotaPollMs',
+  'autoFailoverEnabled',
+  'queueWaitAttempts',
+  'queueWaitSeconds',
+  'routingStrategy',
+  'routingOrder',
+  'stickinessRounds',
+  'stickinessRequests',
+  'stickinessMinutes',
 ] as const satisfies readonly (keyof Config)[]
 
 /** Every declared configuration field, in the order the sections are merged. */
@@ -572,6 +675,43 @@ interface VariantRuntime {
    * field turns every check-in into a no-op) instead of failing to compile.
    */
   checkIn: (signal?: AbortSignal) => Promise<QoderCheckInResult>
+  /**
+   * The last upstream "not serviceable" answer for this variant.
+   *
+   * Recorded when a chat ends on the upstream's own saturated-queue reply, and
+   * cleared when a later chat is accepted: the notice describes a live
+   * condition, so it must not outlive the condition it explains. `occurrences`
+   * counts how many times the answer has come back since the last success,
+   * which is what separates a one-off queue from an account that upstream keeps
+   * refusing.
+   */
+  upstreamNotice: () => QoderWebUpstreamNotice | undefined
+  /**
+   * When the pool last moved off a failed account, and why. Epoch ms.
+   *
+   * Surfaced on the card so an automatic switch is visible after the fact: the
+   * request that triggered it failed, so nothing in the conversation says which
+   * subscription ended up paying for the retry.
+   */
+  failoverAt: () => number | undefined
+  failoverReason: () => string | undefined
+  /**
+   * What one pooled account has shown lately, for the card's health label.
+   *
+   * Read through the recognizer rather than exposing the tracker itself, so the
+   * status route cannot accidentally record an observation while rendering —
+   * health is fed from upstream answers only.
+   */
+  healthOf: (accountId: string) => QoderAccountHealth | undefined
+  /**
+   * Drop one account's health observations.
+   *
+   * Called when the user parks or removes an account: the label describes the
+   * last few minutes of a running process, and an account that was out of
+   * rotation for a while has had nothing asked of it, so the previous verdict
+   * no longer describes anything real.
+   */
+  forgetHealth: (accountId: string) => void
 }
 
 /** One catalog request plus the identity state it is allowed to update. */
@@ -634,6 +774,21 @@ function jobTokenRefreshFailedHintText(at: number): string {
   return `jobToken 已重换但仍被上游拒绝（${time}）— 自愈未恢复，该请求已失败`
 }
 
+/**
+ * The conversation row written when an automatic account switch happens.
+ *
+ * The row carries the visible copy (the card's tag only reports the state
+ * afterwards), and it says what actually happened rather than naming the
+ * account: the row is appended to whichever conversation was running, and this
+ * module has only the redacted reason the transport classified — never a token,
+ * never an upstream body. A switch caused by a queue answer is reported by
+ * {@link formatQueueNotice} instead; this one is the connection/interruption
+ * case, where there is no upstream explanation to quote.
+ */
+function failoverNoticeText(reason: string): string {
+  return `已自动切换到下一个账号重试（原因：${reason}）— 当前请求由备用账号继续`
+}
+
 /** Build one variant's stores, transport, and probe state. */
 function createVariantRuntime(
   ctx: Context,
@@ -646,6 +801,25 @@ function createVariantRuntime(
   // The self-heal's auto-refresh record, surfaced on the card. Per variant:
   // each region's transport reports its own refreshes.
   let jobTokenRefreshedAt: number | undefined
+  /**
+   * How long an upstream "not serviceable" answer keeps describing the present.
+   *
+   * The upstream's own answer is transient by construction — it names a retry
+   * delay, typically 30 s — so a notice older than this bound is no longer a
+   * description of anything the user is about to hit, and keeping it on the
+   * card would report a stale condition as a live one. Same convention (and the
+   * same five minutes) as the job-token notice, which is the other notice about
+   * a condition that clears itself.
+   */
+  const queueNoticeMaxAgeMs = 5 * 60 * 1000
+  /**
+   * The live queue notice: the last answer, when it arrived, and how many times
+   * it has come back within the same outage window.
+   */
+  let queueNotice: QoderWebUpstreamNotice | undefined
+  /** The last automatic account switch, for the card. */
+  let failoverAt: number | undefined
+  let failoverReason: string | undefined
   // The attachment service may not exist when the client and transport are
   // constructed (and a headless profile never has one), so both get a stable
   // facade that resolves the real store per request.
@@ -664,6 +838,15 @@ function createVariantRuntime(
       await resolveAttachmentService().readImageRequest(attachment, policy, signal),
     saveImage: async request => await resolveAttachmentService().saveImage(request),
   }
+  /**
+   * This variant's per-account health, fed from the transport's own answers.
+   *
+   * Constructed with the runtime (not per request) because health is a claim
+   * about the last few minutes, and because the two facts the card's
+   * 正常/排队/限流 labels rest on arrive on different hooks: queue answers on
+   * `onUpstreamQueue`, connection failures on `failover.failed`.
+   */
+  const health = new QoderAccountHealthTracker()
   const transport = createQoderTransport({
     region: variant.region,
     resolvePat: () => store.patPromise(),
@@ -671,6 +854,147 @@ function createVariantRuntime(
     // (state/) instead of letting the transport write it near $HOME.
     resolveMachineId: () => getMachineId([qoderMachineIdPath()]),
     attachments,
+    /*
+     * Automatic next-account failover.
+     *
+     * Always enabled: with a single stored account `nextAccount` answers
+     * `undefined` and the walk ends by rethrowing the original failure, which
+     * is byte-for-byte the pre-failover behavior. So "on" has no way to change
+     * what a one-account pool does, and there is no reason to gate it behind a
+     * setting the user would have to find first.
+     */
+    failover: {
+      /*
+       * The user's switch, not a constant.
+       *
+       * It used to be `() => true` on the argument that a one-account pool is
+       * unaffected either way. That held while the walk was invisible, but the
+       * walk now moves the stored active pointer and announces itself in the
+       * conversation, so a user who wants one account to be the only one that
+       * ever signs needs a way to say so — and the only honest thing "off" can
+       * mean is that no retry ever runs on another account.
+       *
+       * Defaulted to ON for every document written before the setting existed:
+       * absent must not silently turn off a behaviour the previous version had.
+       */
+      enabled: () => current().autoFailoverEnabled !== false,
+      activeAccount: async () => {
+        const credential = await store.current()
+        if (credential === undefined) return undefined
+        return { id: qoderCredentialIdentity(credential), pat: credential.pat }
+      },
+      nextAccount: async id => {
+        const next = await store.nextAfter(id)
+        return next === undefined ? undefined : { id: next.id, pat: next.pat }
+      },
+      /*
+       * By-id resolution, for custom routing and pinned sessions.
+       *
+       * Both name an account directly instead of "whoever comes next", so they
+       * need the credential — and neither may fall back to the active pointer,
+       * because that would quietly sign as a different account than the one the
+       * user ordered or the session remembered. A removed account resolves to
+       * `undefined`, which is how the walk skips it.
+       */
+      accountById: async id => {
+        const found = await store.byId(id)
+        /*
+         * A parked account resolves to nothing.
+         *
+         * The two callers of this hook name an account directly instead of
+         * asking for "the next one" — a custom routing order and a pinned
+         * session — and both must get the same answer the save-order walk
+         * gives: a parked account is not tried. Without this the checkbox
+         * would only affect `nextAfter`, so an account the user parked could
+         * still be reached by its position in their custom order, or keep
+         * signing a session it was pinned to before the pause. `undefined`
+         * is exactly how the transport spells "skip this id": routing moves
+         * on, and a pin is dropped so the session starts over.
+         */
+        if (found === undefined || found.enabled === false) return undefined
+        return { id: found.id, pat: found.pat }
+      },
+      failed: info => {
+        // The card's 限流 label. Only connection-level failures reach here
+        // (the transport filters out refused requests and queue answers), so
+        // the streak it counts is exactly "this account could not serve".
+        health.noteFailure(info.accountId, info.at)
+      },
+      switched: async info => {
+        // Adopting the account is what makes the switch stick. The retry itself
+        // signs with the PAT the transport already holds, but every later read
+        // — the catalog, credits, the card — resolves the ACTIVE account, so
+        // the stored pointer has to move with the request or the next refresh
+        // would authenticate as the account that just failed.
+        await store.activate(info.toId)
+        failoverAt = Date.now()
+        failoverReason = info.reason
+        // A different identity pays from here on, so the previous account's
+        // queue answer no longer describes the account in effect.
+        queueNotice = undefined
+        ctx.logger.warn(
+          `dsh-qoder-plugin: ${variant.displayName} switched accounts after a connection failure (${info.reason})`,
+        )
+        // The visible channel: without it the failed request and the recovered
+        // retry are indistinguishable from a plain success, and nothing would
+        // say that a different subscription paid for it.
+        emitUpstreamNotice(failoverNoticeText(info.reason))
+      },
+    },
+    onUpstreamQueue: (facts, accountId) => {
+      const at = Date.now()
+      // Health is per account and outlives one notice: recorded before the
+      // document-wide notice, which is replaced on every answer.
+      if (accountId !== undefined) health.noteQueue(accountId, at)
+      const previous = queueNotice
+      // Reports inside one window are the same outage recurring; a report after
+      // the window is a new one, and the risk-control sentence — which is only
+      // honest about a REPEATED answer — must start counting again.
+      const sameOutage = previous !== undefined && at - previous.at <= queueNoticeMaxAgeMs
+      // A "0 seconds" advice is the upstream saying "retry now", which is no
+      // window at all. Carried as a number it would make `waited` true on a
+      // zero-length gap and print "已按上游建议等待 0 秒仍不可服务" — a claim
+      // about waiting that the advice never supported. Treated as absent, the
+      // notice falls back to its no-delay sentence, while the head still quotes
+      // the upstream's own advice verbatim.
+      const advisedMs = facts.retryAfterSeconds === undefined || facts.retryAfterSeconds <= 0
+        ? undefined
+        : facts.retryAfterSeconds * 1000
+      // Elapsed time is the only evidence this seam can have for the wait
+      // sentence: the transport refuses to sit the upstream's window out (that
+      // would hold the stream open) and the harness retries the turn itself, so
+      // what is left is the clock, and an accepted chat clears the record —
+      // meaning an answer that arrives at least one advised window after the
+      // previous one can only describe a user who really waited that long and
+      // was refused again. A shorter gap supports no such claim, and `waited:
+      // true` there would print "已按上游建议等待 30 秒仍不可服务" to someone
+      // whose wait was seconds.
+      const waited = sameOutage && advisedMs !== undefined && at - previous.at >= advisedMs
+      queueNotice = {
+        kind: facts.serviceAvailable === false ? 'unavailable' : 'queued',
+        ...facts.upstreamMessage === undefined ? {} : { upstreamMessage: facts.upstreamMessage },
+        ...advisedMs === undefined ? {} : { retryAfterMs: advisedMs },
+        waited,
+        at,
+        occurrences: sameOutage ? previous.occurrences + 1 : 1,
+      }
+      ctx.logger.warn(
+        `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
+      )
+      emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }))
+    },
+    onChatAccepted: accountId => {
+      // The upstream took a chat, so the condition the last notice described is
+      // over — and "over" has to take the streak with it, not just the
+      // timestamp. A record kept past this point would first re-describe an
+      // outage the user stopped hitting, then count the NEXT answer as a
+      // recurrence of it and print the risk-control sentence over a chat that
+      // succeeded in between. Dropping the record resets both facts at once.
+      queueNotice = undefined
+      // Same reasoning for this account's health, and the only observation that
+      // can clear 限流: an accepted request proves the account serves.
+      if (accountId !== undefined) health.noteConnected(accountId, Date.now())
+    },
     onJobTokenRefreshed: info => {
       jobTokenRefreshedAt = info.at
       ctx.logger.warn(
@@ -688,6 +1012,36 @@ function createVariantRuntime(
       )
       emitJobTokenRefreshFailedHint(info.at, jobTokenRefreshFailedHintText(info.at))
     },
+    /*
+     * The three settings that shape a request's account walk, read live.
+     *
+     * All three are functions rather than values for the same reason the
+     * failover switch is: `apply()` mints this transport once and a settings
+     * write never re-mints it, so a captured value would freeze at whatever the
+     * document held at startup — the card would report a change the transport
+     * never saw.
+     */
+    queueWait: {
+      // Retries to sit out INSIDE one request when the upstream names a delay.
+      attempts: () => current().queueWaitAttempts ?? 0,
+      seconds: () => current().queueWaitSeconds ?? 30,
+    },
+    stickiness: {
+      // How long one account serves a conversation before the session moves to
+      // the next account. All three are bounds: whichever is reached first
+      // moves the conversation on, so a single big turn cannot pin a session to
+      // one account for longer than the round or request bound allows.
+      rounds: () => current().stickinessRounds ?? 1,
+      requests: () => current().stickinessRequests ?? 60,
+      minutes: () => current().stickinessMinutes ?? 180,
+    },
+    routing: {
+      // The user's own order, spanning both variants, with save order as the
+      // fallback for accounts the list does not name.
+      strategy: () => current().routingStrategy ?? 'save-order',
+      order: () => current().routingOrder ?? [],
+    },
+    now: () => Date.now(),
   })
   const client = new QoderUpstreamClient({
     region: variant.region,
@@ -760,6 +1114,22 @@ function createVariantRuntime(
     invalidate: () => {},
     registered: false,
     jobTokenRefreshedAt: () => jobTokenRefreshedAt,
+    upstreamNotice: () => {
+      // Read through the same bound the report uses, so a notice that stopped
+      // describing the present cannot be revived by a page refresh: the card
+      // pulls this document on every open, and a stale notice kept forever
+      // would tell the user a cleared condition is still in effect.
+      if (queueNotice === undefined) return undefined
+      if (Date.now() - queueNotice.at > queueNoticeMaxAgeMs) {
+        queueNotice = undefined
+        return undefined
+      }
+      return queueNotice
+    },
+    failoverAt: () => failoverAt,
+    failoverReason: () => failoverReason,
+    healthOf: accountId => health.healthOf(accountId),
+    forgetHealth: accountId => { health.forget(accountId) },
     checkIn: (signal?: AbortSignal) => transport.checkIn(signal),
   }
 }
@@ -1032,6 +1402,14 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       autoCheckInGlobal: false,
       checkInMinute: 600,
       quotaPollMs: 300_000,
+      autoFailoverEnabled: true,
+      queueWaitAttempts: 0,
+      queueWaitSeconds: 30,
+      routingStrategy: 'save-order',
+      routingOrder: [],
+      stickinessRounds: 1,
+      stickinessRequests: 60,
+      stickinessMinutes: 180,
     }
   }
   return out
@@ -1139,11 +1517,31 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
       case 'sidebarQuotaGlobal':
       case 'autoCheckInCN':
       case 'autoCheckInGlobal':
+      case 'autoFailoverEnabled':
         if (typeof value !== 'boolean') return `${field} must be a boolean`
         break
       case 'disabledModels':
       case 'disabledModelsCN':
+      case 'routingOrder':
         if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) return `${field} must be an array of strings`
+        break
+      case 'routingStrategy':
+        if (value !== 'save-order' && value !== 'custom') return `${field} must be "save-order" or "custom"`
+        break
+      case 'queueWaitAttempts':
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 10) return `${field} must be an integer 0..10`
+        break
+      case 'queueWaitSeconds':
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 300) return `${field} must be an integer 1..300`
+        break
+      case 'stickinessRounds':
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 100) return `${field} must be an integer 0..100`
+        break
+      case 'stickinessRequests':
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 10_000) return `${field} must be an integer 0..10000`
+        break
+      case 'stickinessMinutes':
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 1440) return `${field} must be an integer 0..1440`
         break
       case 'checkInMinute':
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 1439) return `${field} must be an integer minute 0..1439`
@@ -1404,6 +1802,82 @@ export function apply(ctx: Context, config: Config): void {
             disabledModels: () => current().disabledModels ?? [],
           }),
         jobTokenRefreshedAt: runtime.jobTokenRefreshedAt,
+        accounts: async () => {
+          const [summaries, stored] = await Promise.all([
+            runtime.store.accounts(),
+            runtime.store.list(),
+          ])
+          /*
+           * Price every pooled account from that account's OWN billing answer.
+           *
+           * The composer panel has to show what each account still holds before
+           * the user switches to it, and only that account's token can say. The
+           * reads go out in parallel through the account reader's per-token
+           * cache, so a poll that repeats within the TTL costs no upstream
+           * request. The active account is also priced below by `fetchCredits`,
+           * which forces a fresh read and then caches it — so this row reuses
+           * that answer on the next poll, and the only duplicate call is the
+           * very first poll after a reload, when nothing is cached yet. A
+           * failure prices one row as unknown rather than failing the document:
+           * an account whose billing answer is down is exactly the one the user
+           * may need to switch to.
+           */
+          const tokens = new Map(stored.map(account => [account.id, account.pat]))
+          const entries = await Promise.all(summaries.map(async entry => {
+            /*
+             * Health rides every row, priced or not.
+             *
+             * It is read from this process's own observations, so a row whose
+             * billing read fails still shows 限流/排队 — and that is exactly the
+             * row where the label matters most, because "no credits answer" and
+             * "cannot connect" are the two halves of the same story.
+             */
+            const health = runtime.healthOf(entry.id)
+            const withHealth = health === undefined ? entry : { ...entry, health }
+            const pat = tokens.get(entry.id)
+            if (pat === undefined) return withHealth
+            try {
+              const billing = await runtime.client.fetchAccountBilling(pat)
+              const plan = webPlan(billing.plan)
+              return {
+                ...withHealth,
+                ...billing.accountName === undefined ? {} : { accountName: billing.accountName },
+                ...plan === undefined ? {} : { plan },
+                credits: billing.credits,
+              }
+            } catch (error: unknown) {
+              return {
+                ...withHealth,
+                creditsError: error instanceof Error ? error.message.slice(0, 300) : String(error),
+              }
+            }
+          }))
+          const lastFailoverAt = runtime.failoverAt()
+          const lastFailoverReason = runtime.failoverReason()
+          return {
+            entries,
+            /*
+             * The tag reports whether a failure could actually be absorbed, not
+             * whether some policy bit is set: with one account the walk has
+             * nowhere to go, so the honest reading of "automatic switch" is off
+             * — and it turns itself on the moment a second account is saved.
+             */
+            autoFailover: entries.length > 1,
+            /*
+             * The switch as the user set it, which is a different claim from
+             * `autoFailover` above: that one answers "could a failure be
+             * absorbed", this one answers "did the user allow it". The card
+             * needs both — a two-account pool with the switch off must not look
+             * like it will fail over.
+             */
+            autoFailoverEnabled: current().autoFailoverEnabled !== false,
+            routingStrategy: current().routingStrategy ?? 'save-order',
+            routingOrder: current().routingOrder ?? [],
+            ...lastFailoverAt === undefined ? {} : { lastFailoverAt },
+            ...lastFailoverReason === undefined ? {} : { lastFailoverReason },
+          }
+        },
+        upstreamNotice: runtime.upstreamNotice,
         checkIn: () => {
           const record = checkInStore.read(runtime.variant.id)
           if (record === undefined) return undefined
@@ -1467,9 +1941,58 @@ export function apply(ctx: Context, config: Config): void {
           await fetchCatalog(runtime, identity)
           return { ok: true, status: await runtime.store.status() }
         },
+        activate: async accountId => {
+          /*
+           * Switching accounts changes which subscription pays, so the model
+           * group must follow it in the same round trip: the card re-reads the
+           * status the moment this answer lands, and an identity adopted a tick
+           * later would render the previous account's roster and credits.
+           */
+          const credential = await runtime.store.activate(accountId)
+          const identity = credentialIdentity(credential)
+          adoptIdentity(runtime, identity)
+          await fetchCatalog(runtime, identity)
+          return await runtime.store.status()
+        },
+        remove: async accountId => {
+          /*
+           * The store decides what removal means for the active pointer (it
+           * adopts the next account, or reports signed-out when the last one
+           * goes); this only makes the consequence visible. Re-adopting the
+           * identity unconditionally is what covers the case the store cannot
+           * report through a credential: the removed account WAS the active
+           * one, so the group and its cached catalog belong to a credential the
+           * plugin no longer holds.
+           */
+          const removed = await runtime.store.remove(accountId)
+          if (removed) {
+            const credential = await runtime.store.current()
+            adoptIdentity(runtime, credential === undefined ? undefined : credentialIdentity(credential))
+          }
+          return await runtime.store.status()
+        },
         clear: async () => {
           await runtime.store.clear()
           adoptIdentity(runtime, undefined)
+        },
+        setEnabled: async (accountId, enabled) => {
+          /*
+           * Parking an account never moves the active pointer.
+           *
+           * The checkbox says "do not route here", not "switch away from
+           * here": a user parking the account they are using keeps reading the
+           * card with it selected, and the store deliberately leaves
+           * `activeId` alone. The walk and the pool both ask
+           * `enabled`/`nextAfter`, which already skip a parked row, so the
+           * effect reaches requests without this route touching identity.
+           *
+           * Forgetting the account's health too: a row that comes back from
+           * parked is a fresh start, and a 限流 label earned before the pause
+           * would accuse an account nothing has asked anything of since.
+           */
+          const found = await runtime.store.setEnabled(accountId, enabled)
+          if (found) runtime.forgetHealth(accountId)
+          return await runtime.store.status()
         },
       }, authKey)
       registerQoderProbeRoute(webCtx, {

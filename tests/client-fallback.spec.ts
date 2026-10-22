@@ -252,6 +252,24 @@ describe('client card fallback', () => {
     restore()
   })
 
+  it('claims exactly the declared seats and registers no notice slot', () => {
+    const { errors, restore } = useErrorSpy()
+    const { ctx, injections, registerCalls } = fakeContext()
+
+    expect(() => apply(ctx)).not.toThrow()
+    expect(errors).toEqual([])
+    // The upstream notice is a conversation ROW emitted by the HOST half, not a
+    // client contribution: claiming a slot for it here would render the same
+    // fact twice (and crash on an unknown slot in older hosts).
+    expect(injections).toEqual([
+      ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT,
+    ])
+    const seats = new Set([ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT])
+    for (const call of registerCalls) expect(seats.has(String(call['name']))).toBe(true)
+
+    restore()
+  })
+
   it('contributes both plugin-config seats, the readout, and the probe', () => {
     const { errors, restore } = useErrorSpy()
     const { ctx, injections, registerCalls } = fakeContext()

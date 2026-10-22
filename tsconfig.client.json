@@ -20,10 +20,13 @@
     "tests/plugin-card.spec.ts",
     "tests/client-defects.spec.ts",
     "tests/client-variants.spec.ts",
+    "tests/client-round-shapes.spec.ts",
     "tests/slot-registration.spec.ts",
     "tests/probe-composer.spec.ts",
     "tests/unified-card.spec.ts",
     "tests/models-pane.spec.ts",
-    "tests/composer-quota.spec.ts"
+    "tests/composer-quota.spec.ts",
+    "tests/client-quota-accounts.spec.ts",
+    "tests/client-settings-editing.spec.ts"
   ]
 }
