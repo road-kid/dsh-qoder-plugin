@@ -21,13 +21,13 @@
 
 ## 界面
 
-![账号卡片：额度、签到与已保存的账号](assets/screenshot-accounts.png)
+![账号卡片：额度、签到与已保存的账号](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-accounts.png)
 
-![模型卡片：逐模型开关、推理档位与上下文窗口](assets/screenshot-models.png)
+![模型卡片：逐模型开关、推理档位与上下文窗口](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-models.png)
 
-![设置卡片：输入框读数与刷新间隔、自动签到与签到时间](assets/screenshot-settings.png)
+![设置卡片：输入框读数与刷新间隔、自动签到与签到时间](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-settings.png)
 
-![输入框额度读数：点开是锚定面板，套餐、剩余 / 总量、进度与到期时间一屏看完](assets/screenshot-quota.png)
+![输入框额度读数：点开是锚定面板，套餐、剩余 / 总量、进度与到期时间一屏看完](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-quota.png)
 
 ## 安装
 

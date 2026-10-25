@@ -21,13 +21,13 @@ China (qoder.com.cn) and Global (qoder.com) are two independent entries: separat
 
 ## Screenshots
 
-![Account card: credit, check-in and saved accounts](assets/screenshot-accounts.png)
+![Account card: credit, check-in and saved accounts](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-accounts.png)
 
-![Models card: per-model switches, reasoning levels and context windows](assets/screenshot-models.png)
+![Models card: per-model switches, reasoning levels and context windows](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-models.png)
 
-![Settings card: composer readout and its refresh interval, automatic check-in and its time](assets/screenshot-settings.png)
+![Settings card: composer readout and its refresh interval, automatic check-in and its time](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-settings.png)
 
-![Composer readout: one anchored panel with the plan, credits used of total, progress and expiry](assets/screenshot-quota.png)
+![Composer readout: one anchored panel with the plan, credits used of total, progress and expiry](https://cdn.jsdelivr.net/gh/road-kid/dsh-qoder-plugin@main/assets/screenshot-quota.png)
 
 ## Install
 
