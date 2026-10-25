@@ -193,7 +193,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 0, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 0, requests: () => 0, minutes: () => 0 },
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
 
@@ -205,11 +205,28 @@ describe('QoderTransport session stickiness', () => {
     expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
   })
 
+  it('is off when the master toggle is off, even with positive bounds', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => false, rounds: () => 5, requests: () => 200, minutes: () => 180 },
+      chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
+    })
+
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    // The master switch gates everything: off means no pinning regardless of
+    // the bounds, so every request starts on the active account as if the
+    // three bounds were all zero.
+    expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
+  })
+
   it('rotates the session to the next account once the round bound is reached', async () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
 
@@ -242,7 +259,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
       chat: () => accepted('from-any'),
     })
 
@@ -266,7 +283,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 2, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 2, requests: () => 0, minutes: () => 0 },
       chat: () => accepted('from-any'),
     })
 
@@ -293,7 +310,7 @@ describe('QoderTransport session stickiness', () => {
     const failing = pool([ALPHA, BETA], ALPHA)
     const failingHarness = harness({
       failover: failing.hooks,
-      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
       // Nobody serves: every request exhausts the whole pool and throws.
       chat: () => unavailable(),
     })
@@ -314,7 +331,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 0, requests: () => 2, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 0, requests: () => 2, minutes: () => 0 },
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
 
@@ -337,7 +354,7 @@ describe('QoderTransport session stickiness', () => {
     let clock = 1_000_000
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 0, requests: () => 0, minutes: () => 5 },
+      stickiness: { enabled: () => true, rounds: () => 0, requests: () => 0, minutes: () => 5 },
       now: () => clock,
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
@@ -358,7 +375,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA, GAMMA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
       // Alpha never serves; Beta fails once, then serves. The walk therefore
       // ends this session on Gamma, two accounts away from where it started.
       chat: (pat, call) => {
@@ -385,7 +402,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
       chat: () => accepted('from-a'),
     })
 
@@ -403,7 +420,7 @@ describe('QoderTransport session stickiness', () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })
 
@@ -431,7 +448,7 @@ describe('QoderTransport session stickiness', () => {
     let clock = 1_700_000_000_000
     const { transport, upstream } = harness({
       failover: poolState.hooks,
-      stickiness: { rounds: () => 100, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 100, requests: () => 0, minutes: () => 0 },
       now: () => (clock += 24 * 60 * 60 * 1000),
       chat: pat => pat === ALPHA.pat ? unavailable() : accepted('from-b'),
     })

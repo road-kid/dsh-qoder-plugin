@@ -120,6 +120,8 @@ export interface QuotaSection {
   routingStrategy?: 'save-order' | 'custom'
   /** The user's own routing order, account ids, highest priority first. */
   routingOrder?: string[]
+  /** Master switch: when off, no session is pinned and the bounds are ignored. */
+  stickinessEnabled?: boolean
   /** How many completed rounds one account serves before the session moves on. */
   stickinessRounds?: number
   /** How many requests one account serves before the session moves on. */

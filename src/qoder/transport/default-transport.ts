@@ -21,7 +21,8 @@ import { QoderImageUploader } from './image-upload.ts'
 import { QoderUsageReader } from './account-reader.ts'
 import { QoderCheckInService, type QoderCheckInResult } from './checkin.ts'
 import type { QoderAccountInfo } from '../account.ts'
-import type { QoderTransport, QoderTransportOptions } from './index.ts'
+import type { QoderPooledAccount, QoderTransport, QoderTransportOptions } from './index.ts'
+import type { QoderQueueWaitBasis } from '../queue-notice.ts'
 import { streamQoderChat } from './chat.ts'
 import type { CosyCredentials } from './wire/cosy.ts'
 import type { QoderWireMessage } from './wire/wire-types.ts'
@@ -64,6 +65,32 @@ const queueWaitCeilingMs = 5 * 60 * 1000
  */
 const queueWaitPaddingMs = 1_000
 const queueWaitJitterMs = 2_000
+
+/**
+ * The conversation one request belongs to, as the string every per-conversation
+ * map keys on — or `undefined` when the host asked for no conversation.
+ *
+ * This is the identity the hint rows are attributed to. It comes from the
+ * request itself rather than from a remembered "current agent", because requests
+ * run concurrently (a chat and its session-title request at minimum) and only
+ * the request knows which conversation its queue answer or its heal describes.
+ */
+function sessionIdOf(options: GenerateOptions): string | undefined {
+  return options.sessionId === undefined ? undefined : String(options.sessionId)
+}
+
+/**
+ * The pending-notice map key for one conversation.
+ *
+ * A request that carries no session id — a direct API call, a host that passes
+ * none — still heals and still gets a row, so those requests share one bucket
+ * and flush each other's notice. That is what the fallback target already means
+ * for them: they are indistinguishable to this module, and none of them can be
+ * printed into someone else's conversation.
+ */
+function pendingKeyOf(sessionId: string | undefined): string {
+  return sessionId ?? '<sessionless>'
+}
 
 /**
  * Most session pins the transport remembers at once.
@@ -152,6 +179,12 @@ function isServedFinish(chunk: StreamChunk): boolean {
 interface SessionPin {
   id: string
   pat: string
+  /**
+   * The region this pinned account signs against; see `QoderPooledAccount`.
+   * Undefined means "the transport's own region", which is what a single-region
+   * pool leaves it as.
+   */
+  region?: QoderRegion | undefined
   /** Wall-clock instant this account took over the session. */
   pinnedAtMs: number
   /** Conversations this account served to the end while holding the pin. */
@@ -269,12 +302,32 @@ export class DefaultQoderTransport implements QoderTransport {
   private readonly streamIdleTimeoutMs: number
   private readonly responseHeaderTimeoutMs: number
   private readonly metadataTimeoutMs: number | undefined
+  private readonly resolveMachineId: (() => string) | undefined
+  private readonly imageUploadTimeoutMs: number | undefined
+  private readonly imageUrlCacheTtlMs: number | undefined
   private readonly auth: QoderAuthService
   private readonly usage: QoderUsageReader
   private readonly checkInService: QoderCheckInService
   private readonly modelFlights = new SingleFlight<readonly QoderCatalogModel[]>()
   private readonly attachments: Pick<AttachmentStore, 'imageLimits' | 'readImageRequest'> | undefined
   private readonly imageUploader: QoderImageUploader
+  /**
+   * The per-region copies of the two services a CHAT attempt needs.
+   *
+   * `auth` and `imageUploader` are the only services whose endpoint is decided
+   * per attempt rather than per variant: a pool may span both Qoder regions, and
+   * an account saved in the other region has to be exchanged and signed against
+   * THAT region's gateway (see `QoderPooledAccount`). One instance per region is
+   * the whole trick — the auth cache is already keyed `${region}:${pat}`, and the
+   * upload cache keys on the region's upload URL, so two instances never share
+   * an entry they should not.
+   *
+   * The metadata services (`usage`, `checkInService`) stay on this transport's
+   * own region: they are read through the host's per-variant runtime, which
+   * always hands them an account from its own credential file.
+   */
+  private readonly authByRegion = new Map<QoderRegion, QoderAuthService>()
+  private readonly uploaderByRegion = new Map<QoderRegion, QoderImageUploader>()
   private readonly preserveThinking: boolean | undefined
   private readonly failover: QoderTransportOptions['failover']
   private readonly onUpstreamQueue: QoderTransportOptions['onUpstreamQueue']
@@ -324,13 +377,23 @@ export class DefaultQoderTransport implements QoderTransport {
    */
   private readonly sessionPins = new Map<string, SessionPin>()
   /**
-   * Set when the self-heal exchanged a fresh job token, cleared when a chat
-   * afterwards succeeds. The notice reports "the token was rotated because the
-   * old one was rejected", which is true from that exchange on — so it must
-   * not be tied to the heal's OWN retry, which can still lose a race with a
-   * transient upstream timeout and be rescued by a later attempt.
+   * The conversations whose self-heal exchanged a fresh job token and whose
+   * retry has not been accepted yet, with the time each rotation happened.
+   *
+   * Set by the heal, cleared when a chat from the SAME conversation succeeds.
+   * The notice reports "the token was rotated because the old one was rejected",
+   * which is true from that exchange on — so it must not be tied to the heal's
+   * OWN retry, which can still lose a race with a transient upstream timeout and
+   * be rescued by a later attempt.
+   *
+   * Keyed per conversation instead of being one shared slot, because one job
+   * token is shared by every request the credential signs: a single slot let a
+   * chat in a DIFFERENT conversation flush it, printing "已自动重换并恢复" into a
+   * conversation whose own request never healed (observed: a rotation reported
+   * an hour later, in another chat). A conversation now collects only its own
+   * notice, and one that never comes back leaves nothing to print.
    */
-  private pendingRefreshAt: number | undefined
+  private readonly pendingRefreshBySession = new Map<string, number>()
   /**
    * Whether the current unresolved heal failure has already been reported.
    *
@@ -350,6 +413,9 @@ export class DefaultQoderTransport implements QoderTransport {
     this.streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? defaultStreamIdleTimeoutMs
     this.responseHeaderTimeoutMs = options.responseHeaderTimeoutMs ?? defaultResponseHeaderTimeoutMs
     this.metadataTimeoutMs = options.metadataTimeoutMs
+    this.resolveMachineId = options.resolveMachineId
+    this.imageUploadTimeoutMs = options.imageUploadTimeoutMs
+    this.imageUrlCacheTtlMs = options.imageUrlCacheTtlMs
     this.attachments = options.attachments
     this.preserveThinking = options.preserveThinking
     this.failover = options.failover
@@ -381,24 +447,8 @@ export class DefaultQoderTransport implements QoderTransport {
         })
       },
     })
-    this.auth = new QoderAuthService({
-      fetch: this.fetchImpl,
-      logger: this.logger,
-      region: this.region,
-      resolveMachineId: options.resolveMachineId,
-    })
-    this.imageUploader = new QoderImageUploader({
-      fetch: this.fetchImpl,
-      logger: this.logger,
-      region: this.region,
-      ...options.imageUploadTimeoutMs === undefined ? {} : { timeoutMs: options.imageUploadTimeoutMs },
-      ...options.imageUrlCacheTtlMs === undefined ? {} : { cacheTtlMs: options.imageUrlCacheTtlMs },
-      refreshCredentials: async (signal) => {
-        const pat = await this.requirePat(signal)
-        this.auth.clear(pat)
-        return this.auth.getCredentials(pat, signal)
-      },
-    })
+    this.auth = this.authFor(this.region)
+    this.imageUploader = this.uploaderFor(this.region)
     this.usage = new QoderUsageReader({
       authService: this.auth,
       fetch: this.fetchImpl,
@@ -415,21 +465,94 @@ export class DefaultQoderTransport implements QoderTransport {
     })
   }
 
+  /**
+   * The auth service for one region, built once and reused.
+   *
+   * A chat attempt resolves the account's OWN region first (see
+   * `attemptRegion`), so the same transport may exchange job tokens against
+   * either gateway during one request walk. The service's cache is keyed
+   * `${region}:${pat}`, which is exactly why one instance per region is safe:
+   * a token exchanged for `api3.qoder.sh` can never be handed to
+   * `gateway.qoder.com.cn`.
+   */
+  private authFor(region: QoderRegion): QoderAuthService {
+    const cached = this.authByRegion.get(region)
+    if (cached !== undefined) return cached
+    const created = new QoderAuthService({
+      fetch: this.fetchImpl,
+      logger: this.logger,
+      region,
+      resolveMachineId: this.resolveMachineId,
+    })
+    this.authByRegion.set(region, created)
+    return created
+  }
+
+  /**
+   * The image uploader for one region, built once and reused.
+   *
+   * Publication is signed with the same region's job token, so the uploader has
+   * to follow the account's region rather than the variant's: a China account's
+   * image published to the global center would be signed by a gateway it never
+   * authenticated against. Its credential-refresh callback re-reads through the
+   * SAME region's auth service for the same reason.
+   */
+  private uploaderFor(region: QoderRegion): QoderImageUploader {
+    const cached = this.uploaderByRegion.get(region)
+    if (cached !== undefined) return cached
+    const auth = this.authFor(region)
+    const created = new QoderImageUploader({
+      fetch: this.fetchImpl,
+      logger: this.logger,
+      region,
+      ...this.imageUploadTimeoutMs === undefined ? {} : { timeoutMs: this.imageUploadTimeoutMs },
+      ...this.imageUrlCacheTtlMs === undefined ? {} : { cacheTtlMs: this.imageUrlCacheTtlMs },
+      refreshCredentials: async (signal) => {
+        const pat = await this.requirePat(signal)
+        auth.clear(pat)
+        return auth.getCredentials(pat, signal)
+      },
+    })
+    this.uploaderByRegion.set(region, created)
+    return created
+  }
+
+  /**
+   * The region one pooled account signs against.
+   *
+   * A pooled account carries the region it was saved under (the host keeps one
+   * credential file per region, and the file's region stamp is authoritative —
+   * see `QoderPooledAccount`). An account with no declared region, or an
+   * ambient credential, signs against this transport's own region, which is the
+   * single-region behavior this transport had before pools could span regions.
+   */
+  private attemptRegion(account: { readonly region?: QoderRegion | undefined } | undefined): QoderRegion {
+    return account?.region ?? this.region
+  }
+
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk> {
     return this.generate(options, model)
   }
 
   /**
-   * Report the pending self-heal once a chat is accepted, then clear it.
+   * Report THIS conversation's pending self-heal once its chat is accepted.
    *
    * The notice means "the stale token was rejected, so it was rotated, and the
    * chat works again" — all three are true by the time a chat is accepted
-   * after the refresh, no matter which attempt delivered it.
+   * after the refresh, no matter which attempt delivered it. "This conversation"
+   * is load-bearing: the rotated token is shared, so another conversation's
+   * acceptance proves nothing about the request that actually healed, and
+   * reporting there printed a recovery row in the wrong conversation.
+   *
+   * @param key - The pending-map key for the conversation whose chat landed
+   *   (see {@link pendingKeyOf}).
+   * @param sessionId - The same id as a string, reported so the host can print
+   *   into that conversation; `undefined` when the request carried no session.
    */
-  private flushPendingRefreshNotice(): void {
-    if (this.pendingRefreshAt === undefined) return
-    const at = this.pendingRefreshAt
-    this.pendingRefreshAt = undefined
+  private flushPendingRefreshNotice(key: string, sessionId: string | undefined): void {
+    const at = this.pendingRefreshBySession.get(key)
+    if (at === undefined) return
+    this.pendingRefreshBySession.delete(key)
     // A rotation whose acceptance took this long is no longer news. Printing
     // it would drop a row into the conversation long after the fact, and its
     // timestamp would name a moment the user has no reason to connect to now —
@@ -437,19 +560,23 @@ export class DefaultQoderTransport implements QoderTransport {
     // reported at 17:47). Dropping it keeps the notice meaningful.
     if (Date.now() - at > jobTokenNoticeMaxAgeMs) return
     this.logger?.warn?.('[Qoder Stream] Job token was auto-refreshed after an upstream rejection; the chat has recovered')
-    this.onJobTokenRefreshed?.({ region: this.region, at })
+    this.onJobTokenRefreshed?.({
+      region: this.region,
+      at,
+      ...(sessionId === undefined ? {} : { sessionId }),
+    })
   }
 
   /**
-   * Drop a pending rotation notice whose heal did not rescue anything.
+   * Drop this conversation's pending rotation notice whose heal rescued nothing.
    *
    * The heal's own retry was rejected too, so "the rotation fixed it" is not
-   * what happened. Leaving the notice pending made a LATER, unrelated chat
-   * acceptance flush it — printing a success row that contradicts the failure
-   * row already shown, stamped with the old rotation time.
+   * what happened. Leaving the notice pending made a LATER chat acceptance flush
+   * it — printing a success row that contradicts the failure row already shown,
+   * stamped with the old rotation time.
    */
-  private discardPendingRefreshNotice(): void {
-    this.pendingRefreshAt = undefined
+  private discardPendingRefreshNotice(key: string, at: number): void {
+    if (this.pendingRefreshBySession.get(key) === at) this.pendingRefreshBySession.delete(key)
   }
 
   /**
@@ -463,10 +590,10 @@ export class DefaultQoderTransport implements QoderTransport {
    * is over, so the host is told here as well: it owns that notice's wording and
    * lifetime, and nothing in the transport can retract it later.
    */
-  private onChatAccepted(accountId?: string): void {
+  private onChatAccepted(accountId?: string, sessionId?: string): void {
     this.refreshFailureAnnounced = false
-    this.flushPendingRefreshNotice()
-    this.chatAccepted?.(accountId)
+    this.flushPendingRefreshNotice(pendingKeyOf(sessionId), sessionId)
+    this.chatAccepted?.(accountId, sessionId)
   }
 
   async discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]> {
@@ -539,12 +666,13 @@ export class DefaultQoderTransport implements QoderTransport {
     credentials: CosyCredentials,
     messages: QoderWireMessage[],
     onAccepted: () => void,
+    region: QoderRegion,
     onFirstByte?: () => void,
   ): AsyncGenerator<StreamChunk> {
     const stream = streamQoderChat(options, model, credentials, messages, {
       fetch: this.fetchImpl,
       logger: this.logger,
-      region: this.region,
+      region,
       responseHeaderTimeoutMs: this.responseHeaderTimeoutMs,
       streamIdleTimeoutMs: this.streamIdleTimeoutMs,
     })
@@ -588,7 +716,7 @@ export class DefaultQoderTransport implements QoderTransport {
        */
       const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
       if (facts !== undefined && options.signal?.aborted !== true) {
-        this.onUpstreamQueue?.(facts, attribution.accountId)
+        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options))
       }
       throw error
     }
@@ -626,7 +754,7 @@ export class DefaultQoderTransport implements QoderTransport {
     if (failover === undefined || !failover.enabled()) {
       // No pool to walk, or the user turned switching off: resolve the ambient
       // credential and behave exactly as before the hooks existed.
-      yield* this.attempt(options, model, await this.requirePat(options.signal), { emitted: false }, undefined, queueBudget)
+      yield* this.attempt(options, model, { pat: await this.requirePat(options.signal) }, { emitted: false }, undefined, queueBudget)
       return
     }
     const active = await failover.activeAccount()
@@ -635,10 +763,10 @@ export class DefaultQoderTransport implements QoderTransport {
       // to advance FROM and nothing for `nextAccount` to be given; the ambient
       // resolution is the whole answer. `attribution` stays empty, which is how
       // the host learns that no pooled account is answerable for this request.
-      yield* this.attempt(options, model, await this.requirePat(options.signal), { emitted: false }, undefined, queueBudget)
+      yield* this.attempt(options, model, { pat: await this.requirePat(options.signal) }, { emitted: false }, undefined, queueBudget)
       return
     }
-    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    const sessionId = sessionIdOf(options)
     // Stickiness chooses where a request STARTS, never whether the walk runs: a
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
@@ -785,7 +913,7 @@ export class DefaultQoderTransport implements QoderTransport {
       // already name the account whose attempt failed last.
       attribution.accountId = account.id
       try {
-        yield* this.attempt(options, model, account.pat, state, account.id, queueBudget)
+        yield* this.attempt(options, model, account, state, account.id, queueBudget)
         // Reached only when the source ended without a terminal chunk at all,
         // which the SSE layer treats as a failure. A normally finished answer
         // was already recorded by `state.onServed` at its finish chunk.
@@ -809,7 +937,12 @@ export class DefaultQoderTransport implements QoderTransport {
         // account's: a later success on `next` (or a later account) is the
         // evidence, and the walk's exhaustion discards it.
         pendingBlame.push({ accountId: account.id, kind: penaltyKind(error) })
-        await failover.switched({ fromId: account.id, toId: next.id, reason })
+        await failover.switched({
+          fromId: account.id,
+          toId: next.id,
+          reason,
+          ...(sessionId === undefined ? {} : { sessionId }),
+        })
         account = next
         // The session follows the walk. A pin left pointing at the account that
         // just failed would send the very next turn straight back to it, once
@@ -836,7 +969,7 @@ export class DefaultQoderTransport implements QoderTransport {
   private async * attempt(
     options: GenerateOptions,
     model: QoderCatalogModel | undefined,
-    pat: string,
+    account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: AttemptState = { emitted: false },
     accountId?: string,
     queueBudget: { waitsLeft: number; total: number } = { waitsLeft: 0, total: 0 },
@@ -868,7 +1001,7 @@ export class DefaultQoderTransport implements QoderTransport {
     }
     try {
       lease = accountId === undefined ? undefined : await this.traffic.acquire(accountId)
-      for await (const chunk of this.attemptPaced(options, model, pat, state, accountId, queueBudget)) {
+      for await (const chunk of this.attemptPaced(options, model, account, state, accountId, queueBudget)) {
         /*
          * Release at the terminal chunk, not only in `finally`.
          *
@@ -915,22 +1048,38 @@ export class DefaultQoderTransport implements QoderTransport {
   private async * attemptPaced(
     options: GenerateOptions,
     model: QoderCatalogModel | undefined,
-    pat: string,
+    account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: { emitted: boolean },
     accountId: string | undefined,
     queueBudget: { waitsLeft: number; total: number },
   ): AsyncGenerator<StreamChunk> {
+    /*
+     * Everything below signs against the ACCOUNT's region, not the variant's.
+     *
+     * A pool that spans both Qoder regions hands this transport an account
+     * saved in the other file, and that account may only be exchanged and
+     * signed against its own gateway: a China PAT sent to `api3.qoder.sh` is a
+     * guaranteed rejection, and (worse) it would look like a broken credential
+     * rather than a routing mistake. The region is a pure function of the
+     * account the walk chose, so it is resolved once here and threaded through
+     * the credential exchange, the image publication, the chat, and the
+     * self-heal.
+     */
+    const region = this.attemptRegion(account)
+    const auth = this.authFor(region)
+    const uploader = this.uploaderFor(region)
+    const pat = account.pat
     // Phase 2: credentials, which the center image exchange must be able to sign with.
-    const credentials = await this.auth.getCredentials(pat, options.signal)
+    const credentials = await auth.getCredentials(pat, options.signal)
     // Phase 3: read attachments, publish images, and assemble wire messages.
     const messages = await translateQoderMessages(options, this.attachments, {
-      uploader: this.imageUploader,
+      uploader,
       credentials,
       preserveThinking: this.preserveThinking,
     })
     // Image publication may have refreshed a rejected job token, so the chat
     // credential is read once more: it must be the token that actually signs.
-    let chatCredentials = await this.auth.getCredentials(pat, options.signal)
+    let chatCredentials = await auth.getCredentials(pat, options.signal)
     const onFirstByte = (): void => { state.emitted = true }
     // Wait out a queue answer instead of failing the request.
     //
@@ -943,13 +1092,18 @@ export class DefaultQoderTransport implements QoderTransport {
     // same rule the account walk follows.
     let healRound = 0
     let noticeAt: number | undefined
+    // The conversation this attempt belongs to. Every notice it can produce —
+    // the queue row, the deferred rotation row, the failed-heal row — is printed
+    // here and nowhere else, and a pending rotation is filed under this key so
+    // no other conversation can flush it.
+    const pendingId = sessionIdOf(options)
     for (;;) {
       try {
         // A pending notice from an earlier heal is reported as soon as this
         // request is accepted (see `streamChat`).
         yield* this.streamChat(options, model, chatCredentials, messages, () => {
-          this.onChatAccepted(accountId)
-        }, onFirstByte)
+          this.onChatAccepted(accountId, sessionIdOf(options))
+        }, region, onFirstByte)
         return
       } catch (error: unknown) {
         // A queue is resolved by waiting, never by another account and never by
@@ -959,14 +1113,16 @@ export class DefaultQoderTransport implements QoderTransport {
         // in fact decline it — but the ordering makes that explicit rather than
         // incidental).
         if (queueBudget.waitsLeft > 0 && !state.emitted && options.signal?.aborted !== true) {
-          const waitMs = this.queueWaitMs(error)
-          if (waitMs !== undefined) {
+          const plan = this.queueWaitMs(error)
+          if (plan !== undefined) {
+            const waitMs = plan.waitMs
             queueBudget.waitsLeft -= 1
             const attempt = queueBudget.total - queueBudget.waitsLeft
             this.logger?.warn?.('[Qoder Stream] Upstream queue is saturated; waiting before retrying the same account', {
               waitMs,
               attempt,
               attemptsLeft: queueBudget.waitsLeft,
+              basis: plan.basis.source,
             })
             /*
              * Report the wait BEFORE it starts, so the host can print a
@@ -976,7 +1132,12 @@ export class DefaultQoderTransport implements QoderTransport {
              */
             const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
             if (facts !== undefined) {
-              this.onQueueWait?.(facts, accountId, { waitMs, attempt, remaining: queueBudget.waitsLeft })
+              this.onQueueWait?.(facts, accountId, {
+                waitMs,
+                attempt,
+                remaining: queueBudget.waitsLeft,
+                basis: plan.basis,
+              }, pendingId)
             }
             await this.waitOutQueue(waitMs, options.signal)
             continue
@@ -1006,7 +1167,7 @@ export class DefaultQoderTransport implements QoderTransport {
           // "已自动重换并恢复" with a stale rotation time — the row that made the
           // notice look broken. Only this request's own notice is void, though:
           // a concurrent heal that armed the pending slot after ours keeps it.
-          if (this.pendingRefreshAt === noticeAt) this.discardPendingRefreshNotice()
+          if (noticeAt !== undefined) this.discardPendingRefreshNotice(pendingKeyOf(pendingId), noticeAt)
           // Report the failed heal once per outage. The success notice covers
           // "the rotation rescued the chat"; without this, a rejection the
           // rotation could NOT rescue was announced nowhere at all, and the user
@@ -1018,9 +1179,10 @@ export class DefaultQoderTransport implements QoderTransport {
               status: error.failure.status,
             })
             this.onJobTokenRefreshFailed?.({
-              region: this.region,
+              region,
               at: Date.now(),
               ...(error.failure.status === undefined ? {} : { status: error.failure.status }),
+              ...(pendingId === undefined ? {} : { sessionId: pendingId }),
             })
           }
           throw error
@@ -1045,11 +1207,11 @@ export class DefaultQoderTransport implements QoderTransport {
         // (exchangeFresh): the flight can be aborted by a departing concurrent
         // waiter (quota poll, catalog sweep), and a retry joined to it would be
         // cancelled by a path unrelated to the chat.
-        const refreshed = await this.auth.exchangeFresh(pat, options.signal)
+        const refreshed = await auth.exchangeFresh(pat, options.signal)
         // The rotation has happened; the first chat accepted afterwards — this
         // round's retry or any subsequent one — is what makes it reportable.
-        this.pendingRefreshAt = Date.now()
-        noticeAt = this.pendingRefreshAt
+        noticeAt = Date.now()
+        this.pendingRefreshBySession.set(pendingKeyOf(pendingId), noticeAt)
         chatCredentials = refreshed
         healRound += 1
       }
@@ -1083,10 +1245,10 @@ export class DefaultQoderTransport implements QoderTransport {
     currentId: string,
     tried: ReadonlySet<string>,
     allowBusy = false,
-  ): Promise<{ id: string; pat: string } | undefined> {
+  ): Promise<QoderPooledAccount | undefined> {
     const considered = new Set<string>([currentId])
-    const deprioritized: Array<{ id: string; pat: string }> = []
-    const busy: Array<{ id: string; pat: string }> = []
+    const deprioritized: QoderPooledAccount[] = []
+    const busy: QoderPooledAccount[] = []
     let id = currentId
     for (let step = 0; step < maxWalkSearchSteps; step++) {
       const candidate = await this.nextAccount(failover, id, tried)
@@ -1132,8 +1294,8 @@ export class DefaultQoderTransport implements QoderTransport {
    */
   private async preferredStart(
     failover: NonNullable<QoderTransportOptions['failover']>,
-    active: { id: string; pat: string },
-  ): Promise<{ id: string; pat: string }> {
+    active: QoderPooledAccount,
+  ): Promise<QoderPooledAccount> {
     const routing = this.routing
     const resolve = failover.accountById
     if (routing === undefined || resolve === undefined || routing.strategy() !== 'custom') return active
@@ -1157,7 +1319,7 @@ export class DefaultQoderTransport implements QoderTransport {
     failover: NonNullable<QoderTransportOptions['failover']>,
     currentId: string,
     tried: ReadonlySet<string>,
-  ): Promise<{ id: string; pat: string } | undefined> {
+  ): Promise<QoderPooledAccount | undefined> {
     const routing = this.routing
     const resolve = failover.accountById
     if (routing === undefined || resolve === undefined || routing.strategy() !== 'custom') {
@@ -1194,7 +1356,7 @@ export class DefaultQoderTransport implements QoderTransport {
    * where it is, with its counters restarted so the same bound is not examined
    * and rejected on every following request.
    */
-  private async pinnedAccount(sessionId: string | undefined): Promise<{ id: string; pat: string } | undefined> {
+  private async pinnedAccount(sessionId: string | undefined): Promise<QoderPooledAccount | undefined> {
     const policy = this.stickiness
     if (sessionId === undefined || policy === undefined || !this.stickinessEnabled(policy)) return undefined
     const pin = this.sessionPins.get(sessionId)
@@ -1207,6 +1369,7 @@ export class DefaultQoderTransport implements QoderTransport {
         return undefined
       }
       pin.pat = account.pat
+      pin.region = account.region
     }
     if (this.pinExhausted(pin, policy)) {
       const moved = await this.rotatePin(sessionId, pin)
@@ -1221,7 +1384,7 @@ export class DefaultQoderTransport implements QoderTransport {
     // Re-inserting moves the pin to the young end of the eviction order.
     this.sessionPins.delete(sessionId)
     this.sessionPins.set(sessionId, pin)
-    return { id: pin.id, pat: pin.pat }
+    return { id: pin.id, pat: pin.pat, ...pin.region === undefined ? {} : { region: pin.region } }
   }
 
   /**
@@ -1265,7 +1428,7 @@ export class DefaultQoderTransport implements QoderTransport {
   private async rotatePin(
     sessionId: string,
     pin: SessionPin,
-  ): Promise<{ id: string; pat: string } | undefined> {
+  ): Promise<QoderPooledAccount | undefined> {
     const failover = this.failover
     if (failover === undefined) return undefined
     const tried = new Set<string>([pin.id])
@@ -1273,7 +1436,7 @@ export class DefaultQoderTransport implements QoderTransport {
     const next = free ?? await this.nextAccount(failover, pin.id, tried)
     if (next === undefined || next.id === pin.id) return undefined
     this.pinSession(sessionId, next)
-    return { id: next.id, pat: next.pat }
+    return { id: next.id, pat: next.pat, ...next.region === undefined ? {} : { region: next.region } }
   }
 
   /**
@@ -1314,7 +1477,7 @@ export class DefaultQoderTransport implements QoderTransport {
    * Insertion order is the eviction order, and the cap only ever costs the
    * oldest session its stickiness.
    */
-  private pinSession(sessionId: string | undefined, account: { id: string; pat: string }): void {
+  private pinSession(sessionId: string | undefined, account: QoderPooledAccount): void {
     const policy = this.stickiness
     if (sessionId === undefined || policy === undefined) return
     if (!this.stickinessEnabled(policy)) return
@@ -1333,6 +1496,7 @@ export class DefaultQoderTransport implements QoderTransport {
     this.sessionPins.set(sessionId, {
       id: account.id,
       pat: account.pat,
+      ...account.region === undefined ? {} : { region: account.region },
       pinnedAtMs: this.now(),
       rounds: 0,
       requests: 0,
@@ -1347,6 +1511,10 @@ export class DefaultQoderTransport implements QoderTransport {
    * the one outcome worse than having no stickiness.
    */
   private stickinessEnabled(policy: NonNullable<QoderTransportOptions['stickiness']>): boolean {
+    // The master switch gates everything: off means no pinning regardless of
+    // what the bounds say. This is the settings UI's toggle; the bounds below
+    // are only read while it is on.
+    if (!policy.enabled()) return false
     const minutes = policy.minutes()
     const rounds = policy.rounds()
     const requests = policy.requests()
@@ -1387,19 +1555,40 @@ export class DefaultQoderTransport implements QoderTransport {
    * `queueWaitPaddingMs`, and the total is capped again so the padding can
    * never push a five-minute wait past the ceiling that exists to bound the
    * caller's time.
+   *
+   * The answer names WHICH value governed, not just the length. The host's row
+   * used to print only the seconds, so a user reading "等待约 86 秒" next to a
+   * 排队等待秒数 setting of 30 concluded the setting was ignored — when in fact
+   * the setting is the fallback used only when the upstream advises nothing, and
+   * the queue's own window plus the anti-stampede padding produced 86. Saying
+   * which one drove the wait is the fix; changing the algorithm to obey the
+   * setting would mean waiting out a queue the upstream said is longer, which
+   * is a slower failure dressed up as obedience.
    */
-  private queueWaitMs(error: unknown): number | undefined {
+  private queueWaitMs(error: unknown): { waitMs: number; basis: QoderQueueWaitBasis } | undefined {
     if (!(error instanceof QoderLlmError) || error.qoderQueue === undefined) return undefined
     const advised = error.failure.providerRetryAfterMs
     const advisedMs = advised !== undefined && Number.isFinite(advised) && advised > 0 ? advised : 0
     const waitTime = error.qoderQueue.waitTime
     const waitTimeMs = waitTime !== undefined && Number.isFinite(waitTime) && waitTime > 0 ? waitTime * 1000 : 0
     const queuedMs = Math.max(advisedMs, waitTimeMs)
+    const configuredSeconds = Math.max(0, this.queueWait?.seconds() ?? 0)
     const baseMs = queuedMs > 0
       ? Math.min(queuedMs, queueWaitCeilingMs)
-      : Math.min(Math.max(0, this.queueWait?.seconds() ?? 0) * 1000, queueWaitCeilingMs)
+      : Math.min(configuredSeconds * 1000, queueWaitCeilingMs)
     const jitterMs = Math.floor(Math.max(0, Math.min(0.999, this.random())) * queueWaitJitterMs)
-    return Math.min(baseMs + queueWaitPaddingMs + jitterMs, queueWaitCeilingMs)
+    const waitMs = Math.min(baseMs + queueWaitPaddingMs + jitterMs, queueWaitCeilingMs)
+    // The advised seconds the queue answer actually named, if any: the larger
+    // of its two hints, since that is the window the wait is built on.
+    const advisedSeconds = queuedMs > 0 ? Math.round(queuedMs / 1000) : undefined
+    return {
+      waitMs,
+      basis: {
+        source: queuedMs > 0 ? 'upstream' : 'configured',
+        ...(advisedSeconds === undefined ? {} : { advisedSeconds }),
+        configuredSeconds,
+      },
+    }
   }
 
   /**

@@ -305,6 +305,42 @@ test('formatQueueWaitNotice reports the wait that is happening, not the failure'
   assert.doesNotMatch(bare, /暂不可服务/u)
 })
 
+test('formatQueueWaitNotice names which value governed the wait', () => {
+  const facts = parseQueueFacts(nestedBody('403'))
+  assert.ok(facts !== undefined)
+
+  // The bug this closes: the setting said 30 but the row waited 86 (the queue
+  // advised 85 + padding + jitter), and beside an unexplained 86 the setting
+  // looked ignored. The row now states the upstream advice won and the setting
+  // is only the no-advice fallback.
+  const advised = formatQueueWaitNotice(facts, {
+    waitMs: 86_000,
+    attempt: 1,
+    remaining: 4,
+    basis: { source: 'upstream', advisedSeconds: 85, configuredSeconds: 30 },
+  })
+  assert.match(advised, /正在等待约 86 秒后重试/u)
+  assert.match(advised, /上游建议 85 秒，设置仅作无建议时的回退/u)
+  assert.doesNotMatch(advised, /按设置的 30 秒/u)
+
+  // The fallback branch: no advice, so the configured seconds ARE in force —
+  // and the row must not pretend the upstream said anything.
+  const fallback = formatQueueWaitNotice(facts, {
+    waitMs: 31_000,
+    attempt: 1,
+    remaining: 4,
+    basis: { source: 'configured', configuredSeconds: 30 },
+  })
+  assert.match(fallback, /上游未给出建议，按设置的 30 秒/u)
+  assert.doesNotMatch(fallback, /上游建议/u)
+
+  // A hand-built progress record without the basis still renders the old
+  // wording untouched — the clause is additive, never mandatory.
+  const legacy = formatQueueWaitNotice(facts, { waitMs: 31_000, attempt: 1, remaining: 1 })
+  assert.doesNotMatch(legacy, /回退|按设置/u)
+  assert.match(legacy, /正在等待约 31 秒后重试/u)
+})
+
 /** The property names of the outermost object, for the "did not dig" assertion. */
 function parseObjectKeys(body: string): string[] {
   return Object.keys(JSON.parse(body) as Record<string, unknown>)

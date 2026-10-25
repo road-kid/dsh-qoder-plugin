@@ -2,6 +2,58 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.2 — 2026-10-24
+
+The pool was documented as spanning 国内版 and 国际版 from the first release —
+the custom priority list says it may mix both, and the card says so in a
+warning. It did not. Every account was resolved inside the credential file of
+the variant the request arrived on, so a mixed list silently degraded to
+"whichever accounts this variant happens to hold". This release makes the pool
+actually reach across the two files, and keeps every account signed against the
+region it was saved under.
+
+### Fixed — the walk crosses from one variant's file into the other
+
+Save order used to wrap back inside the file it had just finished, so the
+second variant's accounts were never tried. The walk now continues into the
+other file's first usable row, and only wraps when the whole pool is spent. A
+custom order, and a session pinned to an account, resolve their ids across both
+files for the same reason: they name an account directly, so refusing the ids
+the user ordered made the order inert.
+
+### Fixed — an account is signed with the endpoints of its own region
+
+A Global PAT handed to the China transport used to be exchanged against the
+China gateway, which is a guaranteed authentication failure — not a fallback.
+The credential exchange, the chat endpoint, the image uploader and the token
+heal now all follow the account's own region, so a request that fails over from
+a China seat to a Global seat is answered by the Global service. Nothing writes
+an account's region: the file's own stamp stays authoritative.
+
+### Fixed — a cross-variant switch sticks in the file that owns the account
+
+Adopting a failover account used to activate it in the local file only, where
+the id does not exist; the failure was logged and the pointer never moved, so
+the card's "current account" and every later catalog and credit read stayed on
+the account that had just failed. Adoption now lands in the file that stores
+the account.
+
+### Fixed — the health chip and the auto-failover badge describe the whole pool
+
+Health was tracked per variant, so a failure recorded while a China seat was
+being walked never reached the Global card that displays that account — three
+consecutive failures left the chip reading 正常. One ledger now serves the pool;
+account ids are one-way hashes of the token, so they cannot collide. The
+"automatic switching" badge likewise counted one file, which made a pool split
+one seat per variant read as idle; it now counts every seat in the pool.
+
+### Fixed — the unified card keeps the other variant fresh
+
+The card only polled the variant it was showing, so after a failover moved
+traffic into the other file that tab's credits and health labels froze at
+whatever they were when the card first mounted. Both variants are now polled,
+on the same interval and the same timer.
+
 ## 1.0.1 — 2026-10-23
 
 A repair release for the account pool. Everything below is about the same

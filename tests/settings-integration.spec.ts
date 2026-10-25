@@ -609,6 +609,17 @@ describe('Qoder Host settings integration', () => {
     expect(tooFast.status).toBe(400)
     expect(tooFast.body.error).toBe('quotaPollMs must be an integer of at least 60000 ms')
 
+    // The stickiness master switch is a boolean field of the same section: the
+    // face serves its default, accepts a flip, persists it, and refuses a
+    // non-boolean.
+    expect(document.body.base).toMatchObject({ stickinessEnabled: true })
+    const switched = await face.post(QODER_SETTINGS_FACE_PATH, { stickinessEnabled: false }, key)
+    expect(switched.status).toBe(200)
+    expect(switched.body.user).toMatchObject({ stickinessEnabled: false })
+    expect(JSON.parse(await readFile(settingsFile(), 'utf8'))).toMatchObject({ stickinessEnabled: false })
+    const wrongType = await face.post(QODER_SETTINGS_FACE_PATH, { stickinessEnabled: 'yes' }, key)
+    expect(wrongType.status).toBe(400)
+
     // The poll floor is enforced by the schema itself, not by the card. The
     // schema instance is callable: it validates and applies defaults.
     expect(Qoder.QUOTA_POLL_DEFAULT_MS).toBe(300_000)

@@ -839,6 +839,178 @@ declare class QoderCredentialStore {
  */
 declare function qoderOwnAuthPath(variant: QoderVariant): string;
 //#endregion
+//#region src/qoder/account.d.ts
+interface QoderSubscriberProfile {
+  id: string;
+  name: string;
+  email: string;
+}
+interface QoderQuota {
+  total: number;
+  used: number;
+  remaining: number;
+  percentage: number;
+  unit: string;
+}
+interface QoderQuotaUsage {
+  userQuota?: QoderQuota | undefined;
+  orgResourcePackage?: QoderQuota | undefined;
+  /**
+   * Credits granted on top of the plan — the daily campaign's 100, for one.
+   *
+   * A separate bucket upstream reports beside `userQuota`; it carries its own
+   * total and remaining, so leaving it out made the card show fewer packages
+   * than the account actually holds (two on the web, one here).
+   */
+  addOnQuota?: QoderQuota | undefined;
+  totalUsagePercentage?: number | undefined;
+  isQuotaExceeded?: boolean | undefined;
+  expiresAt?: string | undefined;
+  raw?: unknown;
+}
+interface QoderSubscriberOrganization {
+  orgId: string;
+  orgName: string;
+  roleName?: string | undefined;
+  isSuspended?: boolean;
+  canManageSubscriptions?: boolean;
+  resourcePackageFeatureEnabled?: boolean;
+}
+interface QoderSubscriberFeatureAllowed {
+  quest?: boolean;
+  wiki?: boolean;
+  codeReview?: boolean;
+}
+interface QoderSubscriberPlan {
+  userType: string;
+  planTierName: string;
+  planTier?: string;
+  isPersonalVersion: boolean;
+  isHighestTier?: boolean;
+  isRenewed?: boolean;
+  startDate?: string;
+  endDate?: string;
+  organization?: QoderSubscriberOrganization;
+  featureAllowed?: QoderSubscriberFeatureAllowed;
+  raw?: unknown;
+}
+interface QoderSubscriberStatus {
+  allowByok: number;
+  teamAllowByok?: number;
+  isPrivacyPolicyModifiable?: boolean;
+  raw?: unknown;
+}
+interface QoderAccountInfo {
+  profile: QoderSubscriberProfile;
+  usage?: QoderQuotaUsage;
+  plan?: QoderSubscriberPlan;
+  status?: QoderSubscriberStatus;
+  updatedAt: string;
+}
+//#endregion
+//#region src/qoder/catalog.d.ts
+/** Browser-safe Qoder model catalog types and built-in fallback entries. */
+interface QoderCatalogModel {
+  id: string;
+  name: string;
+  description?: string;
+  /** Effective DSH input budget, which may be smaller than the provider default tier. */
+  contextWindow?: number;
+  /** Largest known capacity, independent of the effective input budget. */
+  maxContextWindow?: number;
+  maxTokens?: number;
+  source?: string;
+  isReasoning?: boolean;
+  supportsEffort?: boolean;
+  reasoningEfforts?: Array<{
+    id: string;
+    name: string;
+    description?: string;
+  }>;
+  defaultReasoningEffort?: string;
+  priceFactor?: number;
+  contextOptions?: Record<string, {
+    tokenCount?: number;
+    isDefault?: boolean;
+  }>;
+  supportsImages?: boolean;
+}
+//#endregion
+//#region src/qoder/transport/checkin.d.ts
+interface QoderCheckInResult {
+  variantId: string;
+  date: string;
+  timestamp: number;
+  status: 'claimed' | 'already-claimed' | 'no-campaign' | 'error';
+  amount?: number | undefined;
+  campaignKey?: string | undefined;
+  message?: string | undefined;
+  /**
+   * When the claimed credits expire, epoch milliseconds.
+   *
+   * A claimed package is not permanent — Qoder grants it for a fixed window
+   * (30 days for the daily 100-credit benefit) — and the card has to say so.
+   * Resolution order: the claim's own `expiresAt`; failing that, the
+   * campaign's stated `validity.days` counted from the claim moment. Absent
+   * when the upstream said neither, and an absent value is rendered as
+   * unknown rather than guessed.
+   */
+  expiresAtMs?: number | undefined;
+  /**
+   * A stable reason code for a failed attempt, when one applies.
+   *
+   * Carried alongside `message` so the card can localize the one failure the
+   * user can actually act on instead of matching on English prose:
+   * - `no-client` — this machine has no Qoder client to mint the device
+   *   identity the international campaign requires.
+   * - `claim-conflict` — the claim endpoint answered HTTP 409 and the
+   *   authoritative campaign read afterwards still says the benefit was not
+   *   granted (window closed, or the campaign is not claimable right now).
+   *   The card must not read that as a granted benefit.
+   */
+  reasonCode?: 'no-client' | 'claim-conflict' | undefined;
+}
+//#endregion
+//#region src/qoder/transport/index.d.ts
+interface QoderTransport {
+  stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk>;
+  discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]>;
+  /**
+   * Read one account's billing answer.
+   *
+   * `pat` names the account to read; without it the ambient credential signs,
+   * which is what the card's single-account quota read does. With it, the host
+   * can price every pooled account in one status document without switching the
+   * active pointer — the read is a plain GET, it does not adopt the credential.
+   */
+  readAccount(options?: {
+    force?: boolean | undefined;
+    signal?: AbortSignal | undefined;
+    pat?: string | undefined;
+    minIntervalMs?: number | undefined;
+  }): Promise<QoderAccountInfo>;
+  checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>;
+}
+/**
+ * One account the pool can hand to the transport.
+ *
+ * `region` is the region that account was SAVED under, and it is what makes a
+ * pool able to span the two Qoder variants: the host keeps one credential file
+ * per region, so a pooled account that lives in the other file must be signed
+ * against the other region's endpoints. The transport uses `region` for exactly
+ * that — it never writes an account's region anywhere, and the file's own
+ * region stamp stays authoritative.
+ *
+ * Optional because a host that pools one region only (or an older host) can
+ * leave it off; the transport then falls back to its own construction region.
+ */
+interface QoderPooledAccount {
+  readonly id: string;
+  readonly pat: string;
+  /** The region whose endpoints this account may sign against. */
+  readonly region?: QoderRegion;
+}
+//#endregion
 //#region src/catalog.d.ts
 /**
  * Qoder model catalog: a static fallback roster captured from the transport's
@@ -1042,159 +1214,6 @@ declare function probeModel(options: {
   candidates?: readonly QoderEffort[];
   timeoutMs?: number;
 }): Promise<ProbeOutcome>;
-//#endregion
-//#region src/qoder/catalog.d.ts
-/** Browser-safe Qoder model catalog types and built-in fallback entries. */
-interface QoderCatalogModel {
-  id: string;
-  name: string;
-  description?: string;
-  /** Effective DSH input budget, which may be smaller than the provider default tier. */
-  contextWindow?: number;
-  /** Largest known capacity, independent of the effective input budget. */
-  maxContextWindow?: number;
-  maxTokens?: number;
-  source?: string;
-  isReasoning?: boolean;
-  supportsEffort?: boolean;
-  reasoningEfforts?: Array<{
-    id: string;
-    name: string;
-    description?: string;
-  }>;
-  defaultReasoningEffort?: string;
-  priceFactor?: number;
-  contextOptions?: Record<string, {
-    tokenCount?: number;
-    isDefault?: boolean;
-  }>;
-  supportsImages?: boolean;
-}
-//#endregion
-//#region src/qoder/account.d.ts
-interface QoderSubscriberProfile {
-  id: string;
-  name: string;
-  email: string;
-}
-interface QoderQuota {
-  total: number;
-  used: number;
-  remaining: number;
-  percentage: number;
-  unit: string;
-}
-interface QoderQuotaUsage {
-  userQuota?: QoderQuota | undefined;
-  orgResourcePackage?: QoderQuota | undefined;
-  /**
-   * Credits granted on top of the plan — the daily campaign's 100, for one.
-   *
-   * A separate bucket upstream reports beside `userQuota`; it carries its own
-   * total and remaining, so leaving it out made the card show fewer packages
-   * than the account actually holds (two on the web, one here).
-   */
-  addOnQuota?: QoderQuota | undefined;
-  totalUsagePercentage?: number | undefined;
-  isQuotaExceeded?: boolean | undefined;
-  expiresAt?: string | undefined;
-  raw?: unknown;
-}
-interface QoderSubscriberOrganization {
-  orgId: string;
-  orgName: string;
-  roleName?: string | undefined;
-  isSuspended?: boolean;
-  canManageSubscriptions?: boolean;
-  resourcePackageFeatureEnabled?: boolean;
-}
-interface QoderSubscriberFeatureAllowed {
-  quest?: boolean;
-  wiki?: boolean;
-  codeReview?: boolean;
-}
-interface QoderSubscriberPlan {
-  userType: string;
-  planTierName: string;
-  planTier?: string;
-  isPersonalVersion: boolean;
-  isHighestTier?: boolean;
-  isRenewed?: boolean;
-  startDate?: string;
-  endDate?: string;
-  organization?: QoderSubscriberOrganization;
-  featureAllowed?: QoderSubscriberFeatureAllowed;
-  raw?: unknown;
-}
-interface QoderSubscriberStatus {
-  allowByok: number;
-  teamAllowByok?: number;
-  isPrivacyPolicyModifiable?: boolean;
-  raw?: unknown;
-}
-interface QoderAccountInfo {
-  profile: QoderSubscriberProfile;
-  usage?: QoderQuotaUsage;
-  plan?: QoderSubscriberPlan;
-  status?: QoderSubscriberStatus;
-  updatedAt: string;
-}
-//#endregion
-//#region src/qoder/transport/checkin.d.ts
-interface QoderCheckInResult {
-  variantId: string;
-  date: string;
-  timestamp: number;
-  status: 'claimed' | 'already-claimed' | 'no-campaign' | 'error';
-  amount?: number | undefined;
-  campaignKey?: string | undefined;
-  message?: string | undefined;
-  /**
-   * When the claimed credits expire, epoch milliseconds.
-   *
-   * A claimed package is not permanent — Qoder grants it for a fixed window
-   * (30 days for the daily 100-credit benefit) — and the card has to say so.
-   * Resolution order: the claim's own `expiresAt`; failing that, the
-   * campaign's stated `validity.days` counted from the claim moment. Absent
-   * when the upstream said neither, and an absent value is rendered as
-   * unknown rather than guessed.
-   */
-  expiresAtMs?: number | undefined;
-  /**
-   * A stable reason code for a failed attempt, when one applies.
-   *
-   * Carried alongside `message` so the card can localize the one failure the
-   * user can actually act on instead of matching on English prose:
-   * - `no-client` — this machine has no Qoder client to mint the device
-   *   identity the international campaign requires.
-   * - `claim-conflict` — the claim endpoint answered HTTP 409 and the
-   *   authoritative campaign read afterwards still says the benefit was not
-   *   granted (window closed, or the campaign is not claimable right now).
-   *   The card must not read that as a granted benefit.
-   */
-  reasonCode?: 'no-client' | 'claim-conflict' | undefined;
-}
-//#endregion
-//#region src/qoder/transport/index.d.ts
-interface QoderTransport {
-  stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk>;
-  discoverModels(signal?: AbortSignal): Promise<readonly QoderCatalogModel[]>;
-  /**
-   * Read one account's billing answer.
-   *
-   * `pat` names the account to read; without it the ambient credential signs,
-   * which is what the card's single-account quota read does. With it, the host
-   * can price every pooled account in one status document without switching the
-   * active pointer — the read is a plain GET, it does not adopt the credential.
-   */
-  readAccount(options?: {
-    force?: boolean | undefined;
-    signal?: AbortSignal | undefined;
-    pat?: string | undefined;
-    minIntervalMs?: number | undefined;
-  }): Promise<QoderAccountInfo>;
-  checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>;
-}
 //#endregion
 //#region src/upstream.d.ts
 /**
@@ -2002,6 +2021,12 @@ interface Config {
    */
   routingOrder?: string[];
   /**
+   * Conversation stickiness master switch. When off (explicitly `false`), no
+   * account is ever pinned: every request picks one fresh, whatever the three
+   * bounds below say. Defaults to on.
+   */
+  stickinessEnabled?: boolean;
+  /**
    * Conversation stickiness: how many completed rounds one account serves
    * before the session moves to the next account. 0 disables round counting.
    */
@@ -2038,7 +2063,7 @@ declare const Config: z<Config>;
  */
 declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindowCN", "modelContextWindowsCN", "disabledModelsCN", "variantEnabledCN"];
 declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels", "variantEnabledGlobal"];
-declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
+declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessEnabled", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
 /**
  * Whether a connection failure could be absorbed by switching accounts.
  *
@@ -2057,6 +2082,18 @@ declare function autoFailoverActive(enabled: boolean | undefined, entries: reado
   readonly enabled?: boolean;
 }[]): boolean;
 /**
+ * Every seat in the pool, flattened into the shape {@link autoFailoverActive}
+ * reads: one flag per row, `enabled: false` for a parked one.
+ *
+ * Reading both files is what makes the derived 「自动切换」 fact honest for a
+ * mixed pool. It costs two file reads per status request — the same reads the
+ * walk itself does, and the document is assembled on demand rather than polled
+ * in a tight loop.
+ */
+declare function poolSeatFlags(members: readonly PoolMember[]): Promise<readonly {
+  readonly enabled?: boolean;
+}[]>;
+/**
  * Move the stored active pointer to the account a failover just switched to.
  *
  * The retry itself is already answering with the successor's PAT, so this move
@@ -2070,6 +2107,89 @@ declare function autoFailoverActive(enabled: boolean | undefined, entries: reado
  */
 declare function adoptFailoverAccount(store: Pick<QoderCredentialStore, 'activate'>, accountId: string, warn: (message: string) => void): Promise<boolean>;
 /**
+ * One account as the cross-variant walk sees it, with the variant that stores it.
+ *
+ * An account is always OWNED by exactly one variant's credential file: that is
+ * where its row lives, that is the region stamped on it, and that is the only
+ * endpoint set that may sign it. The pool layer never moves a row between
+ * files — it only decides which of the two files the walk visits next, and
+ * carries the owning variant's region along so the transport can sign with the
+ * endpoints the account was saved under.
+ */
+interface PoolMember {
+  /** Only the id is read: the pool never asks a member about its own routes. */
+  readonly variant: Pick<QoderVariant, 'id'>;
+  /** The three reads/writes the pool performs on a member's credential file. */
+  readonly store: Pick<QoderCredentialStore, 'byId' | 'list' | 'activate'>;
+}
+/**
+ * The walk's view of the pool: this variant's file first, then its siblings.
+ *
+ * Local-first is not cosmetic — it is what keeps a single-region install
+ * byte-for-byte unchanged. The sibling contributes no rows there, so every
+ * resolution lands on the same store the walk always used, and the extra reads
+ * are two cheap file misses. For a mixed pool it also gives the save-order walk
+ * a sane continuation: this file ends, and the walk resumes in the other one
+ * instead of looping back to an account it has already tried.
+ */
+declare function poolOrder(pool: () => readonly PoolMember[], variant: Pick<QoderVariant, 'id'>): readonly PoolMember[];
+/** The variant whose credential file stores `accountId`, if any file holds it. */
+declare function poolOwner(order: readonly PoolMember[], accountId: string): Promise<PoolMember | undefined>;
+/**
+ * By-id resolution across the pool, for custom routing and pinned sessions.
+ *
+ * Ids are globally unique (the id is a hash of the PAT), so a row is found in
+ * at most one file. A parked row resolves to nothing — the same "skip this id"
+ * answer the save-order walk gives — and because ids cannot collide there is no
+ * point looking for it in the other file. A row no file holds resolves to
+ * nothing too, which is how the walk skips an account removed in another tab.
+ */
+declare function pooledAccountById(order: readonly PoolMember[], accountId: string): Promise<QoderPooledAccount | undefined>;
+/**
+ * The pool as one ordered ring: every file's usable rows, local file first.
+ *
+ * Each file keeps its own save order, and the pool is their concatenation —
+ * the same local-first order {@link poolOrder} gives the walk. Parked rows are
+ * dropped here rather than skipped later, because the ring's answer must not
+ * depend on which file it happens to look in: the transport treats "not in the
+ * pool" and "parked" identically, and building the ring once is what lets the
+ * walk continue into the sibling file at exactly the point its own file ends.
+ *
+ * Reading the files costs one `list()` per variant per step. That is the same
+ * on-demand read the store already does for every `nextAfter` call, and the
+ * pool has two files at most.
+ */
+declare function poolRing(order: readonly PoolMember[]): Promise<readonly QoderPooledAccount[]>;
+/**
+ * The account after `accountId`, continuing across the pool's files.
+ *
+ * This is the save-order leg. Within one file it is exactly the store's own
+ * `nextAfter`; at the end of a file the walk continues with the NEXT file's
+ * first row, and only after the last file does it wrap to the pool's first
+ * row. That is the difference from the per-file walk: it used to wrap inside
+ * its own document, so an account in the other variant's file was never
+ * reached by save order at all — the very leg the two-file pool was supposed
+ * to extend.
+ *
+ * An id no file holds (removed in another tab, or the step after a pin to a
+ * since-deleted account) restarts the ring at its first row instead of
+ * dead-ending, which is the same "one silent extra lap" the per-file walk
+ * always had, now spanning the pool. The transport's own `tried` set is what
+ * stops a lap from repeating.
+ */
+declare function pooledNextAccount(order: readonly PoolMember[], accountId: string): Promise<QoderPooledAccount | undefined>;
+/**
+ * Move the active pointer in whichever file stores the account a switch chose.
+ *
+ * The pointer that has to move is the OWNING variant's — the card, the catalog
+ * and the credits all resolve "the active account" out of their own file, so a
+ * cross-region switch that only warned would leave the card pointing at the
+ * account that just failed while the request signs as the sibling's. The
+ * per-file semantics stay intact: a variant's file still records exactly one
+ * active row, it is just chosen by whoever owns the row.
+ */
+declare function adoptPooledAccount(order: readonly PoolMember[], accountId: string, warn: (message: string) => void): Promise<boolean>;
+/**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their
  * credential-driven catalog lifecycles.
@@ -2081,4 +2201,4 @@ declare function adoptFailoverAccount(store: Pick<QoderCredentialStore, 'activat
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, adoptFailoverAccount, apply, autoFailoverActive, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };
+export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, PoolMember, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, adoptFailoverAccount, adoptPooledAccount, apply, autoFailoverActive, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, poolOrder, poolOwner, poolRing, poolSeatFlags, pooledAccountById, pooledNextAccount, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };

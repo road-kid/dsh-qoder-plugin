@@ -191,3 +191,111 @@ describe('emitUpstreamNotice', () => {
     expect(text).not.toContain('x'.repeat(401))
   })
 })
+
+/**
+ * Attribution: the row belongs to the conversation whose request produced it.
+ *
+ * The user reported that these lines appeared in ANOTHER conversation — with
+ * two sessions live at once the remembered `lastRunningAgent` decided where the
+ * row went, so a queue answer from chat A printed into chat B. The transport now
+ * carries each request's own session id, and a row whose id names a
+ * conversation this process cannot resolve is DROPPED rather than misplaced.
+ */
+describe('conversation attribution', () => {
+  /** A context that also composes a session store, like the real host does. */
+  function hosted(sessions: Map<string, FakeSession>): {
+    ctx: Context
+    running: (agent: { id: string; session?: FakeSession }) => void
+  } {
+    const listeners = new Map<string, (payload: unknown) => void>()
+    const ctx = {
+      on: (event: string, handler: (payload: unknown) => void): void => { listeners.set(event, handler) },
+      sessions: { get: (id: string) => sessions.get(id) },
+    } as unknown as Context
+    return { ctx, running: agent => listeners.get('agent/status')?.({ agent, status: 'running' }) }
+  }
+
+  it('prints into the named conversation, not the most recently running one', () => {
+    const sessions = new Map<string, FakeSession>()
+    const issuing = fakeSession()
+    const bystander = fakeSession()
+    sessions.set('chat-a', issuing)
+    sessions.set('chat-b', bystander)
+    const { ctx, running } = hosted(sessions)
+    installJobTokenHint(ctx)
+
+    // chat B started last, so the remembered agent points at it — exactly the
+    // condition that used to steal the row.
+    running({ id: 'chat-b', session: bystander })
+    running({ id: 'chat-a', session: issuing })
+    running({ id: 'chat-b', session: bystander })
+    emitUpstreamNotice('上游模型排队中', 'chat-a')
+
+    expect(issuing.rows).toHaveLength(2)
+    expect(bystander.rows).toHaveLength(0)
+  })
+
+  it('prefers the store object for an idle conversation', () => {
+    // A session-title or compaction request belongs to its own conversation,
+    // which may be idle right now and so is not the remembered agent at all.
+    const sessions = new Map<string, FakeSession>()
+    const idle = fakeSession()
+    sessions.set('chat-idle', idle)
+    const remembered = fakeSession()
+    const { ctx, running } = hosted(sessions)
+    installJobTokenHint(ctx)
+    running({ id: 'chat-other', session: remembered })
+
+    emitUpstreamNotice('上游模型排队中', 'chat-idle')
+
+    expect(idle.rows).toHaveLength(2)
+    expect(remembered.rows).toHaveLength(0)
+  })
+
+  it('drops the row when the named conversation cannot be resolved', () => {
+    // The store has no such session and the remembered agent is a DIFFERENT
+    // conversation: printing here would be a false statement about someone
+    // else's chat, so the line is lost instead.
+    const bystander = fakeSession()
+    const { ctx, running } = hosted(new Map())
+    installJobTokenHint(ctx)
+    running({ id: 'chat-b', session: bystander })
+
+    expect(() => emitUpstreamNotice('上游模型排队中', 'chat-a')).not.toThrow()
+    expect(bystander.rows).toHaveLength(0)
+  })
+
+  it('uses the remembered agent only when it IS the named conversation', () => {
+    // Callers with no session store (the recovery spec drives a bare Context):
+    // an id that matches the remembered agent must still land.
+    const session = fakeSession()
+    const { ctx, running } = hosted(new Map())
+    installJobTokenHint(ctx)
+    running({ id: 'chat-a', session })
+
+    emitUpstreamNotice('上游模型排队中', 'chat-a')
+
+    expect(session.rows).toHaveLength(2)
+  })
+
+  it('de-duplicates per conversation, so two chats each report their own queue', () => {
+    const sessions = new Map<string, FakeSession>()
+    const a = fakeSession()
+    const b = fakeSession()
+    sessions.set('chat-a', a)
+    sessions.set('chat-b', b)
+    const { ctx, running } = hosted(sessions)
+    installJobTokenHint(ctx)
+    running({ id: 'chat-a', session: a })
+    running({ id: 'chat-b', session: b })
+
+    emitUpstreamNotice('上游模型排队中', 'chat-a')
+    // Same text, same turn, different conversation: not a repeat.
+    emitUpstreamNotice('上游模型排队中', 'chat-b')
+    // Same text, same conversation, same turn: the host's retry, suppressed.
+    emitUpstreamNotice('上游模型排队中', 'chat-a')
+
+    expect(a.rows).toHaveLength(2)
+    expect(b.rows).toHaveLength(2)
+  })
+})

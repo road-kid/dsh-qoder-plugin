@@ -28,6 +28,14 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
      */
     'conversation.input.right': { kind: 'list'; scope: 'session' }
     /**
+     * The command-row seat, declared by `@deepseek-ai/dsh-client-ui-conversation`
+     * as `{ kind: 'keyed'; scope: 'session' }` and dispatched with the command
+     * name as the entry key. This plugin claims the `qoder` key — the name its
+     * queue notices are logged under — so the row renders its full text
+     * instead of the generic card's one-line ellipsis.
+     */
+    'conversation.chat.commandview': { kind: 'keyed'; scope: 'session'; owner: CommandRowOwnerProps }
+    /**
      * The Plugins page's row-configuration seat, declared by
      * `@deepseek-ai/dsh-client-ui-plugin-manager` (not a dependency of this
      * bundle). It is a KEYED slot dispatched with `entryKey = <package
@@ -64,3 +72,20 @@ export interface PluginConfigViewOwnerProps {
   /** Which face of the card the page asks for. */
   view: 'summary' | 'page'
 }
+
+/**
+ * Owner share of `conversation.chat.commandview`, mirrored structurally from
+ * the host's `CommandRowOwnerProps`.
+ *
+ * `node` is the folded command lifecycle: its `name` is the dispatch key, its
+ * `outcome` carries the finished text (`null` while the command still runs).
+ * Only the pieces the queue-notice row reads are declared; a wider shape from
+ * the owner is harmless for the same reason as above.
+ */
+export interface CommandRowOwnerProps {
+  node: {
+    name?: string
+    outcome?: { kind?: string; text?: string } | null
+  }
+}
+

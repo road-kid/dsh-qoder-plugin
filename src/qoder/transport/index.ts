@@ -30,6 +30,26 @@ export interface QoderTransport {
 }
 
 /**
+ * One account the pool can hand to the transport.
+ *
+ * `region` is the region that account was SAVED under, and it is what makes a
+ * pool able to span the two Qoder variants: the host keeps one credential file
+ * per region, so a pooled account that lives in the other file must be signed
+ * against the other region's endpoints. The transport uses `region` for exactly
+ * that — it never writes an account's region anywhere, and the file's own
+ * region stamp stays authoritative.
+ *
+ * Optional because a host that pools one region only (or an older host) can
+ * leave it off; the transport then falls back to its own construction region.
+ */
+export interface QoderPooledAccount {
+  readonly id: string
+  readonly pat: string
+  /** The region whose endpoints this account may sign against. */
+  readonly region?: QoderRegion
+}
+
+/**
  * The credential pool's seam into the transport: which account signs now, which
  * one to try next, and how a switch is announced.
  *
@@ -41,9 +61,9 @@ export interface QoderFailoverHooks {
   /** Whether automatic switching is on for this transport right now. */
   enabled(): boolean
   /** The pooled account that should sign the request, when there is one. */
-  activeAccount(): Promise<{ id: string; pat: string } | undefined>
+  activeAccount(): Promise<QoderPooledAccount | undefined>
   /** The account after `id` in save order; `undefined` ends the walk. */
-  nextAccount(id: string): Promise<{ id: string; pat: string } | undefined>
+  nextAccount(id: string): Promise<QoderPooledAccount | undefined>
   /**
    * Resolve one stored account id to its credential, `undefined` when the id
    * names no account any more.
@@ -59,7 +79,7 @@ export interface QoderFailoverHooks {
    * transport falls back to save order (routing) and to the credential it
    * captured when the session was pinned (stickiness).
    */
-  accountById?(id: string): Promise<{ id: string; pat: string } | undefined>
+  accountById?(id: string): Promise<QoderPooledAccount | undefined>
   /**
    * Announce a switch, before the retry is made.
    *
@@ -68,7 +88,13 @@ export interface QoderFailoverHooks {
    * the store's active account, so the host's adoption has to have landed by
    * the time that path can run.
    */
-  switched(info: { fromId: string; toId: string; reason: string }): void | Promise<void>
+  switched(info: {
+    readonly fromId: string
+    readonly toId: string
+    readonly reason: string
+    /** The conversation this switch belongs to; see `onUpstreamQueue`'s id. */
+    readonly sessionId?: string
+  }): void | Promise<void>
   /**
    * Adopt a dispatch decision that moved this request to another account for a
    * reason that is NOT a failure of the request (today: the active account is
@@ -143,8 +169,14 @@ export interface QoderTransportOptions {
    *   rather than being remembered on the transport: requests run concurrently,
    *   and a shared "last account" field would let one request's failure be
    *   blamed on another request's account.
+   * @param sessionId - The conversation the failed request belongs to, taken
+   *   from the request itself rather than from any remembered "current" agent:
+   *   several conversations run at once, and a notice printed into whichever one
+   *   most recently looked busy is a notice about someone else's request (this
+   *   is what made rows land in the wrong conversation). Absent when the request
+   *   carries no session, in which case the host falls back to its best guess.
    */
-  onUpstreamQueue?: (facts: QoderQueueFacts, accountId?: string) => void
+  onUpstreamQueue?: (facts: QoderQueueFacts, accountId?: string, sessionId?: string) => void
   /**
    * Called right before this transport waits out a queue answer, once per wait.
    *
@@ -162,8 +194,11 @@ export interface QoderTransportOptions {
    *   for the ambient credential.
    * @param wait - The wait about to start; see
    *   {@link QoderQueueWaitProgress}.
+   * @param sessionId - The conversation whose request is waiting, for the same
+   *   reason {@link onUpstreamQueue} carries it: the row must print where the
+   *   wait actually happened.
    */
-  onQueueWait?: (facts: QoderQueueFacts, accountId: string | undefined, wait: QoderQueueWaitProgress) => void
+  onQueueWait?: (facts: QoderQueueFacts, accountId: string | undefined, wait: QoderQueueWaitProgress, sessionId?: string) => void
   /**
    * Called when the upstream accepted a chat — its first chunk is about to be
    * forwarded — so any condition an earlier failure notice described is over.
@@ -179,14 +214,19 @@ export interface QoderTransportOptions {
    *   `undefined` when no pooled account signed. Carried per attempt for the
    *   same reason as `onUpstreamQueue`'s id, and it is what lets the host mark
    *   the right account healthy while other requests are failing on others.
+   * @param sessionId - The conversation whose request the upstream accepted. The
+   *   host uses it to report a deferred job-token rotation only to the
+   *   conversation that actually earned it: one rotation is shared by every
+   *   concurrent request, so an acceptance elsewhere must not claim a recovery
+   *   this conversation never waited for.
    */
-  onChatAccepted?: (accountId?: string) => void
+  onChatAccepted?: (accountId?: string, sessionId?: string) => void
   /**
    * Called once per successful re-auth refresh, right after a fresh job token
    * was exchanged and accepted following a 401 rejection. The plugin host
    * surfaces this as a visible "token auto-refreshed" notice on its card.
    */
-  onJobTokenRefreshed?: (info: { region: QoderRegion; at: number }) => void
+  onJobTokenRefreshed?: (info: { region: QoderRegion; at: number; sessionId?: string }) => void
   /**
    * Called once per unresolved self-heal failure: the transport exchanged a
    * fresh job token, retried the chat, and the upstream rejected it anyway.
@@ -196,7 +236,13 @@ export interface QoderTransportOptions {
    * recover. Reported at most once per outage (reset when a later chat is
    * accepted), so a long rejection storm does not print a row per retry.
    */
-  onJobTokenRefreshFailed?: (info: { region: QoderRegion; at: number; status?: number }) => void
+  onJobTokenRefreshFailed?: (info: {
+    region: QoderRegion
+    at: number
+    status?: number
+    /** The conversation whose heal failed; see {@link onChatAccepted}'s id. */
+    sessionId?: string
+  }) => void
   /**
    * Retry a queued chat on the same account instead of giving up on it.
    *
@@ -239,6 +285,14 @@ export interface QoderTransportOptions {
    * way to get the pre-stickiness behaviour of always using the active account.
    */
   stickiness?: {
+    /**
+     * Whether stickiness is on at all.
+     *
+     * When false the transport never pins a session to an account, regardless
+     * of what the bounds say. This is the master switch the settings UI owns;
+     * the three bounds below are only read while it is on.
+     */
+    enabled: () => boolean
     /**
      * Conversation rounds one account serves before the session moves on.
      *

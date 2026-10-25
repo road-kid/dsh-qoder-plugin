@@ -314,7 +314,7 @@ describe('QoderTransport routing order', () => {
       strategy: 'custom',
       // Save order says Beta next; the user's list says Gamma.
       order: [ALPHA.id, GAMMA.id, BETA.id],
-      stickiness: { rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
       chat: () => accepted('from-any'),
     })
 

@@ -56,7 +56,13 @@ interface AccountObservation {
 }
 
 /**
- * Per-variant, per-account health tracker.
+ * Per-account health tracker, shared by the whole pool.
+ *
+ * Keyed by account id, which is globally unique (a hash of the PAT), so one
+ * instance can serve both variants without confusing two accounts. Sharing it
+ * is what makes a cross-region switch observable: the failure is reported by
+ * the runtime whose walk ran, but the label is read from the document that now
+ * owns the row.
  *
  * Deliberately takes explicit timestamps instead of reading the clock: the
  * hour-long rule is untestable otherwise, and the caller (the transport's

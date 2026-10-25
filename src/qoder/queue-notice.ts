@@ -144,6 +144,24 @@ export function formatQueueNotice(
   return `${head}：这不是登录态或额度问题，${wait}${risk}${source}`
 }
 
+/**
+ * Which value drove the wait, as the transport computed it.
+ *
+ * The length of a queue wait comes from one of two places, and the row must say
+ * which: the upstream's own retry window (its `retryAfterSeconds` / `waitTime`,
+ * whichever is larger), or — only when it advised nothing — the 排队等待秒数 the
+ * user configured. Without this, a row reading "等待约 86 秒" beside a setting of
+ * 30 looks like the setting was ignored, when the queue actually named 86.
+ */
+export interface QoderQueueWaitBasis {
+  /** `'upstream'` when the queue's own advice won, else the configured fallback. */
+  source: 'upstream' | 'configured'
+  /** The advice's length in whole seconds; absent when `'configured'`. */
+  advisedSeconds?: number
+  /** The configured fallback in force, in whole seconds. */
+  configuredSeconds: number
+}
+
 /** The wait about to start, as reported by the transport's `onQueueWait`. */
 export interface QoderQueueWaitProgress {
   /** How long this wait will last, in milliseconds. */
@@ -152,6 +170,12 @@ export interface QoderQueueWaitProgress {
   attempt: number
   /** Waits left after this one; 0 means this is the last one. */
   remaining: number
+  /**
+   * Which value governed {@link waitMs}. Optional because a caller that builds
+   * a progress record by hand (a test, an older transport) simply leaves the row
+   * without the clause — the length and the attempt number still read true.
+   */
+  basis?: QoderQueueWaitBasis
 }
 
 /**
@@ -173,11 +197,20 @@ export function formatQueueWaitNotice(facts: QoderQueueFacts, wait: QoderQueueWa
     ? `，本次请求还可再等 ${wait.remaining} 次`
     : '，这是本次请求的最后一次等待'
   const queue = facts.queueCount === undefined ? '' : `（当前排队约 ${facts.queueCount} 个请求）`
+  // The reason the number is what it is. Only the upstream branch needs an
+  // explanation (it names a value the user did not choose); the fallback branch
+  // says so plainly, which is also the one case where the setting is in force.
+  const basis = wait.basis
+  const why = basis === undefined
+    ? ''
+    : basis.source === 'upstream'
+      ? `（上游建议 ${basis.advisedSeconds ?? seconds} 秒，设置仅作无建议时的回退）`
+      : `（上游未给出建议，按设置的 ${basis.configuredSeconds} 秒）`
   const quoted = facts.upstreamMessage === undefined
     ? undefined
     : boundMessage(facts.upstreamMessage)
   const source = quoted === undefined ? '' : `（上游原文：${quoted}）`
-  return `上游模型排队中：正在等待约 ${seconds} 秒后重试（第 ${wait.attempt} 次等待${left}）${queue}。这不是登录态或额度问题${source}`
+  return `上游模型排队中：正在等待约 ${seconds} 秒后重试（第 ${wait.attempt} 次等待${left}）${queue}${why}。这不是登录态或额度问题${source}`
 }
 
 /**

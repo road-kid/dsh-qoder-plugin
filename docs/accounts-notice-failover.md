@@ -317,6 +317,42 @@ from one of them as an explanation. It does not gate the write: the walk skips
 an account whose variant cannot serve the requested model, so the order the
 user asked for is the order that is stored.
 
+### The pool spans both credential files
+
+A mixed order and a mixed save order only mean something if the walk can
+actually reach the other file. The host keeps one credential file per region,
+so the pool is assembled at the host seam, not inside `auth.ts`:
+
+- `src/index.ts` exports the pool primitives — `poolOrder` (own file first, so a
+  single-region install is byte-for-byte unchanged), `poolOwner`,
+  `pooledAccountById`, `poolRing`, `pooledNextAccount`, `adoptPooledAccount`
+  and `poolSeatFlags`. Each takes `PoolMember`, which only requires
+  `variant.id` plus `store.byId`/`list`/`activate`, so the pool can be tested
+  against two real stores without booting the plugin.
+- The failover hooks delegate to those primitives. `accountById` resolving
+  across files is what makes a custom order and a pinned session reach a
+  sibling account at all; `nextAccount` continuing into the other file instead
+  of wrapping home is what makes save order reach it.
+- `activeAccount` deliberately stays local: the start of a walk is a fact about
+  the file the request arrived on, and borrowing a sibling credential there
+  would sign a Global PAT against the China gateway before anything had failed.
+  A parked active row is skipped, because the store keeps `activeId` on a
+  parked account by design.
+- Every account carries `region` (`QoderPooledAccount.region`) and the
+  transport signs each attempt with that region's endpoints: `authByRegion` /
+  `uploaderByRegion` in `default-transport.ts` are lazily built per region, and
+  `attempt`/`attemptPaced`/`streamChat` all read
+  `account.region ?? this.region`. A China account through the Global gateway
+  would be a guaranteed AUTH failure, not a fallback — this is the mechanical
+  wall the old code hit.
+- Adoption follows the owner: `switched`/`adopted` activate the account in the
+  file that stores it. Activating a foreign id locally throws, and that failure
+  used to be a warn-only path that left the pointer on the account that had just
+  failed.
+- The health tracker and the `autoFailover` badge are pool-wide: account ids are
+  one-way hashes of the token, so a shared ledger cannot confuse two accounts,
+  and a pool split one seat per file must not read as "only one account".
+
 ### Session stickiness needs the host's session id
 
 Stickiness cannot work from the request body alone. The chain is

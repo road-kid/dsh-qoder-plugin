@@ -16,6 +16,7 @@ import { ComposerQuotaChip } from './ComposerQuota.tsx'
 import { QoderProbeControl } from './QoderProbeControl.tsx'
 import { QoderPluginCard } from './QoderPluginCard.tsx'
 import type { QoderPluginCardInjected } from './QoderPluginCard.tsx'
+import { QoderQueueNoticeRow } from './QoderQueueNoticeRow.tsx'
 import type { QuotaSection, QuotaSettingsScope } from './QuotaSettingsCard.tsx'
 import { OwnQuotaSettingsScope } from './http-settings-scope.ts'
 import { injectQuotaCss } from './quota-styles.ts'
@@ -180,6 +181,37 @@ export function apply(ctx: ClientContext): void {
     }
     registerCard(ROW_CONFIG_SLOT, ROW_CONFIG_KEY)
     registerCard(BUNDLE_CONFIG_SLOT, PACKAGE_NAME)
+
+    /**
+     * Own the `qoder` command row in the conversation.
+     *
+     * The queue notices and the job-token heal lines are logged as command rows
+     * named `qoder` (`src/job-token-hint.ts`). The host renders an unclaimed
+     * command name with its generic card, whose summary span is
+     * `white-space: nowrap` with an ellipsis — the notice's tail (queue length,
+     * retry count) was cut off. Claiming the key replaces only this plugin's own
+     * rows; every other command keeps the generic card. `replaceRisk: none` is
+     * the owner's own note for this seat, and `keyDomain` reports `qoder` free.
+     *
+     * The key MIRRORS `JOB_TOKEN_HINT_NAME` in `src/job-token-hint.ts` — the
+     * host half's literal `'qoder'`. It is duplicated rather than imported for
+     * the same reason `ENTRY_ID` above mirrors the patch row id: the client
+     * bundle stays free of host modules (that one imports the cordis server
+     * context), and the pinned test suite keeps the two literals in step.
+     */
+    const NOTICE_ROW_SLOT = 'conversation.chat.commandview'
+    const NOTICE_ROW_KEY = 'qoder'
+    try {
+      ctx.slots.inject(NOTICE_ROW_SLOT, () => ctx.slots.register({
+        name: NOTICE_ROW_SLOT,
+        key: NOTICE_ROW_KEY,
+        inject: () => ({}),
+      // The seat is declared structurally in `quota-slots.ts`, whose owner share
+      // (`CommandRowOwnerProps`) the component is typed against.
+      } as never, QoderQueueNoticeRow as never))
+    } catch (error: unknown) {
+      console.error(`[dsh-qoder-plugin] command row "${NOTICE_ROW_SLOT}" failed to register (host provider unaffected):`, error)
+    }
 
     /**
      * 插件自有配置（`<profile>/.dsh-qoder-plugin/settings.json`）：两条宿主线的

@@ -683,6 +683,7 @@ interface CheckInSettings {
   routingStrategy: QoderRoutingStrategy
   /** The user's own priority list, account ids, highest priority first. */
   routingOrder: readonly string[]
+  stickinessEnabled: boolean
   stickinessRounds: number
   stickinessRequests: number
   stickinessMinutes: number
@@ -704,6 +705,7 @@ const UNAVAILABLE_SETTINGS: CheckInSettings = {
   queueWaitSeconds: QUEUE_WAIT_SECONDS_DEFAULT,
   routingStrategy: 'save-order',
   routingOrder: [],
+  stickinessEnabled: true,
   stickinessRounds: STICKINESS_ROUNDS_DEFAULT,
   stickinessRequests: STICKINESS_REQUESTS_DEFAULT,
   stickinessMinutes: STICKINESS_MINUTES_DEFAULT,
@@ -752,6 +754,10 @@ function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): str
     // The last refusal, so a control that did not take says so. Appended for
     // the same positional reason as the field above.
     snapshot.error ?? '',
+    // The stickiness master switch. Appended last, like every addition before
+    // it, so the tuple stays readable by the versions of this card that wrote
+    // the earlier positions.
+    value.stickinessEnabled !== false,
   ])
 }
 
@@ -786,6 +792,10 @@ function parseSettingsKey(raw: string): CheckInSettings {
       stickinessMinutes: typeof parsed[14] === 'number' ? parsed[14] : STICKINESS_MINUTES_DEFAULT,
       stickinessRequests: typeof parsed[15] === 'number' ? parsed[15] : STICKINESS_REQUESTS_DEFAULT,
       writeError: typeof parsed[16] === 'string' ? parsed[16] : '',
+      // The master switch rides at the end of the tuple; an older card wrote
+      // nothing here, and the parse must default those documents to ON so an
+      // upgrade does not silently disable a feature the user never touched.
+      stickinessEnabled: parsed[17] !== false,
     }
   } catch {
     return UNAVAILABLE_SETTINGS
@@ -1203,23 +1213,37 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     return () => { controller.abort() }
   }, [currentVariant.id, isUnified, readVariant])
 
-  // The 60s poll. Also ungated: a mounted page is a page the user is looking at.
-  // A variant known to be signed out is not polled — there is nothing to learn
-  // from a status route with no PAT (an unknown variant keeps polling until its
-  // first answer lands).
+  /*
+   * The 60s poll. Also ungated: a mounted page is a page the user is looking at.
+   * A variant known to be signed out is not polled — there is nothing to learn
+   * from a status route with no PAT (an unknown variant keeps polling until its
+   * first answer lands).
+   *
+   * A unified page polls BOTH variants off one timer. The pool spans them: a
+   * failover moves the walk into the sibling's file, so that file's balances
+   * and health tags go stale on the timescale the user is watching — the mount
+   * prefetch above only covers the first paint. The sibling read stays
+   * non-forced so the host's own freshness gate can still skip it, while the
+   * visible variant is always forced.
+   */
   const currentSignIn = knownSignIn(currentVariant.id)
   useEffect(() => {
     if (currentSignIn === false) return
     const controller = new AbortController()
-    const timer = window.setInterval(
-      () => { void readVariant(currentVariant, { force: true }, controller.signal) },
-      POLL_INTERVAL_MS,
-    )
+    const timer = window.setInterval(() => {
+      void readVariant(currentVariant, { force: true }, controller.signal)
+      if (!isUnified) return
+      for (const candidate of QODER_CARD_VARIANTS) {
+        if (candidate.id === currentVariant.id) continue
+        if (knownSignIn(candidate.id) === false) continue
+        void readVariant(candidate, {}, controller.signal)
+      }
+    }, POLL_INTERVAL_MS)
     return () => {
       window.clearInterval(timer)
       controller.abort()
     }
-  }, [currentSignIn, currentVariant, readVariant])
+  }, [currentSignIn, currentVariant, isUnified, readVariant])
 
   const manualRefresh = async (): Promise<void> => {
     setBusy(true)
@@ -1586,6 +1610,11 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     const controller = trackController()
     try {
       const body: QoderAuthRequest = { action, accountId }
+      // The rows this card draws come from THIS variant's own status document,
+      // and a stored row can only be moved by the auth route bound to the file
+      // that stores it — so the visible variant's route is the owner. The pool
+      // reaching across both files is a routing fact on the host side; it does
+      // not put the other variant's rows on this list.
       const result = await postAuthAction(currentVariant.authPath, key, body, controller.signal)
       if (!result.ok) {
         setAccountError(t('accountActionFailed', { message: result.detail }))
@@ -2586,41 +2615,60 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               <div className="qdp-row">
                 <div className="qdp-rowText">
                   <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
-                  <span className="qdp-rowDesc">{t('stickinessHint')}</span>
+                  <span className="qdp-rowDesc">{t('stickinessToggleHint')}</span>
                 </div>
                 <div className="qdp-rowControl">
-                  <QdpNumberField
-                    marker="stickiness-rounds"
-                    min={0}
-                    max={STICKINESS_ROUNDS_MAX}
-                    value={settings.stickinessRounds}
-                    label={t('stickinessRoundsLabel')}
+                  <QdpSwitch
+                    checked={settings.stickinessEnabled}
+                    label={t('stickinessLabel')}
                     disabled={!settingsReady}
-                    onCommit={rounds => { writeSetting('stickinessRounds', rounds) }}
+                    onChange={next => { writeSetting('stickinessEnabled', next) }}
                   />
-                  <span className="qdp-caption">{t('stickinessRoundsLabel')}</span>
-                  <QdpNumberField
-                    marker="stickiness-requests"
-                    min={0}
-                    max={STICKINESS_REQUESTS_MAX}
-                    value={settings.stickinessRequests}
-                    label={t('stickinessRequestsLabel')}
-                    disabled={!settingsReady}
-                    onCommit={requests => { writeSetting('stickinessRequests', requests) }}
-                  />
-                  <span className="qdp-caption">{t('stickinessRequestsLabel')}</span>
-                  <QdpNumberField
-                    marker="stickiness-minutes"
-                    min={0}
-                    max={STICKINESS_MINUTES_MAX}
-                    value={settings.stickinessMinutes}
-                    label={t('stickinessMinutesLabel')}
-                    disabled={!settingsReady}
-                    onCommit={minutes => { writeSetting('stickinessMinutes', minutes) }}
-                  />
-                  <span className="qdp-caption">{t('stickinessMinutesLabel')}</span>
                 </div>
               </div>
+              {/* The three bounds only exist while the master switch is on:
+                  rendering them against a disabled stickiness would invite the
+                  user to tune limits that never apply. */}
+              {settings.stickinessEnabled ? (
+                <div className="qdp-row">
+                  <div className="qdp-rowText">
+                    <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
+                    <span className="qdp-rowDesc">{t('stickinessHint')}</span>
+                  </div>
+                  <div className="qdp-rowControl">
+                    <QdpNumberField
+                      marker="stickiness-rounds"
+                      min={0}
+                      max={STICKINESS_ROUNDS_MAX}
+                      value={settings.stickinessRounds}
+                      label={t('stickinessRoundsLabel')}
+                      disabled={!settingsReady}
+                      onCommit={rounds => { writeSetting('stickinessRounds', rounds) }}
+                    />
+                    <span className="qdp-caption">{t('stickinessRoundsLabel')}</span>
+                    <QdpNumberField
+                      marker="stickiness-requests"
+                      min={0}
+                      max={STICKINESS_REQUESTS_MAX}
+                      value={settings.stickinessRequests}
+                      label={t('stickinessRequestsLabel')}
+                      disabled={!settingsReady}
+                      onCommit={requests => { writeSetting('stickinessRequests', requests) }}
+                    />
+                    <span className="qdp-caption">{t('stickinessRequestsLabel')}</span>
+                    <QdpNumberField
+                      marker="stickiness-minutes"
+                      min={0}
+                      max={STICKINESS_MINUTES_MAX}
+                      value={settings.stickinessMinutes}
+                      label={t('stickinessMinutesLabel')}
+                      disabled={!settingsReady}
+                      onCommit={minutes => { writeSetting('stickinessMinutes', minutes) }}
+                    />
+                    <span className="qdp-caption">{t('stickinessMinutesLabel')}</span>
+                  </div>
+                </div>
+              ) : null}
             </>
           )}
           {settings.status === 'ready' && !settings.writable ? (

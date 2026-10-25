@@ -484,6 +484,42 @@ export const QUOTA_CSS = `
 
 /* ---------------------------------------------------------------- notices */
 
+/*
+ * The 'qoder' command row in the conversation flow (the queue notices and the
+ * job-token heal lines). The host's generic command card ellipsizes its summary
+ * to one nowrap line, which cut the notice's tail — the queue length and retry
+ * count — off. This is the plugin's own renderer (QoderQueueNoticeRow): the
+ * text wraps, and the tone matches the generic row's caption so the line still
+ * reads as the host's own. Backtick-free: this file is one template literal.
+ */
+.qdp-noticeRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px;
+  padding: 2px 0;
+  font: var(--dsw-font-xxs-12);
+  color: var(--dsw-alias-label-secondary);
+}
+.qdp-noticeRowName {
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.qdp-noticeRowDot {
+  color: var(--dsw-alias-label-tertiary);
+}
+.qdp-noticeRowText {
+  flex: 1 1 40ch;
+  min-width: 0;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.qdp-noticeRowError,
+.qdp-noticeRowError .qdp-noticeRowText {
+  color: var(--dsw-alias-state-error-primary);
+}
+
 .qdp-body {
   font: var(--dsw-font-xxs-12);
   color: var(--dsw-alias-label-tertiary);

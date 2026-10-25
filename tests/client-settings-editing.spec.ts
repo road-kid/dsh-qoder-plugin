@@ -38,7 +38,15 @@ function fakeScope(initial: Partial<ScopeState> = {}) {
     value: {},
     ...initial,
   }
-  const set = vi.fn(async () => true)
+  const listeners: Array<() => void> = []
+  const set = vi.fn(async (field: string, value: unknown) => {
+    // Apply the write the way the real face does: the next snapshot carries it,
+    // and the subscribers are told — the card reads settings through
+    // useSyncExternalStore, so nothing re-renders without this.
+    state.value = { ...state.value, [field]: value }
+    for (const listener of [...listeners]) listener()
+    return true
+  })
   return {
     state,
     set,
@@ -49,7 +57,10 @@ function fakeScope(initial: Partial<ScopeState> = {}) {
         value: state.value,
         ...state.error === undefined ? {} : { error: state.error },
       }),
-      subscribe: () => () => {},
+      subscribe: (listener: () => void) => {
+        listeners.push(listener)
+        return () => {}
+      },
       set,
     },
   }
@@ -180,8 +191,16 @@ describe('Advanced settings editing', () => {
     await act(async () => { node.props.onKeyDown(event) })
   }
 
-  it('commits a typed stickiness bound on blur, not on every keystroke', async () => {
-    const scope = fakeScope({ value: { stickinessRounds: 1 } })
+  /** The stickiness master switch (fails loudly when absent). */
+  const stickinessSwitch = (): { props: Record<string, any> } => {
+    const found = view!.root.findAll(node =>
+      node.props['role'] === 'switch' && node.props['aria-label'] === en.stickinessLabel,
+    )[0]
+    if (found === undefined) throw new Error('no stickiness switch')
+    return found as unknown as { props: Record<string, any> }
+  }
+
+  it('commits a typed stickiness bound on blur, not on every keystroke', async () => {    const scope = fakeScope({ value: { stickinessRounds: 1 } })
     await mount(scope)
     expect(field('stickiness-rounds')).toBeDefined()
 
@@ -239,6 +258,60 @@ describe('Advanced settings editing', () => {
     expect(scope.set).not.toHaveBeenCalled()
   })
 
+  it('hides the three stickiness bounds while the master switch is off', async () => {
+    const scope = fakeScope({ value: { stickinessEnabled: false, stickinessRounds: 3 } })
+    await mount(scope)
+    expect(stickinessSwitch().props['aria-checked']).toBe(false)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-rounds')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-requests')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-minutes')).toHaveLength(0)
+
+    // Turning it on writes the flag and — once the scope echoes the new value —
+    // the bounds render again.
+    await act(async () => { stickinessSwitch().props.onClick() })
+    expect(scope.set).toHaveBeenCalledWith('stickinessEnabled', true)
+    scope.state.value = { ...scope.state.value, stickinessEnabled: true }
+    await act(async () => { view!.root }) // let state settle
+    await mount(scope)
+    expect(field('stickiness-rounds')).toBeDefined()
+    expect(field('stickiness-requests')).toBeDefined()
+    expect(field('stickiness-minutes')).toBeDefined()
+  })
+
+  it('hides the three stickiness bounds while the master switch is off', async () => {
+    const scope = fakeScope({ value: { stickinessEnabled: false, stickinessRounds: 3 } })
+    await mount(scope)
+    expect(stickinessSwitch().props['aria-checked']).toBe(false)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-rounds')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-requests')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-minutes')).toHaveLength(0)
+
+    // Turning the switch on writes the flag; the fake scope applies the write
+    // and notifies, so the card re-reads and the three bounds render.
+    await act(async () => { stickinessSwitch().props.onClick() })
+    expect(scope.set).toHaveBeenCalledWith('stickinessEnabled', true)
+    expect(field('stickiness-rounds')).toBeDefined()
+    expect(field('stickiness-requests')).toBeDefined()
+    expect(field('stickiness-minutes')).toBeDefined()
+
+    // Turning it back off hides them again without touching the stored bounds.
+    await act(async () => { stickinessSwitch().props.onClick() })
+    expect(scope.set).toHaveBeenCalledWith('stickinessEnabled', false)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-rounds')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-requests')).toHaveLength(0)
+    expect(view!.root.findAll(node => node.props['data-number-field'] === 'stickiness-minutes')).toHaveLength(0)
+  })
+
+  it('defaults the stickiness master switch to on when the document predates it', async () => {
+    // A settings document written by an older card carries no flag; the parse
+    // must read it as ON, or upgrading the bundle would silently disable a
+    // feature the user never touched.
+    const scope = fakeScope({ value: { stickinessRounds: 3 } })
+    await mount(scope)
+    expect(stickinessSwitch().props['aria-checked']).toBe(true)
+    expect(field('stickiness-rounds')).toBeDefined()
+  })
+
   it('disables every settings control while the face is still loading, and says why', async () => {
     const scope = fakeScope({ status: 'loading' })
     await mount(scope)
@@ -248,6 +321,7 @@ describe('Advanced settings editing', () => {
     for (const marker of ['stickiness-rounds', 'stickiness-requests', 'stickiness-minutes', 'queue-wait-attempts']) {
       expect(field(marker).props.disabled).toBe(true)
     }
+    expect(stickinessSwitch().props.disabled).toBe(true)
   })
 
   it('enables the controls once the face answers', async () => {

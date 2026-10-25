@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import { QoderCredentialStore, qoderCredentialIdentity } from './auth.ts'
+import { QoderCredentialStore, qoderCredentialIdentity, type QoderStoredAccount } from './auth.ts'
 import { createAuthKey, registerQoderAuthRoute } from './auth-route.ts'
 import { FALLBACK_QODER_MODELS, QoderCatalog } from './catalog.ts'
 import { qoderCatalogPath, QoderCatalogStore } from './catalog-store.ts'
@@ -26,7 +26,8 @@ import { createQoderShim } from './shim.ts'
 import { QoderProbeService } from './probe-service.ts'
 import { newestFirst, QoderProbeStore, qoderProbePath } from './probe-store.ts'
 import { QoderUpstreamClient, validateApiKey } from './upstream.ts'
-import { createQoderTransport, type QoderCheckInResult, type QoderTransport } from './qoder/transport/index.ts'
+import { createQoderTransport, type QoderCheckInResult, type QoderPooledAccount, type QoderTransport } from './qoder/transport/index.ts'
+import type { QoderRegion } from './qoder/region.ts'
 import { getMachineId } from './qoder/transport/machine-id.ts'
 import { registerQoderStatusRoute, webPlan } from './web-status.ts'
 import { createProbeKey, registerQoderProbeRoute } from './probe-route.ts'
@@ -306,6 +307,12 @@ export interface Config {
    */
   routingOrder?: string[]
   /**
+   * Conversation stickiness master switch. When off (explicitly `false`), no
+   * account is ever pinned: every request picks one fresh, whatever the three
+   * bounds below say. Defaults to on.
+   */
+  stickinessEnabled?: boolean
+  /**
    * Conversation stickiness: how many completed rounds one account serves
    * before the session moves to the next account. 0 disables round counting.
    */
@@ -473,15 +480,19 @@ const ROUTING_STRATEGY_FIELD = volatileField(z.union([
 /** The user's own account order (ids across both variants). */
 const ROUTING_ORDER_FIELD = volatileField(z.array(z.string()).default([])
   .description('自定义账号优先级（可跨国内/国际版混排，顺序即试用顺序）'))
-/** Stickiness rounds: 0 disables. Default 1 — one round per account. */
+/** Stickiness master switch: off hides the three bounds and disables stickiness. */
+const STICKINESS_ENABLED_FIELD = volatileField(z.boolean()
+  .default(true)
+  .description('会话粘性总开关：关闭后不再保持同一账号，每次请求都重新选择账号'))
+/** Stickiness rounds: 0 disables. Default 3 — three rounds per account. */
 const STICKINESS_ROUNDS_FIELD = volatileField(z.number()
-  .default(1)
+  .default(3)
   .min(0)
   .max(100)
   .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号（0 = 不限制）'))
-/** Stickiness requests: 0 disables. Default 60. */
+/** Stickiness requests: 0 disables. Default 200. */
 const STICKINESS_REQUESTS_FIELD = volatileField(z.number()
-  .default(60)
+  .default(200)
   .min(0)
   .max(10_000)
   .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号（0 = 不限制）'))
@@ -520,6 +531,7 @@ export const Config: z<Config> = z.object({
   queueWaitSeconds: QUEUE_WAIT_SECONDS_FIELD,
   routingStrategy: ROUTING_STRATEGY_FIELD,
   routingOrder: ROUTING_ORDER_FIELD,
+  stickinessEnabled: STICKINESS_ENABLED_FIELD,
   stickinessRounds: STICKINESS_ROUNDS_FIELD,
   stickinessRequests: STICKINESS_REQUESTS_FIELD,
   stickinessMinutes: STICKINESS_MINUTES_FIELD,
@@ -564,6 +576,7 @@ export const QUOTA_SECTION_KEYS = [
   'queueWaitSeconds',
   'routingStrategy',
   'routingOrder',
+  'stickinessEnabled',
   'stickinessRounds',
   'stickinessRequests',
   'stickinessMinutes',
@@ -811,6 +824,27 @@ export function autoFailoverActive(
 }
 
 /**
+ * Every seat in the pool, flattened into the shape {@link autoFailoverActive}
+ * reads: one flag per row, `enabled: false` for a parked one.
+ *
+ * Reading both files is what makes the derived 「自动切换」 fact honest for a
+ * mixed pool. It costs two file reads per status request — the same reads the
+ * walk itself does, and the document is assembled on demand rather than polled
+ * in a tight loop.
+ */
+export async function poolSeatFlags(
+  members: readonly PoolMember[],
+): Promise<readonly { readonly enabled?: boolean }[]> {
+  const flags: { readonly enabled?: boolean }[] = []
+  for (const member of members) {
+    for (const account of await member.store.list()) {
+      flags.push(account.enabled === false ? { enabled: false } : {})
+    }
+  }
+  return flags
+}
+
+/**
  * Move the stored active pointer to the account a failover just switched to.
  *
  * The retry itself is already answering with the successor's PAT, so this move
@@ -838,6 +872,162 @@ export async function adoptFailoverAccount(
   }
 }
 
+/**
+ * One account as the cross-variant walk sees it, with the variant that stores it.
+ *
+ * An account is always OWNED by exactly one variant's credential file: that is
+ * where its row lives, that is the region stamped on it, and that is the only
+ * endpoint set that may sign it. The pool layer never moves a row between
+ * files — it only decides which of the two files the walk visits next, and
+ * carries the owning variant's region along so the transport can sign with the
+ * endpoints the account was saved under.
+ */
+export interface PoolMember {
+  /** Only the id is read: the pool never asks a member about its own routes. */
+  readonly variant: Pick<QoderVariant, 'id'>
+  /** The three reads/writes the pool performs on a member's credential file. */
+  readonly store: Pick<QoderCredentialStore, 'byId' | 'list' | 'activate'>
+}
+
+/**
+ * The walk's view of the pool: this variant's file first, then its siblings.
+ *
+ * Local-first is not cosmetic — it is what keeps a single-region install
+ * byte-for-byte unchanged. The sibling contributes no rows there, so every
+ * resolution lands on the same store the walk always used, and the extra reads
+ * are two cheap file misses. For a mixed pool it also gives the save-order walk
+ * a sane continuation: this file ends, and the walk resumes in the other one
+ * instead of looping back to an account it has already tried.
+ */
+export function poolOrder(pool: () => readonly PoolMember[], variant: Pick<QoderVariant, 'id'>): readonly PoolMember[] {
+  const all = pool()
+  const own = all.filter(runtime => runtime.variant.id === variant.id)
+  const siblings = all.filter(runtime => runtime.variant.id !== variant.id)
+  return [...own, ...siblings]
+}
+
+/** The variant whose credential file stores `accountId`, if any file holds it. */
+export async function poolOwner(
+  order: readonly PoolMember[],
+  accountId: string,
+): Promise<PoolMember | undefined> {
+  for (const runtime of order) {
+    const found = await runtime.store.byId(accountId)
+    if (found !== undefined) return runtime
+  }
+  return undefined
+}
+
+/**
+ * Project one stored row the way the transport consumes it: id, PAT, region.
+ *
+ * The region is the row's OWN stamp (written by whichever file stores it, never
+ * trusted from disk), and it is the only thing that tells the transport which
+ * endpoint set may sign this credential. Dropping it here is what used to make
+ * every cross-variant hand-off an AUTH failure.
+ */
+function pooledAccount(account: QoderStoredAccount): QoderPooledAccount {
+  return { id: account.id, pat: account.pat, region: account.region }
+}
+
+/**
+ * By-id resolution across the pool, for custom routing and pinned sessions.
+ *
+ * Ids are globally unique (the id is a hash of the PAT), so a row is found in
+ * at most one file. A parked row resolves to nothing — the same "skip this id"
+ * answer the save-order walk gives — and because ids cannot collide there is no
+ * point looking for it in the other file. A row no file holds resolves to
+ * nothing too, which is how the walk skips an account removed in another tab.
+ */
+export async function pooledAccountById(
+  order: readonly PoolMember[],
+  accountId: string,
+): Promise<QoderPooledAccount | undefined> {
+  for (const runtime of order) {
+    const found = await runtime.store.byId(accountId)
+    if (found === undefined) continue
+    if (found.enabled === false) return undefined
+    return pooledAccount(found)
+  }
+  return undefined
+}
+
+/**
+ * The pool as one ordered ring: every file's usable rows, local file first.
+ *
+ * Each file keeps its own save order, and the pool is their concatenation —
+ * the same local-first order {@link poolOrder} gives the walk. Parked rows are
+ * dropped here rather than skipped later, because the ring's answer must not
+ * depend on which file it happens to look in: the transport treats "not in the
+ * pool" and "parked" identically, and building the ring once is what lets the
+ * walk continue into the sibling file at exactly the point its own file ends.
+ *
+ * Reading the files costs one `list()` per variant per step. That is the same
+ * on-demand read the store already does for every `nextAfter` call, and the
+ * pool has two files at most.
+ */
+export async function poolRing(order: readonly PoolMember[]): Promise<readonly QoderPooledAccount[]> {
+  const ring: QoderPooledAccount[] = []
+  for (const runtime of order) {
+    for (const account of await runtime.store.list()) {
+      if (account.enabled === false) continue
+      ring.push(pooledAccount(account))
+    }
+  }
+  return ring
+}
+
+/**
+ * The account after `accountId`, continuing across the pool's files.
+ *
+ * This is the save-order leg. Within one file it is exactly the store's own
+ * `nextAfter`; at the end of a file the walk continues with the NEXT file's
+ * first row, and only after the last file does it wrap to the pool's first
+ * row. That is the difference from the per-file walk: it used to wrap inside
+ * its own document, so an account in the other variant's file was never
+ * reached by save order at all — the very leg the two-file pool was supposed
+ * to extend.
+ *
+ * An id no file holds (removed in another tab, or the step after a pin to a
+ * since-deleted account) restarts the ring at its first row instead of
+ * dead-ending, which is the same "one silent extra lap" the per-file walk
+ * always had, now spanning the pool. The transport's own `tried` set is what
+ * stops a lap from repeating.
+ */
+export async function pooledNextAccount(
+  order: readonly PoolMember[],
+  accountId: string,
+): Promise<QoderPooledAccount | undefined> {
+  const ring = await poolRing(order)
+  if (ring.length === 0) return undefined
+  const index = ring.findIndex(account => account.id === accountId)
+  if (index === -1) return ring[0]
+  return ring[(index + 1) % ring.length]
+}
+
+/**
+ * Move the active pointer in whichever file stores the account a switch chose.
+ *
+ * The pointer that has to move is the OWNING variant's — the card, the catalog
+ * and the credits all resolve "the active account" out of their own file, so a
+ * cross-region switch that only warned would leave the card pointing at the
+ * account that just failed while the request signs as the sibling's. The
+ * per-file semantics stay intact: a variant's file still records exactly one
+ * active row, it is just chosen by whoever owns the row.
+ */
+export async function adoptPooledAccount(
+  order: readonly PoolMember[],
+  accountId: string,
+  warn: (message: string) => void,
+): Promise<boolean> {
+  const owner = await poolOwner(order, accountId)
+  if (owner === undefined) {
+    warn(`dsh-qoder-plugin: could not adopt the failover account (${accountId}): no variant stores it`)
+    return false
+  }
+  return await adoptFailoverAccount(owner.store, accountId, warn)
+}
+
 /** Build one variant's stores, transport, and probe state. */
 function createVariantRuntime(
   ctx: Context,
@@ -845,6 +1035,8 @@ function createVariantRuntime(
   variant: QoderVariant,
   current: () => Config,
   identityOf: (variantId: string) => string | undefined,
+  pool: () => readonly VariantRuntime[],
+  health: QoderAccountHealthTracker,
 ): VariantRuntime {
   const store = new QoderCredentialStore({ variant, logger: ctx.logger })
   // The self-heal's auto-refresh record, surfaced on the card. Per variant:
@@ -887,15 +1079,6 @@ function createVariantRuntime(
       await resolveAttachmentService().readImageRequest(attachment, policy, signal),
     saveImage: async request => await resolveAttachmentService().saveImage(request),
   }
-  /**
-   * This variant's per-account health, fed from the transport's own answers.
-   *
-   * Constructed with the runtime (not per request) because health is a claim
-   * about the last few minutes, and because the two facts the card's
-   * 正常/排队/限流 labels rest on arrive on different hooks: queue answers on
-   * `onUpstreamQueue`, connection failures on `failover.failed`.
-   */
-  const health = new QoderAccountHealthTracker()
   const transport = createQoderTransport({
     region: variant.region,
     resolvePat: () => store.patPromise(),
@@ -932,15 +1115,63 @@ function createVariantRuntime(
        * absent must not silently turn off a behaviour the previous version had.
        */
       enabled: () => current().autoFailoverEnabled !== false,
+      /*
+       * The walk's start: this variant's own file, always.
+       *
+       * "The active account" is a fact about THIS document, and the endpoint set
+       * that signs it is fixed by the variant the request arrived on. Borrowing
+       * a sibling's credential here would sign a Global PAT against the China
+       * gateway before the walk had even begun, so the pool's reach begins at
+       * `nextAccount`, not at the start.
+       */
       activeAccount: async () => {
         const credential = await store.current()
-        if (credential === undefined) return undefined
-        return { id: qoderCredentialIdentity(credential), pat: credential.pat }
+        if (credential !== undefined) {
+          const id = qoderCredentialIdentity(credential)
+          const row = await store.byId(id)
+          /*
+           * A PARKED active row is not a start.
+           *
+           * The store deliberately leaves `activeId` pointing at an account the
+           * user parks (parking means "do not route here", not "switch away"),
+           * and `nextAfter`/`accountById` both skip it. Reading `current()`
+           * directly would quietly reintroduce the parked account as the FIRST
+           * attempt of every walk — the checkbox would stop affecting the one
+           * seat it was set on. Fall through to the first usable row instead,
+           * which is the same answer the rest of the walk gives.
+           */
+          if (row === undefined || row.enabled !== false) {
+            return { id, pat: credential.pat, region: credential.region }
+          }
+        }
+        /*
+         * Nothing usable here: start where the POOL starts.
+         *
+         * This is not "borrowing a sibling's credential to sign a local
+         * endpoint" — the transport signs each account with the endpoints of
+         * the region it was saved under, so a pool whose local file is empty
+         * (or entirely parked) starts on the sibling's first usable row and the
+         * walk proceeds normally. For a single-region install the sibling
+         * contributes no rows and this is exactly the old local answer.
+         */
+        const ring = await poolRing(poolOrder(pool, variant))
+        return ring[0]
       },
-      nextAccount: async id => {
-        const next = await store.nextAfter(id)
-        return next === undefined ? undefined : { id: next.id, pat: next.pat }
-      },
+      /*
+       * The save-order leg, across both files.
+       *
+       * Within one file this is exactly `store.nextAfter`; the difference is at
+       * the end of a file, where the walk continues with the NEXT file's first
+       * usable row instead of wrapping back into the file it just finished.
+       * That continuation is the whole point of a mixed pool: save order is the
+       * default strategy, and it used to be confined to the document the
+       * request arrived on.
+       *
+       * `region` rides along because the transport must sign the successor with
+       * the endpoints it was saved under — a China row through the global
+       * gateway is a guaranteed AUTH failure, not a fallback.
+       */
+      nextAccount: async id => await pooledNextAccount(poolOrder(pool, variant), id),
       /*
        * By-id resolution, for custom routing and pinned sessions.
        *
@@ -949,25 +1180,15 @@ function createVariantRuntime(
        * because that would quietly sign as a different account than the one the
        * user ordered or the session remembered. A removed account resolves to
        * `undefined`, which is how the walk skips it.
+       *
+       * A PARKED account resolves to nothing too, and that has to hold across
+       * the pool as well: the checkbox must stop an account being reached by its
+       * position in a custom order, or keep signing a session it was pinned to
+       * before the pause. `pooledAccountById` gives the same "skip this id"
+       * answer the save-order walk gives, so a parked row cannot be reached by
+       * either leg.
        */
-      accountById: async id => {
-        const found = await store.byId(id)
-        /*
-         * A parked account resolves to nothing.
-         *
-         * The two callers of this hook name an account directly instead of
-         * asking for "the next one" — a custom routing order and a pinned
-         * session — and both must get the same answer the save-order walk
-         * gives: a parked account is not tried. Without this the checkbox
-         * would only affect `nextAfter`, so an account the user parked could
-         * still be reached by its position in their custom order, or keep
-         * signing a session it was pinned to before the pause. `undefined`
-         * is exactly how the transport spells "skip this id": routing moves
-         * on, and a pin is dropped so the session starts over.
-         */
-        if (found === undefined || found.enabled === false) return undefined
-        return { id: found.id, pat: found.pat }
-      },
+      accountById: async id => await pooledAccountById(poolOrder(pool, variant), id),
       adopted: async info => {
         // A quiet move, not a failover: the account kept failing, so the chat
         // path starts elsewhere while nothing in this request failed. The store
@@ -976,7 +1197,7 @@ function createVariantRuntime(
         // reads on the credential the transport just decided to avoid. No
         // notice and no `failoverAt`/`failoverReason`: there is nothing to
         // announce and the card's "last switched" time must not lie.
-        await adoptFailoverAccount(store, info.toId, message => { ctx.logger.warn(message) })
+        await adoptPooledAccount(poolOrder(pool, variant), info.toId, message => { ctx.logger.warn(message) })
         ctx.logger.warn(
           `dsh-qoder-plugin: ${variant.displayName} adopted ${info.toId} after the previous account entered a cooldown (${info.reason})`,
         )
@@ -1000,7 +1221,7 @@ function createVariantRuntime(
         // recovery into an unhandled rejection and kill the request. Record the
         // switch and announce it below either way — the retry did switch, only
         // the pointer move did not, and that is a warning, not a failure.
-        await adoptFailoverAccount(store, info.toId, message => { ctx.logger.warn(message) })
+        await adoptPooledAccount(poolOrder(pool, variant), info.toId, message => { ctx.logger.warn(message) })
         failoverAt = Date.now()
         failoverReason = info.reason
         // A different identity pays from here on, so the previous account's
@@ -1011,11 +1232,13 @@ function createVariantRuntime(
         )
         // The visible channel: without it the failed request and the recovered
         // retry are indistinguishable from a plain success, and nothing would
-        // say that a different subscription paid for it.
-        emitUpstreamNotice(failoverNoticeText(info.reason))
+        // say that a different subscription paid for it. The walk names the
+        // conversation it moved, so the row lands in that chat and not in
+        // whichever one started most recently.
+        emitUpstreamNotice(failoverNoticeText(info.reason), info.sessionId)
       },
     },
-    onUpstreamQueue: (facts, accountId) => {
+    onUpstreamQueue: (facts, accountId, sessionId) => {
       const at = Date.now()
       // Health is per account and outlives one notice: recorded before the
       // document-wide notice, which is replaced on every answer.
@@ -1055,19 +1278,19 @@ function createVariantRuntime(
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
       )
-      emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }))
+      emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }), sessionId)
     },
-    onQueueWait: (facts, accountId, wait) => {
+    onQueueWait: (facts, accountId, wait, sessionId) => {
       // Progress, not the explanation: this row is printed when the wait
       // starts, so a request that waits out one or two windows is visibly
       // working instead of indistinguishable from a hang. The final-failure
       // row (`onUpstreamQueue`) still follows if the retries never succeed.
       ctx.logger.warn(
-        `dsh-qoder-plugin: ${variant.displayName} upstream model is queued; waiting ${Math.round(wait.waitMs / 1000)}s before retry ${wait.attempt}/${wait.attempt + wait.remaining} (account ${accountId ?? 'ambient'})`,
+        `dsh-qoder-plugin: ${variant.displayName} upstream model is queued; waiting ${Math.round(wait.waitMs / 1000)}s before retry ${wait.attempt}/${wait.attempt + wait.remaining} (account ${accountId ?? 'ambient'}, wait driven by ${wait.basis?.source ?? 'unknown'})`,
       )
-      emitUpstreamNotice(formatQueueWaitNotice(facts, wait))
+      emitUpstreamNotice(formatQueueWaitNotice(facts, wait), sessionId)
     },
-    onChatAccepted: accountId => {
+    onChatAccepted: (accountId, sessionId) => {
       // The upstream took a chat, so the condition the last notice described is
       // over — and "over" has to take the streak with it, not just the
       // timestamp. A record kept past this point would first re-describe an
@@ -1085,8 +1308,11 @@ function createVariantRuntime(
         `dsh-qoder-plugin: ${variant.displayName} job token was auto-refreshed after an upstream rejection`,
       )
       // The visible channel: one line in the conversation that triggered the
-      // refresh (the request this heal happened inside).
-      emitJobTokenHint(info.at, jobTokenHintText(info.at))
+      // refresh (the request this heal happened inside). The transport names it,
+      // because one shared job token can heal a request in only one conversation
+      // at a time — printing it "wherever the user is" put the row in a chat that
+      // never healed.
+      emitJobTokenHint(info.at, jobTokenHintText(info.at), info.sessionId)
     },
     onJobTokenRefreshFailed: info => {
       // The heal ran and lost. Announced at most once per outage by the
@@ -1094,7 +1320,7 @@ function createVariantRuntime(
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} job token refresh did not recover the chat (upstream status ${info.status ?? 'unknown'})`,
       )
-      emitJobTokenRefreshFailedHint(info.at, jobTokenRefreshFailedHintText(info.at))
+      emitJobTokenRefreshFailedHint(info.at, jobTokenRefreshFailedHintText(info.at), info.sessionId)
     },
     /*
      * The three settings that shape a request's account walk, read live.
@@ -1115,6 +1341,9 @@ function createVariantRuntime(
       // the next account. All three are bounds: whichever is reached first
       // moves the conversation on, so a single big turn cannot pin a session to
       // one account for longer than the round or request bound allows.
+      // The master switch is read live too: turning it off means no account
+      // is ever pinned, and the three bounds stop mattering until it returns.
+      enabled: () => current().stickinessEnabled !== false,
       rounds: () => current().stickinessRounds ?? 3,
       requests: () => current().stickinessRequests ?? 200,
       minutes: () => current().stickinessMinutes ?? 180,
@@ -1491,6 +1720,7 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       queueWaitSeconds: 30,
       routingStrategy: 'save-order',
       routingOrder: [],
+      stickinessEnabled: true,
       stickinessRounds: 3,
       stickinessRequests: 200,
       stickinessMinutes: 180,
@@ -1618,6 +1848,9 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
       case 'queueWaitSeconds':
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 300) return `${field} must be an integer 1..300`
         break
+      case 'stickinessEnabled':
+        if (typeof value !== 'boolean') return `${field} must be a boolean`
+        break
       case 'stickinessRounds':
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 100) return `${field} must be an integer 0..100`
         break
@@ -1682,13 +1915,38 @@ export function apply(ctx: Context, config: Config): void {
   let stopped = false
   const timers: NodeJS.Timeout[] = []
 
-  const runtimes = QODER_VARIANTS.map(variant => createVariantRuntime(
-    ctx,
-    config,
-    variant,
-    () => current(),
-    id => lastIdentities.get(id),
-  ))
+  /*
+   * Two-phase construction: the pool has to be readable from inside each
+   * variant's hooks, but a runtime is only built once its own hooks exist.
+   * The array is filled as the map runs, so a hook invoked later (never during
+   * construction) always sees the finished pool.
+   */
+  const runtimes: VariantRuntime[] = []
+  const pool = (): readonly VariantRuntime[] => runtimes
+  /*
+   * ONE health tracker for the whole pool, not one per variant.
+   *
+   * Health is keyed by account id, and ids are globally unique (a hash of the
+   * PAT), so a shared tracker cannot confuse two accounts. What it does fix is
+   * the cross-region hand-off: a switch from a China seat to a Global seat
+   * reports its failure through the China runtime's hook but the card reads the
+   * Global account's 正常/排队/限流 label out of the Global document — with a
+   * tracker per variant the failure streak would land in the file that no
+   * longer owns the row being displayed, and the label would stay 正常 after
+   * three failures.
+   */
+  const health = new QoderAccountHealthTracker()
+  for (const variant of QODER_VARIANTS) {
+    runtimes.push(createVariantRuntime(
+      ctx,
+      config,
+      variant,
+      () => current(),
+      id => lastIdentities.get(id),
+      pool,
+      health,
+    ))
+  }
 
   const checkInStore = new JsonFileCheckInStore()
   /**
@@ -1949,7 +2207,23 @@ export function apply(ctx: Context, config: Config): void {
              * honest reading of 「自动切换」 is off, and it turns itself on the
              * moment both conditions hold.
              */
-            autoFailover: autoFailoverActive(current().autoFailoverEnabled, entries),
+            /*
+             * Counted across the whole pool, not just this variant's file.
+             *
+             * The walk now continues into the sibling's file, so a 1+1 split
+             * pool (one account saved in each variant) can absorb a failure
+             * even though each document lists a single seat. Reading only the
+             * local rows would make both cards claim 「自动切换」 is idle while
+             * the transport would happily switch — the tag would be lying in
+             * the one configuration the feature was built for. The ROWS stay
+             * per-variant (each document lists its own file, and the card
+             * merges the two documents for its list), only this derived fact
+             * is pool-wide.
+             */
+            autoFailover: autoFailoverActive(
+              current().autoFailoverEnabled,
+              await poolSeatFlags(pool()),
+            ),
             /*
              * The switch as the user set it, which is a different claim from
              * `autoFailover` above: that one answers "could a failure be

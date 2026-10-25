@@ -699,6 +699,31 @@ describe('Qoder plugin card', () => {
     expect([...intervalHandles.keys()]).toHaveLength(0)
   })
 
+  it('polls both variants on the unified page, so the other tab never freezes', async () => {
+    const clock = vi.spyOn(Date, 'now')
+    try {
+      const base = 1_700_000_000_000
+      clock.mockReturnValue(base)
+      await mountWithSettings(fakeSettingsScope(), undefined, true)
+      // The mount read the visible variant and warmed the sibling, so both
+      // documents exist and both are fresh right now.
+      const afterMount = reads
+      expect(afterMount).toBeGreaterThanOrEqual(2)
+      const handlers = [...intervalHandles.values()]
+      expect(handlers).toHaveLength(1)
+      // Age both documents past the configured cache lifetime.
+      clock.mockReturnValue(base + 400_000)
+      await act(async () => { for (const handler of handlers) handler() })
+      // The tick re-reads BOTH variants: the visible one forced, the sibling
+      // through the same freshness gate. Reading only the visible tab would
+      // leave the other one's credits and health labels frozen at mount time,
+      // which is exactly where a failover into it becomes invisible.
+      expect(reads - afterMount).toBe(2)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   // ---- account card: the batched 一键签到 ------------------------------------
 
   it('posts the batched claim write to its own probe route and reports the outcome', async () => {

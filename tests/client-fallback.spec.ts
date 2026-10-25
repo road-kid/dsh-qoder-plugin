@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { QODER_PROBE_PATH } from '../src/status-paths.ts'
+import { JOB_TOKEN_HINT_NAME } from '../src/job-token-hint.ts'
 
 /**
  * The client entry degrades a slot-API breaking change (the rc.6→rc.7
@@ -41,6 +42,14 @@ const COMPOSER_READOUT_SLOT = 'conversation.input.left'
 const COMPOSER_PROBE_SLOT = 'conversation.input.right'
 const READOUT_ID = 'qoder-quota-readout'
 const PROBE_ID = 'qoder-probe'
+
+/**
+ * The conversation command row that carries this plugin's queue/heal notices.
+ * `NOTICE_ROW_KEY` mirrors `JOB_TOKEN_HINT_NAME` in `src/job-token-hint.ts`;
+ * the pinned test below keeps the two literals in step.
+ */
+const NOTICE_ROW_SLOT = 'conversation.chat.commandview'
+const NOTICE_ROW_KEY = 'qoder'
 
 /** Minimal component stand-in: the mirror never renders anything. */
 const Component = (): null => null
@@ -94,6 +103,18 @@ function apply(ctx: any): void {
     }
     registerCard(ROW_CONFIG_SLOT, ROW_CONFIG_KEY)
     registerCard(BUNDLE_CONFIG_SLOT, PACKAGE_NAME)
+
+    // Own the `qoder` command row so the host's generic ellipsizing card does
+    // not cut the notice tail off. Mirrors src/client/index.tsx.
+    try {
+      ctx.slots.inject(NOTICE_ROW_SLOT, () => ctx.slots.register({
+        name: NOTICE_ROW_SLOT,
+        key: NOTICE_ROW_KEY,
+        inject: () => ({}),
+      }, Component))
+    } catch (error: unknown) {
+      console.error(`[dsh-qoder-plugin] command row "${NOTICE_ROW_SLOT}" failed to register (host provider unaffected):`, error)
+    }
 
     adoptQuotaScope({
       getSnapshot: () => ({ value: { quotaPollMs: 300_000 } }),
@@ -252,20 +273,35 @@ describe('client card fallback', () => {
     restore()
   })
 
-  it('claims exactly the declared seats and registers no notice slot', () => {
+  it('claims exactly the declared seats and nothing else', () => {
     const { errors, restore } = useErrorSpy()
     const { ctx, injections, registerCalls } = fakeContext()
 
     expect(() => apply(ctx)).not.toThrow()
     expect(errors).toEqual([])
-    // The upstream notice is a conversation ROW emitted by the HOST half, not a
-    // client contribution: claiming a slot for it here would render the same
-    // fact twice (and crash on an unknown slot in older hosts).
+    // The command row IS claimed now: the host's generic card ellipsizes the
+    // queue notice, and this plugin's own rows are the only ones the claim
+    // touches. The upstream notice fact itself still comes from the HOST half.
     expect(injections).toEqual([
-      ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT,
+      ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, NOTICE_ROW_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT,
     ])
-    const seats = new Set([ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT])
+    const seats = new Set([ROW_CONFIG_SLOT, BUNDLE_CONFIG_SLOT, NOTICE_ROW_SLOT, COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT])
     for (const call of registerCalls) expect(seats.has(String(call['name']))).toBe(true)
+
+    restore()
+  })
+
+  it('degrades a broken command-row seat to its own console.error', () => {
+    const { errors, restore } = useErrorSpy()
+    const { ctx, injections } = fakeContext({ slot: NOTICE_ROW_SLOT })
+
+    // A host without the seat (older bundle) loses the notice renderer only;
+    // the settings cards and composer seats must still register.
+    expect(() => apply(ctx)).not.toThrow()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain(`command row "${NOTICE_ROW_SLOT}" failed to register`)
+    expect(injections).toContain(COMPOSER_READOUT_SLOT)
+    expect(injections).toContain(COMPOSER_PROBE_SLOT)
 
     restore()
   })
@@ -281,9 +317,9 @@ describe('client card fallback', () => {
     expect(injections).toContain(COMPOSER_READOUT_SLOT)
     expect(injections).toContain(COMPOSER_PROBE_SLOT)
 
-    // The plugin-config seats, by their derived keys.
+    // The plugin-config seats and the command row, by their derived keys.
     const pluginKeys = registerCalls.flatMap(call => typeof call['key'] === 'string' ? [call['key']] : [])
-    expect(pluginKeys.sort()).toEqual([PACKAGE_NAME, ROW_CONFIG_KEY].sort())
+    expect(pluginKeys.sort()).toEqual([PACKAGE_NAME, ROW_CONFIG_KEY, NOTICE_ROW_KEY].sort())
     // The composer seats, by their ids.
     const seatIds = registerCalls.flatMap(call => typeof call['id'] === 'string' ? [call['id']] : [])
     expect(seatIds.sort()).toEqual([PROBE_ID, READOUT_ID].sort())
@@ -362,8 +398,9 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
       ...entrySource.matchAll(/console\.error\(\s*'([^']+)'/g),
       ...entrySource.matchAll(/console\.error\(`([^`]*?)\$\{/g),
     ].map(match => match[1]!)
-    // Guard the guard: outer catch + per-seat card catch + readout + probe.
-    expect(messages).toHaveLength(4)
+    // Guard the guard: outer catch + per-seat card catch + command row +
+    // readout + probe.
+    expect(messages).toHaveLength(5)
     for (const message of messages) {
       expect(mirrorSource).toContain(message)
     }
@@ -375,6 +412,18 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
     for (const label of labels) expect(mirrorSource).toContain(label)
     expect(entrySource).toContain("'settings.qoder'")
     expect(mirrorSource).toContain("'settings.qoder'")
+  })
+
+  it('the entry owns exactly the command-row key the host half records', () => {
+    // The client bundle cannot import the host module (it pulls the cordis
+    // server context into the browser bundle), so `NOTICE_ROW_KEY` in the entry
+    // DUPLICATES `JOB_TOKEN_HINT_NAME` in `src/job-token-hint.ts`. This is the
+    // pinned test that entry comment promises: if the host ever records its
+    // rows under another name, the claim silently stops matching and the
+    // generic ellipsizing card returns — so fail here instead.
+    expect(JOB_TOKEN_HINT_NAME).toBe('qoder')
+    expect(entrySource).toContain(`const NOTICE_ROW_KEY = '${JOB_TOKEN_HINT_NAME}'`)
+    expect(NOTICE_ROW_KEY).toBe(JOB_TOKEN_HINT_NAME)
   })
 
   it('the entry has no legacy brand literal left anywhere', () => {
@@ -389,6 +438,8 @@ describe('mirror stays verbatim with src/client/index.tsx', () => {
       COMPOSER_READOUT_SLOT, COMPOSER_PROBE_SLOT, READOUT_ID, PROBE_ID,
       // The 0.1.7 plugin-configuration seats.
       'plugins.row.config', 'plugins.bundle.config',
+      // The conversation command row that carries the notices.
+      NOTICE_ROW_SLOT, NOTICE_ROW_KEY,
     ]
     for (const seat of seats) {
       expect(entrySource).toContain(seat)

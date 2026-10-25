@@ -19,9 +19,15 @@
  * failed heal belonged to a chat rendering a card in this conversation. A heal
  * inside the session-title request shares the transport and the notice state
  * but renders no card, so the pointer led nowhere. It now states only the
- * facts. Attribution stays best effort (`lastRunningAgent`): with two agents
- * running concurrently the row can land in the other one's conversation, which
- * is a display imprecision, never a wrong heal.
+ * facts.
+ *
+ * Attribution is explicit whenever the request names its conversation: every
+ * emitter takes the issuing session id and prints only into THAT conversation.
+ * The row used to go to whichever agent most recently looked busy
+ * (`lastRunningAgent`), which let one conversation's queue notice land in
+ * another's — with two sessions running at once, the wrong log got the row. The
+ * remembered agent survives only as the fallback for callers that carry no
+ * session id (a direct API request, or a host that composes no session store).
  *
  * The host half alone produces these rows; without a client renderer the title
  * is the recorded name, which is why it is the ASCII `qoder`.
@@ -44,6 +50,23 @@ interface HintAgent {
   readonly id: unknown
   readonly session?: HintSession
 }
+
+/** The session store slice this module reads, structurally. */
+interface HintSessions {
+  get(id: string): HintSession | undefined
+}
+
+/**
+ * The conversation a row may be printed into: an appendable session plus the id
+ * the per-conversation state (de-duplication, refresh times) is keyed by.
+ */
+interface HintTarget {
+  readonly id: string
+  readonly session: HintSession
+}
+
+/** The context captured at install time, for its session store. */
+let installed: { sessions?: HintSessions } | undefined
 
 /** Refresh time per agent id, so a later read can name when it happened. */
 const lastRefreshAt = new Map<string, number>()
@@ -68,20 +91,24 @@ const turnByAgent = new Map<string, number>()
 const lastNoticeByAgent = new Map<string, { turn: number; text: string }>()
 
 /**
- * Start tracking which agent is running.
+ * Start tracking which agent is running, and keep the session store reachable.
  *
  * `agent/status` is a plain `emit` event: a listener that returns nothing
  * cannot disturb the emitting path (unlike a waterfall event, where a listener
- * owes the chain its `next()` call). The self-heal fires inside that agent's
- * request, so the most recently running agent is the conversation to print
- * into.
+ * owes the chain its `next()` call). It is no longer the PRIMARY way to pick a
+ * conversation — the request's own session id is — but it still supplies the
+ * fallback target for callers that carry no id, and it advances the turn mark
+ * the upstream-notice guard is scoped to.
  *
- * The same event also advances the turn mark the upstream-notice guard is
- * scoped to: a `running` status is what opens a turn, so the identical notice
- * is suppressed inside one and allowed again in the next — which is exactly the
- * recurrence the notice wording reports as a risk-control signal.
+ * The turn mark matters because a `running` status is what opens a turn: the
+ * identical notice is suppressed inside one and allowed again in the next, which
+ * is exactly the recurrence the notice wording reports as a risk-control signal.
  */
 export function installJobTokenHint(ctx: Context): void {
+  // Read the store structurally rather than through its service types: this
+  // module must keep working on a host that composes no session store at all
+  // (and on the bare contexts the tests build), where it is simply absent.
+  installed = ctx as unknown as { sessions?: HintSessions }
   ctx.on('agent/status' as never, ((payload: { agent?: HintAgent, status?: string }) => {
     if (payload.status === 'running' && payload.agent !== undefined) {
       lastRunningAgent = payload.agent
@@ -92,6 +119,44 @@ export function installJobTokenHint(ctx: Context): void {
 }
 
 /**
+ * Resolve the conversation a row belongs to.
+ *
+ * The id is the issuing request's own session id, which the transport carries
+ * because requests run concurrently and no remembered "current agent" can say
+ * which conversation a given queue answer or heal belongs to. With an id the
+ * rule is strict:
+ *
+ * - the session store's own object for that id wins — it is the live log the
+ *   client is reading, and it also works for a conversation that is idle right
+ *   now (a session-title or compaction request belongs to its own conversation,
+ *   not to whoever started most recently);
+ * - otherwise the remembered agent, but ONLY when it is that same conversation;
+ * - otherwise nothing. The row is dropped rather than printed into a
+ *   conversation whose request it does not describe: a missing diagnostics line
+ *   is a lost detail, a misplaced one is a false statement about someone else's
+ *   chat.
+ *
+ * Without an id there is nothing to be strict about, so the old best-effort
+ * target stands: the most recently running agent.
+ *
+ * @param sessionId - The issuing request's session id, `undefined` when the
+ *   request carried none.
+ */
+function resolveTarget(sessionId: string | undefined): HintTarget | undefined {
+  if (sessionId === undefined) {
+    const agent = lastRunningAgent
+    return agent?.session === undefined ? undefined : { id: String(agent.id), session: agent.session }
+  }
+  const stored = installed?.sessions?.get(sessionId)
+  if (stored !== undefined) return { id: sessionId, session: stored }
+  const agent = lastRunningAgent
+  if (agent?.session !== undefined && String(agent.id) === sessionId) {
+    return { id: sessionId, session: agent.session }
+  }
+  return undefined
+}
+
+/**
  * Print the refresh row into the conversation whose request triggered it.
  *
  * Best effort by design: a missing agent, an absent session, or a projection
@@ -99,12 +164,14 @@ export function installJobTokenHint(ctx: Context): void {
  *
  * @param at - When the job token was rotated.
  * @param text - The row's summary line.
+ * @param sessionId - The conversation whose request healed; see
+ *   {@link resolveTarget}.
  */
-export function emitJobTokenHint(at: number, text: string): void {
-  const agent = lastRunningAgent
-  if (agent?.session === undefined) return
-  lastRefreshAt.set(String(agent.id), at)
-  appendHintRow(agent, 'success', text)
+export function emitJobTokenHint(at: number, text: string, sessionId?: string): void {
+  const target = resolveTarget(sessionId)
+  if (target === undefined) return
+  lastRefreshAt.set(target.id, at)
+  appendHintRow(target.session, 'success', text)
 }
 
 /**
@@ -121,21 +188,23 @@ export function emitJobTokenHint(at: number, text: string): void {
  *
  * @param at - When the failed heal was recorded.
  * @param text - The row's summary line.
+ * @param sessionId - The conversation whose request failed to heal; see
+ *   {@link resolveTarget}.
  */
-export function emitJobTokenRefreshFailedHint(at: number, text: string): void {
-  const agent = lastRunningAgent
-  if (agent?.session === undefined) return
-  appendHintRow(agent, 'error', text)
+export function emitJobTokenRefreshFailedHint(at: number, text: string, sessionId?: string): void {
+  const target = resolveTarget(sessionId)
+  if (target === undefined) return
+  appendHintRow(target.session, 'error', text)
 }
 
 /**
- * Print one upstream "model not serviceable" notice into the running agent's
- * conversation.
+ * Print one upstream "model not serviceable" notice into the conversation whose
+ * request produced it.
  *
  * The same best-effort printer as the job-token rows. The request it describes
  * has already been answered with the upstream's own queue/unserviceable body,
  * so a missing agent session must never turn a diagnostics line into a second
- * failure: no agent, no row, and the chat keeps whatever outcome it had.
+ * failure: no target, no row, and the chat keeps whatever outcome it had.
  *
  * Guarded per turn. The host retries a `RATE_LIMIT` several times inside one
  * turn and the upstream's queue answer is byte-identical on each attempt, so
@@ -148,11 +217,14 @@ export function emitJobTokenRefreshFailedHint(at: number, text: string): void {
  * possible risk-control signal.
  *
  * @param text - The rendered notice line (see `formatQueueNotice`).
+ * @param sessionId - The conversation whose request produced this answer; see
+ *   {@link resolveTarget}.
  */
-export function emitUpstreamNotice(text: string): void {
-  const agent = lastRunningAgent
-  if (agent?.session === undefined || text === '') return
-  const id = String(agent.id)
+export function emitUpstreamNotice(text: string, sessionId?: string): void {
+  if (text === '') return
+  const target = resolveTarget(sessionId)
+  if (target === undefined) return
+  const id = target.id
   const turn = turnByAgent.get(id) ?? 0
   const printed = lastNoticeByAgent.get(id)
   if (printed !== undefined && printed.turn === turn && printed.text === text) return
@@ -160,13 +232,11 @@ export function emitUpstreamNotice(text: string): void {
   // could not be written must not be retried by a later identical attempt in
   // the same turn.
   lastNoticeByAgent.set(id, { turn, text })
-  appendHintRow(agent, 'error', text)
+  appendHintRow(target.session, 'error', text)
 }
 
 /** Append one log-only command pair carrying `text` as its outcome. */
-function appendHintRow(agent: HintAgent, kind: 'success' | 'error', text: string): void {
-  const session = agent.session
-  if (session === undefined) return
+function appendHintRow(session: HintSession, kind: 'success' | 'error', text: string): void {
   const commandId = `cmd-qoder-hint-${Date.now().toString(36)}-${++hintSeq}`
   try {
     // The official pairing: `command/run` opens the row, `command/done` carries
