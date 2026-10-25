@@ -22,7 +22,7 @@ Everything you need to build, test and release `dsh-qoder-plugin`.
 | `tests/qoder/`       | Transport tests, run by `node --test` instead of Vitest                |
 | `scripts/`           | Ad-hoc verification scripts (live end-to-end, endpoint guard checks)   |
 | `lib/`               | Build output — committed, see below                                    |
-| `assets/`            | Plugin icon and the README's overview diagram (`icon.svg`, `overview.svg`) |
+| `assets/`            | Plugin icon, overview diagram and README screenshots (`icon.svg`, `overview.svg`, `screenshot-*.png`) |
 | `locale/`            | `en.json` / `zh.json` shipped with the package                          |
 
 ## Commands

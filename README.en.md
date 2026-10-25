@@ -21,6 +21,20 @@ China (qoder.com.cn) and Global (qoder.com) are two independent entries: separat
 - **A plain explanation when the upstream cannot serve a model** — instead of a bare error, the conversation gets a notice saying this is neither a sign-in nor a credit problem, how long the upstream suggests waiting, and what it actually said. It retires itself once a later chat is accepted.
 - **Rate display `x<priceFactor>`** — each model name carries the Qoder-reported multiplier (`x0.79`; free reads `x0.0`). Display only — it never changes a request.
 
+## Screenshots
+
+The screenshots show the Chinese dark UI, which is what this machine runs; account names, balances and token tails on the account card are masked.
+
+![Find the plugin in the installed list on the Plugins page](assets/screenshot-plugins-list.png)
+
+![Plugin page header: version, package description and inline docs](assets/screenshot-plugin-page.png)
+
+![Account card: credit, check-in and saved accounts](assets/screenshot-accounts.png)
+
+![Models card: per-model switches, reasoning levels and context windows](assets/screenshot-models.png)
+
+![Settings card: composer readout, refresh interval, automatic check-in and account switching](assets/screenshot-settings.png)
+
 ## Install
 
 Prerequisites:
@@ -76,6 +90,7 @@ dsh-qoder-plugin doctor            # secret-free environment diagnostics
 ```
 
 `--provider` picks the variant to act on (`qoder` / `qoder-global`, default `qoder`); `status` and `doctor` accept `--json`; `pat set` can also read the token from `--file <path>` or `-` (standard input) so it never lands in your shell history. On DSH versions where the settings card does not appear, this is the only way to configure the plugin.
+
 ## Where the settings surface is
 
 Since DSH 0.1.7 plugin configuration lives on the **Plugins** page: open it, click this plugin in the installed list, and the settings body renders inline under the package description. Do not go looking under DSH's own *Settings* — there is no entry for this plugin there.
