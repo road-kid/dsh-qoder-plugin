@@ -2,7 +2,7 @@
   "name": "dsh-qoder-plugin",
   "displayName": "dsh-qoder-plugin",
   "description": "把 Qoder 模型接入 DeepSeek Harness：用 PAT 调用与 Qoder CLI 同源的模型服务，支持国内版 / 国际版双区域、模型开关、上下文窗口与每日签到，并提供只读的额度概览。",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "author": "corrinehu",
   "keywords": [
     "dsh-plugin",

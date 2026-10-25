@@ -369,13 +369,20 @@ export function ModelsPane({
             )}
           </div>
           <div className="qdp-saveBarActions">
-            <QdpButton data-testid="qdp-models-cancel" disabled={saving} onClick={resetDraft}>
+            {/* The dismissive action is borderless: the strip carries one
+                control that commits, and a hairline next to it would read as a
+                second, equally weighted decision. */}
+            <QdpButton
+              data-testid="qdp-models-cancel"
+              variant="ghost"
+              disabled={saving}
+              onClick={resetDraft}
+            >
               {t('cancelChanges')}
             </QdpButton>
             <QdpButton
               data-testid="qdp-models-save"
               variant="primary"
-              size="md"
               disabled={saving}
               onClick={saveDraft}
             >

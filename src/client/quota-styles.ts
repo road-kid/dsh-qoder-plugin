@@ -1108,26 +1108,37 @@ export const QUOTA_CSS = `
 
 /* --------------------------------------------------------------- save bar */
 
+/*
+ * The dirty-models strip. It is a footnote under a dense list, not a dialog
+ * footer: one hairline, one line of 11px copy and two compact controls, so the
+ * strip reads lighter than the rows it follows instead of outshouting them.
+ */
 .qdp-saveBar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  padding: 10px 0 0;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 0 0;
   border-top: 0.5px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-settings-card-fill);
 }
 .qdp-saveBarText {
   flex: 1 1 auto;
   min-width: 0;
-  font: var(--dsw-font-xxs-12);
+  font: var(--dsw-font-xxxs-11);
   color: var(--dsw-alias-label-secondary);
 }
 .qdp-saveBarActions {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+}
+/* Row-scale controls inside the strip: 24px tall, 11px label. */
+.qdp-saveBarActions .qdp-btn {
+  height: 24px;
+  padding: 0 10px;
+  font: var(--dsw-font-xxxs-strong-11);
 }
 
 /* ------------------------------------------------- chip + anchored panel */
@@ -1167,8 +1178,8 @@ export const QUOTA_CSS = `
 .qdp-pop {
   position: fixed;
   z-index: 60;
-  width: 300px;
-  padding: 12px;
+  width: 340px;
+  padding: 10px 10px 8px;
   border: 0;
   border-radius: var(--dsw-radius-lg);
   background: var(--dsw-alias-bg-layer-1);
@@ -1180,12 +1191,12 @@ export const QUOTA_CSS = `
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
 .qdp-popTitle {
   flex: 1 1 auto;
   min-width: 0;
-  font: var(--dsw-font-s-strong-14);
+  font: var(--dsw-font-xs-strong-13);
   color: var(--dsw-alias-label-primary);
 }
 .qdp-popTime {
@@ -1200,10 +1211,14 @@ export const QUOTA_CSS = `
   /*
    * A stored pool makes the row count unbounded (the user can save as many
    * tokens as they like), and the panel opens upward from the composer — so it
-   * scrolls here instead of growing off the top of the window.
+   * scrolls here instead of growing off the top of the window. The bound is
+   * generous: a compact row is ~48px, so five accounts fit without a scrollbar,
+   * and the thin bar only appears for a pool past that.
    */
-  max-height: 320px;
+  max-height: 360px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 .qdp-popVariant {
   display: flex;
@@ -1270,12 +1285,13 @@ export const QUOTA_CSS = `
 .qdp-popAccounts {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 .qdp-popAccountsHead {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
+  padding: 0 2px;
 }
 .qdp-popAccountsTitle {
   font: var(--dsw-font-xxs-strong-12);
@@ -1283,10 +1299,6 @@ export const QUOTA_CSS = `
 }
 .qdp-popAccountsSwitchHint {
   margin-left: auto;
-  font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-label-tertiary);
-}
-.qdp-popAccountsHint {
   font: var(--dsw-font-xxxs-11);
   color: var(--dsw-alias-label-tertiary);
 }
@@ -1301,8 +1313,8 @@ export const QUOTA_CSS = `
 .qdp-popAccount {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px;
+  gap: 3px;
+  padding: 6px 6px;
   border-radius: var(--dsw-radius-sm);
 }
 .qdp-popAccountActive {
@@ -1311,7 +1323,7 @@ export const QUOTA_CSS = `
 .qdp-popAccountHead {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
 }
 /*
@@ -1355,16 +1367,71 @@ export const QUOTA_CSS = `
 .qdp-popAccountParked .qdp-popAccountHead {
   opacity: 0.6;
 }
+/*
+ * The health tag is a WORD, not a control: as a pill it repeated four times a
+ * row's worth of filled shapes and competed with the name for attention. It
+ * keeps the tag element (assistive tech and the tests read the same node) and
+ * loses the fill, so the row's only filled marks are the in-use and plan pills.
+ */
 .qdp-popAccountHealth {
   display: inline-flex;
   flex: 0 0 auto;
+}
+
+/* Separates the service state from the credit caption it follows, so the two
+   muted runs never read as one sentence. Decorative only: the DOM text is
+   unchanged. */
+.qdp-popAccountHealth::before {
+  content: '·';
+  margin-right: 4px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.qdp-popAccountHealth .qdp-tag {
+  height: auto;
+  padding: 0;
+  background: transparent;
+  font: var(--dsw-font-xxxs-11);
+  color: var(--dsw-alias-label-tertiary);
+}
+.qdp-popAccountHealth .qdp-tagSuccess {
+  color: var(--dsw-alias-state-success-primary);
+}
+.qdp-popAccountHealth .qdp-tagWarn {
+  color: var(--dsw-alias-state-warn-primary);
+}
+/* Bar and caption share one line: the rail takes the slack, the numbers sit
+   at the end of it. */
+.qdp-popAccountMeter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.qdp-popAccountMeter .qdp-popMeter,
+.qdp-popAccountMeter .qdp-popAccountUnavailable {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.qdp-popMeter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.qdp-popMeter .qdp-popBar {
+  flex: 1 1 auto;
+  min-width: 56px;
+}
+.qdp-popMeter .qdp-popCaption {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .qdp-popFoot {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
   border-top: 0.5px solid var(--dsw-alias-border-l2);
   font: var(--dsw-font-xxxs-11);
   color: var(--dsw-alias-label-caption);

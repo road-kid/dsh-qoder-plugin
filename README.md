@@ -6,8 +6,6 @@
 
 国内版（qoder.com.cn）与国际版（qoder.com）是两个独立条目，各自一套凭证、一套模型目录、一份额度，互不混用。只用其中一版时，另一版完全不会出现。
 
-![插件在 DSH 中的位置](assets/overview.svg)
-
 ## 能做什么
 
 - **粘贴即用**：在设置卡上粘贴 PAT 点「保存」，插件先向对应区域校验令牌，通过才落盘，模型随即出现在 DSH 的模型选择器里，无需重启。之后可随时「更换 PAT」或「清除 PAT」；新令牌校验通过才会覆盖旧的，粘贴打错不会把可用凭证弄丢。
@@ -23,17 +21,13 @@
 
 ## 界面
 
-截图取自中文深色界面；账号卡片里的账号名、余额与令牌尾号已打码。
-
-![在「插件」页的已安装列表里找到本插件](assets/screenshot-plugins-list.png)
-
-![插件页顶部：版本、包描述与内联文档](assets/screenshot-plugin-page.png)
-
 ![账号卡片：额度、签到与已保存的账号](assets/screenshot-accounts.png)
 
 ![模型卡片：逐模型开关、推理档位与上下文窗口](assets/screenshot-models.png)
 
-![设置卡片：输入框读数、刷新间隔、自动签到与账号切换](assets/screenshot-settings.png)
+![设置卡片：输入框读数与刷新间隔、自动签到与签到时间](assets/screenshot-settings.png)
+
+![输入框额度读数：点开是锚定面板，套餐、剩余 / 总量、进度与到期时间一屏看完](assets/screenshot-quota.png)
 
 ## 安装
 

@@ -91,7 +91,7 @@ export interface ComposerQuotaInjected {
 }
 
 /** Panel width, mirrored by `.qdp-pop` in quota-styles.ts. */
-const PANEL_WIDTH = 300
+const PANEL_WIDTH = 340
 /** Breathing room between the chip and its panel. */
 const ANCHOR_GAP = 8
 /** The panel never comes closer than this to a viewport edge. */
@@ -259,14 +259,16 @@ function containsTarget(container: HTMLElement | null, target: EventTarget | nul
  *
  * Shared by the single-account row and the per-account rows so both draw the
  * same bar geometry (the only inline size is the bar's percent `width`, which
- * is geometry, not appearance).
+ * is geometry, not appearance). The caption sits BESIDE the rail rather than
+ * under it: at the panel's width the two fit on one line, and the row then
+ * spends one line on its numbers instead of two.
  */
 function CreditBar({ figures, t }: {
   figures: VariantFigures
   t: QoderPluginCardInjected['t']
 }): ReactNode {
   return (
-    <>
+    <div className="qdp-popMeter">
       <div className="qdp-popBar">
         <div
           className={cx(
@@ -277,7 +279,7 @@ function CreditBar({ figures, t }: {
         />
       </div>
       <span className="qdp-popCaption">{captionText(figures, t)}</span>
-    </>
+    </div>
   )
 }
 
@@ -375,6 +377,7 @@ function AccountRow({ entry, busy, canSwitch, onActivate, t }: {
           <button
             type="button"
             className="qdp-popAccountName qdp-popAccountSwitch"
+            title={name}
             aria-label={t('accountSwitchAria', { name })}
             disabled={busy}
             onClick={() => {
@@ -384,19 +387,34 @@ function AccountRow({ entry, busy, canSwitch, onActivate, t }: {
             {name}
           </button>
         ) : (
-          <span className="qdp-popAccountName">{name}</span>
+          <span className="qdp-popAccountName" title={name}>{name}</span>
         )}
         {entry.active ? <QdpTag tone="success">{t('accountCurrent')}</QdpTag> : null}
         {parked ? <QdpTag tone="neutral">{t('accountParked')}</QdpTag> : null}
         {figures?.planName === undefined ? null : <QdpTag>{figures.planName}</QdpTag>}
-        {/*
-          The account's observed service state, on the same terms as the card's
-          account list: `undefined` is "nothing observed", rendered as the
-          neutral 「尚未观测」 rather than an invented 正常. A parked seat shows
-          no state at all — it is out of the walk, so calling it healthy would be
-          a promise this popover will not keep.
-        */}
-        {parked ? null : (
+        <span className="qdp-popValue">
+          {parked
+            ? t('accountCreditsParked')
+            : figures === undefined ? '—' : valueText(figures, t)}
+        </span>
+      </div>
+      {parked ? null : (
+        <div className="qdp-popAccountMeter">
+          {figures === undefined ? (
+            <span className="qdp-popAccountUnavailable">
+              <QdpTag tone="error">{t('quotaError')}</QdpTag>
+            </span>
+          ) : (
+            <CreditBar figures={figures} t={t} />
+          )}
+          {/*
+            The account's observed service state, on the same terms as the card's
+            account list: `undefined` is "nothing observed", rendered as the
+            neutral 「尚未观测」 rather than an invented 正常. A parked seat shows
+            no state at all — it is out of the walk, so calling it healthy would be
+            a promise this popover will not keep. It rides the meter line rather
+            than the name line so a long account name keeps its room.
+          */}
           <span className="qdp-popAccountHealth" title={t('accountHealthAria')}>
             <QdpTag
               tone={entry.health === undefined ? 'neutral' : entry.health === 'normal' ? 'success' : 'warn'}
@@ -404,19 +422,7 @@ function AccountRow({ entry, busy, canSwitch, onActivate, t }: {
               {accountHealthLabel(entry.health, t)}
             </QdpTag>
           </span>
-        )}
-        <span className="qdp-popValue">
-          {parked
-            ? t('accountCreditsParked')
-            : figures === undefined ? '—' : valueText(figures, t)}
-        </span>
-      </div>
-      {parked ? null : figures === undefined ? (
-        <span className="qdp-popAccountUnavailable">
-          <QdpTag tone="error">{t('quotaError')}</QdpTag>
-        </span>
-      ) : (
-        <CreditBar figures={figures} t={t} />
+        </div>
       )}
     </li>
   )
@@ -438,7 +444,14 @@ function AccountPool({ entries, busy, canSwitch, onActivate, t }: {
 }): ReactNode {
   return (
     <div className="qdp-popAccounts">
-      <div className="qdp-popAccountsHead">
+      {/*
+        The pool's two sentences ("requests walk the list in order; switching
+        changes which subscription pays") are reference copy, not a control, so
+        they ride on the heading's tooltip instead of spending three lines of a
+        panel that opens above the composer. The settings card still prints them
+        in full, which is where the pool is edited.
+      */}
+      <div className="qdp-popAccountsHead" title={t('accountsHint')}>
         <span className="qdp-popAccountsTitle">{t('accountsHeading')}</span>
         {/*
           The rows' affordance is the name itself, so the panel says so once
@@ -447,7 +460,6 @@ function AccountPool({ entries, busy, canSwitch, onActivate, t }: {
         */}
         {canSwitch ? <span className="qdp-popAccountsSwitchHint">{t('accountsSwitchHint')}</span> : null}
       </div>
-      <span className="qdp-popAccountsHint">{t('accountsHint')}</span>
       <ul className="qdp-popAccountList">
         {entries.map(entry => (
           <AccountRow

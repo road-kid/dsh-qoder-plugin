@@ -2,6 +2,49 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.4 — 2026-10-26
+
+A polish release: three surfaces got smaller or quieter, and the README's
+screenshots were retaken against them. Nothing about settings, credentials or
+the wire changed — updating in place needs no migration.
+
+### Changed — the composer readout stops scrolling
+
+**The panel above the composer spent three lines per account and then
+scrolled.** Each row stacked the name, the credits, a bar and a caption, and
+with the pool's explanation on top a two-account pool already overflowed the
+320px bound. The bar and its numbers now share one line, the service state
+(尚未观测 / 正常 / 排队 / 限流) rides that same line as muted text instead of a
+fourth filled pill, and the two sentences describing the walk moved into the
+heading's tooltip — they are reference copy, and the settings card still prints
+them in full. The panel is 340px wide, a two-account pool fits without a
+scrollbar, and a larger pool scrolls thinly against a raised 360px bound.
+
+**Long account names keep their room.** The health tag moved off the name line,
+so the name is no longer squeezed by four neighbours, and a truncated name
+carries the full string in its tooltip.
+
+### Changed — the model card's save strip is row scale again
+
+**保存设置 was drawn at 36px beside a 12px list.** It is 24px with an 11px
+label now — the height of the rows it belongs to — and 取消 lost its border, so
+the strip carries exactly one filled control. The strip's padding, gap and the
+hairline above it tightened to match.
+
+### Changed — a new icon
+
+The blue tile with a bolt and a small dot became a bolt inside an open gauge arc.
+Credit level is what this plugin is about, and the mark has to survive 16px in
+the plugin list. The candidates that lost — a Q-shaped ring, rising bars, a
+closed gauge — read as a magnifier, as analytics and as a loading spinner
+respectively at small sizes; an open arc with a centred bolt did not.
+
+### Notes
+
+- `lib/` is committed: run `pnpm run build` after pulling, or the old bundle
+  keeps drawing the 36px button.
+- README screenshots were retaken from this build, in the light theme.
+
 ## 1.0.3 — 2026-10-25
 
 A follow-up to 1.0.2. The first fix below is the pool counting rows in the two

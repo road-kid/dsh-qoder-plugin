@@ -1,6 +1,14 @@
-<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="1" y="1" width="34" height="34" rx="8" fill="url(#g)" />
-  <path d="M19.6 7.5 11 20h5.6l-1.4 8.5L24.5 16h-5.6l.7-8.5Z" fill="#FFFFFF"/>
-  <circle cx="25.5" cy="25.5" r="3.2" fill="#45D9E7"/>
-  <defs><linearGradient id="g" x1="18" y1="1" x2="18" y2="35" gradientUnits="userSpaceOnUse"><stop stop-color="#7CB7FF"/><stop offset="1" stop-color="#145AF3"/></linearGradient></defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" width="36" height="36">
+  <defs>
+    <linearGradient id="qdpIconTile" x1="0" y1="0" x2="36" y2="36" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7FA3FF"/>
+      <stop offset="0.55" stop-color="#4A6BFA"/>
+      <stop offset="1" stop-color="#3A3CE0"/>
+    </linearGradient>
+  </defs>
+  <rect width="36" height="36" rx="9" fill="url(#qdpIconTile)"/>
+  <path d="M10.22 25.78A11 11 0 1 1 25.78 25.78" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round"/>
+  <g transform="translate(18 17.5) scale(0.92)">
+    <path d="M1.32 -4.5 -4.98 4.5h5.67l-1.63 6 6.3-9h-5.67l1.63-6Z" fill="#FFFFFF"/>
+  </g>
 </svg>

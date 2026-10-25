@@ -22,7 +22,7 @@ Everything you need to build, test and release `dsh-qoder-plugin`.
 | `tests/qoder/`       | Transport tests, run by `node --test` instead of Vitest                |
 | `scripts/`           | Ad-hoc verification scripts (live end-to-end, endpoint guard checks)   |
 | `lib/`               | Build output — committed, see below                                    |
-| `assets/`            | Plugin icon, overview diagram and README screenshots (`icon.svg`, `overview.svg`, `screenshot-*.png`) |
+| `assets/`            | Plugin icon and README screenshots (`icon.svg`, `screenshot-*.png`)    |
 | `locale/`            | `en.json` / `zh.json` shipped with the package                          |
 
 ## Commands
@@ -75,7 +75,7 @@ commit. A pull request that changes source without the bundle is incomplete.
 5. Tag and push: `git tag -a v<version> -m "v<version>"` then
    `git push origin main --tags`.
 
-The current release line is **1.0.3**. `prepack` guarantees the published tarball is
+The current release line is **1.0.4**. `prepack` guarantees the published tarball is
 built from the tagged source.
 
 ## Contribution conventions

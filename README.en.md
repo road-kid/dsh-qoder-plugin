@@ -6,8 +6,6 @@ Bring your **Qoder subscription** models into [DeepSeek Harness](https://github.
 
 China (qoder.com.cn) and Global (qoder.com) are two independent entries: separate credentials, separate model catalogues, separate credit. Configure only the one you use — the other never appears.
 
-![Where the plugin sits in DSH](assets/overview.svg)
-
 ## What it does
 
 - **Paste and go** — paste a PAT into the settings card and press *Save*; the token is validated against that region first and only then written, and the models appear in DSH's picker immediately — no restart. *Replace PAT* and *Clear PAT* are one click away, and a new token overwrites the old one only after it validates, so a mistyped paste can never strand a working credential.
@@ -23,17 +21,13 @@ China (qoder.com.cn) and Global (qoder.com) are two independent entries: separat
 
 ## Screenshots
 
-The screenshots show the Chinese dark UI, which is what this machine runs; account names, balances and token tails on the account card are masked.
-
-![Find the plugin in the installed list on the Plugins page](assets/screenshot-plugins-list.png)
-
-![Plugin page header: version, package description and inline docs](assets/screenshot-plugin-page.png)
-
 ![Account card: credit, check-in and saved accounts](assets/screenshot-accounts.png)
 
 ![Models card: per-model switches, reasoning levels and context windows](assets/screenshot-models.png)
 
-![Settings card: composer readout, refresh interval, automatic check-in and account switching](assets/screenshot-settings.png)
+![Settings card: composer readout and its refresh interval, automatic check-in and its time](assets/screenshot-settings.png)
+
+![Composer readout: one anchored panel with the plan, credits used of total, progress and expiry](assets/screenshot-quota.png)
 
 ## Install
 
