@@ -75,7 +75,7 @@ commit. A pull request that changes source without the bundle is incomplete.
 5. Tag and push: `git tag -a v<version> -m "v<version>"` then
    `git push origin main --tags`.
 
-The current release line is **1.0.4**. `prepack` guarantees the published tarball is
+The current release line is **1.0.5**. `prepack` guarantees the published tarball is
 built from the tagged source.
 
 ## Contribution conventions

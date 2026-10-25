@@ -2,6 +2,33 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.5 — 2026-10-26
+
+A packaging release. 1.0.4 shipped the README's four screenshots inside the
+tarball — 750 kB of a 1 MB package for images no consumer reads — and linked them
+from the README by relative path. No runtime behaviour changes.
+
+### Changed — the package ships the icon and nothing else from `assets/`
+
+**`files` listed the whole directory.** The host reads the plugin icon from
+`package.json`'s `icon`, so `assets/icon.svg` stays; the screenshots exist for the
+README and are no longer published. The tarball drops from 1.0 MB to 275 kB and
+from 20 files to 16, unpacked from 1.7 MB to 930 kB.
+
+### Changed — the README's screenshots load from absolute URLs
+
+**npm renders the README from the tarball, so a relative image path resolves to
+nothing once the file stops shipping.** The four images now point at jsDelivr's
+GitHub endpoint, which serves the same repository files to GitHub and to the
+package page alike. All four were verified against the CDN: 200, `image/png`,
+byte sizes matching the files in the repository.
+
+### Notes
+
+- `lib/` is committed: run `pnpm run build` after pulling, or the bundle keeps
+  reporting the old version.
+- 1.0.4 is superseded but stays on the registry, screenshots inside.
+
 ## 1.0.4 — 2026-10-26
 
 A polish release: three surfaces got smaller or quieter, and the README's
