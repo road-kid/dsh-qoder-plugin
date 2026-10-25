@@ -41,7 +41,7 @@
   },
   "files": [
     "lib",
-    "assets",
+    "assets/icon.svg",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",
