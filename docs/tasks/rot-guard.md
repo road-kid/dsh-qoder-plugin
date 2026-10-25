@@ -1,6 +1,8 @@
 # 任务：dsh-qoder-plugin 防风控 / 调度健壮性改造（8 项）
 
 > 本文件是任务规格，供本仓库的开发者（人或多代理）直接执行。只改本仓库，不依赖会话上下文。
+>
+> **状态：T1–T8 已全部实施完毕。** 文中「新增开关改 `src/client/QuotaSettingsCard.tsx`」这类指导已过时——该文件现在只剩类型定义，设置卡的界面在 `src/client/QoderPluginCard.tsx`，配置 schema 在 `src/index.ts`。文末的历史验证记录引用的是 1.0.2 时刻的产物文件名，产物名随后续构建变化。
 
 ## 角色与背景
 你是 dsh-qoder-plugin（DSH 宿主插件，TypeScript ESM）的开发者。插件通过

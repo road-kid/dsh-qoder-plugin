@@ -43,6 +43,7 @@ import { creditSummary } from './quota-merge.ts'
 import type { QoderSettingsKey } from './locales.ts'
 import type { QuotaSection, QuotaSettingsScope } from './QuotaSettingsCard.tsx'
 import {
+  advancedSettings,
   noteQuotaSignIn,
   noteQuotaStatus,
   onQuotaSettingsChange,
@@ -52,6 +53,7 @@ import {
   quotaSignInState,
   quotaStatus,
   quotaStatusIsFresh,
+  setAdvancedSettingsOpen,
   setQuotaReadout,
 } from './quota-settings-store.ts'
 
@@ -678,6 +680,8 @@ interface CheckInSettings {
   writable: boolean
   /** Whether a connection failure may walk on to the next account. */
   autoFailoverEnabled: boolean
+  /** The queue-retry master switch (on unless explicitly off). */
+  queueWaitEnabled: boolean
   queueWaitAttempts: number
   queueWaitSeconds: number
   routingStrategy: QoderRoutingStrategy
@@ -701,6 +705,7 @@ const UNAVAILABLE_SETTINGS: CheckInSettings = {
   status: 'unavailable',
   writable: false,
   autoFailoverEnabled: true,
+  queueWaitEnabled: true,
   queueWaitAttempts: QUEUE_WAIT_ATTEMPTS_DEFAULT,
   queueWaitSeconds: QUEUE_WAIT_SECONDS_DEFAULT,
   routingStrategy: 'save-order',
@@ -758,6 +763,9 @@ function settingsKeyOf(scope: QuotaSettingsScope<QuotaSection> | undefined): str
     // it, so the tuple stays readable by the versions of this card that wrote
     // the earlier positions.
     value.stickinessEnabled !== false,
+    // The queue-retry master switch. Appended last for the same positional
+    // reason: a field in the middle would re-label every position after it.
+    value.queueWaitEnabled !== false,
   ])
 }
 
@@ -796,6 +804,9 @@ function parseSettingsKey(raw: string): CheckInSettings {
       // nothing here, and the parse must default those documents to ON so an
       // upgrade does not silently disable a feature the user never touched.
       stickinessEnabled: parsed[17] !== false,
+      // Same rule for the queue-retry switch: a document written before it
+      // existed reads as ON, which is the behaviour it already had.
+      queueWaitEnabled: parsed[18] !== false,
     }
   } catch {
     return UNAVAILABLE_SETTINGS
@@ -809,16 +820,23 @@ function parseSettingsKey(raw: string): CheckInSettings {
  *
  * On `page` this component renders the configuration BODY only: the Plugins
  * page draws the breadcrumb, icon, title, version and description, so no shell
- * chrome or second title lives here. The page is a grid of three cards:
+ * chrome or second title lives here. The page is a grid of four cards:
  *
  * 1. 账号 — variant switcher (with per-variant enable checkboxes), status row,
  *    account summary strip, credential row, PAT entry
  * 2. 模型 — catalogue provenance + refresh, then the models pane body
- * 3. 高级设置 — quota-readout switch, auto check-in + its UTC+8 time, poll interval
+ * 3. 高级设置 — four master switches, each owning the rows that can only act
+ *    through it: the readout switch owns the poll interval, auto check-in owns
+ *    the check-in time, queue retry owns the two queue bounds, and automatic
+ *    account switching owns routing, the custom order and stickiness
+ * 4. 设备码 — one button that re-identifies every saved account; it is an
+ *    action rather than a setting, so it appears only when the host serves the
+ *    route, and it renders for a signed-out account too
  *
  * A signed-out account renders 账号 (with the PAT entry) and 高级设置 only:
  * model preferences for an account nobody is signed into would be settings the
- * user cannot exercise yet.
+ * user cannot exercise yet. The device-codes card is not a model preference, so
+ * it stays.
  */
 /**
  * The custom routing order, top to bottom.
@@ -979,6 +997,12 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    */
   const readout = useSyncExternalStore(onQuotaSettingsChange, quotaReadout)
   /**
+   * The 高级设置 card's own switch: a CLIENT preference with the same reasoning
+   * as the readout above — it decides what the page draws, not what the host
+   * does, so it lives in the browser store and defaults to closed.
+   */
+  const advanced = useSyncExternalStore(onQuotaSettingsChange, advancedSettings)
+  /**
    * Both variants' account pools and catalogues, as a stable snapshot.
    *
    * The custom routing order spans BOTH variants, so the warning that guards a
@@ -1078,6 +1102,16 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    */
   const [savingModels, setSavingModels] = useState(false)
   const [modelsSaveError, setModelsSaveError] = useState<string>()
+  /**
+   * The device-code reset at the bottom of the card.
+   *
+   * Its own busy/notice pair, like the account row actions: the reset writes a
+   * host-level seed and drops every cached job token, and its verdict ("2
+   * accounts") has nowhere else to appear.
+   */
+  const [resettingDevices, setResettingDevices] = useState(false)
+  const [deviceResetError, setDeviceResetError] = useState<string>()
+  const [deviceResetNotice, setDeviceResetNotice] = useState<string>()
   const mounted = useRef(true)
   const manualControllers = useRef(new Set<AbortController>())
 
@@ -1382,6 +1416,48 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
       manualControllers.current.delete(controller)
     }
   }, [currentVariant.id, liveSignIn, refresh, status, t, trackController])
+
+  /**
+   * Give every saved account a new device code.
+   *
+   * One host call, no status re-read: the answer is the verdict itself, and the
+   * next request each account makes re-mints its token with the new fingerprint
+   * — nothing in the status document changes until then. A refusal (a read-only
+   * home directory, a host that serves no route) is reported where the button
+   * is, because a reset that silently did nothing is worse than one that says so.
+   */
+  const resetDeviceCodes = useCallback(async (): Promise<void> => {
+    // Called ON the scope, never as a detached function: the real implementation
+    // is a class method that reads `this.document`, so extracting it would throw
+    // on the first click while every type check and every test that stubs the
+    // scope with an arrow function still passed.
+    const active = scope
+    if (active?.resetDeviceCodes === undefined) return
+    setDeviceResetError(undefined)
+    setDeviceResetNotice(undefined)
+    setResettingDevices(true)
+    try {
+      const result = await active.resetDeviceCodes()
+      if (!mounted.current) return
+      if (result.ok) {
+        setDeviceResetNotice(
+          result.accounts === undefined
+            ? t('deviceResetDoneBare')
+            : t('deviceResetDone', { count: result.accounts }),
+        )
+      } else {
+        setDeviceResetError(t('deviceResetFailed', { message: result.error ?? t('requestFailed') }))
+      }
+    } catch (error: unknown) {
+      if (mounted.current) {
+        setDeviceResetError(t('deviceResetFailed', {
+          message: error instanceof Error ? error.message : t('requestFailed'),
+        }))
+      }
+    } finally {
+      if (mounted.current) setResettingDevices(false)
+    }
+  }, [scope, t])
 
   /**
    * One probe-route write, WITHOUT a status re-read.
@@ -1882,6 +1958,12 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    * state exists to prevent.
    */
   const settingsReady = settings.status === 'ready'
+  /**
+   * Whether 高级设置 has anything to fold: the tuning rows need a settings
+   * face that carries them, and the device card needs a host that serves the
+   * reset route. With neither, the disclosure is not drawn at all.
+   */
+  const hasAdvancedRows = settings.status !== 'unavailable' || scope?.resetDeviceCodes !== undefined
   const routingStrategy = settings.routingStrategy
   const routingStoredOrder = settings.routingOrder
   const routingNameOf = (id: string): string => {
@@ -2397,10 +2479,10 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
         </section>
       )}
 
-      {/* ── 3. 高级设置: readout switch, auto check-in + its shared time, poll ── */}
+      {/* ── 3. 设置: the switches a request meets, day to day ── */}
       <section className="qdp-card">
         <div className="qdp-sectionHead">
-          <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
+          <h2 className="qdp-sectionTitle">{t('quotaSectionSettings')}</h2>
         </div>
         <div className="qdp-sectionBody">
           {/* The face has not answered yet: the controls below show the schema
@@ -2423,6 +2505,12 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               {t('settingsWriteFailed', { message: settings.writeError })}
             </p>
           )}
+          {/*
+            ── Composer readout ──
+            The switch is a per-browser preference, not a plugin setting, and
+            the interval below it only exists while the readout it refreshes is
+            on screen.
+          */}
           <div className="qdp-row">
             <div className="qdp-rowText">
               <span className="qdp-rowTitle">{t('quotaReadoutEnabledLabel')}</span>
@@ -2437,9 +2525,10 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
             </div>
           </div>
           {/* The poll interval drives the composer's remaining-credit label
-              itself, so it sits right under the readout switch it serves. */}
-          {settings.status === 'unavailable' ? null : (
-            <div className="qdp-row">
+              itself, so it is a sub-menu of the readout switch it serves: with
+              the label hidden there is nothing on screen to refresh. */}
+          {settings.status === 'unavailable' || !readoutEnabled ? null : (
+            <div className="qdp-row qdp-subRow">
               <div className="qdp-rowText">
                 <span className="qdp-rowTitle">{t('quotaPollLabel')}</span>
                 <span className="qdp-rowDesc">{t('quotaPollHint')}</span>
@@ -2458,6 +2547,13 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               </div>
             </div>
           )}
+          {/*
+            ── Daily check-in ──
+            Above the failover block on purpose: check-in is a once-a-day
+            housekeeping action, while the rows below change how a running
+            conversation is served. Reading the card top to bottom should put
+            the routine first and the routing policy second.
+          */}
           <div className="qdp-row">
             <div className="qdp-rowText">
               <span className="qdp-rowTitle">{t('paneUsage')}</span>
@@ -2476,34 +2572,47 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               />
             </div>
           </div>
-          <div className="qdp-row">
-            <div className="qdp-rowText">
-              <span className="qdp-rowTitle">{t('checkInTime')}</span>
-              <span className="qdp-rowDesc">{t('checkInTimeHint')}</span>
+          {/* The check-in moment is a sub-menu of the automatic check-in
+              switch: a time for an action that never runs is noise. It follows
+              the switch ON SCREEN, so turning check-in off closes the row the
+              user was just looking at. The value stays shared: whichever
+              variant's scheduler is armed reads the one moment, and the row
+              reappears with it when that tab's switch goes back on. */}
+          {autoCheckInOn ? (
+            <div className="qdp-row qdp-subRow">
+              <div className="qdp-rowText">
+                <span className="qdp-rowTitle">{t('checkInTime')}</span>
+                <span className="qdp-rowDesc">{t('checkInTimeHint')}</span>
+              </div>
+              <div className="qdp-rowControl">
+                <CheckInTimeRow
+                  label={t('checkInTime')}
+                  value={checkInMinute}
+                  disabled={!anySignedIn}
+                  onPick={writeCheckInMinute}
+                />
+              </div>
             </div>
-            <div className="qdp-rowControl">
-              <CheckInTimeRow
-                label={t('checkInTime')}
-                value={checkInMinute}
-                disabled={!anySignedIn}
-                onPick={writeCheckInMinute}
-              />
-            </div>
-          </div>
+          ) : null}
           {/*
-            ── Daily check-in ──
-            Above the failover block on purpose: check-in is a once-a-day
-            housekeeping action, while the rows below change how a running
-            conversation is served. Reading the card top to bottom should put
-            the routine first and the routing policy second.
-          */}
-          {/*
-            ── Failover and routing ──
+            ── Automatic account switch and routing ──
             These rows write the host Config's own fields. They are omitted
             entirely on a settings face that does not carry them, because a
             control the host silently drops is worse than no control: the user
             would set a policy and only find out at the next failover that
             nothing recorded it.
+
+            The routing strategy and the custom order are a sub-menu of the
+            switch above: with switching off, no request ever leaves the account
+            it starts on, so an order would be a control that cannot take
+            effect. The transport enforces the same thing — the walk is skipped
+            entirely — so hiding these rows keeps the card honest instead of
+            offering a policy that is silently ignored.
+
+            Queueing and stickiness are NOT here: they tune how a request is
+            retried and how long it stays on one account, which is a different
+            question from which account is even allowed to answer. They fold
+            away under 高级设置.
           */}
           {settings.status === 'unavailable' ? null : (
             <>
@@ -2521,161 +2630,277 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                   />
                 </div>
               </div>
-              <div className="qdp-row">
-                <div className="qdp-rowText">
-                  <span className="qdp-rowTitle">{t('queueWaitAttemptsLabel')}</span>
-                  <span className="qdp-rowDesc">{t('queueWaitAttemptsHint')}</span>
-                </div>
-                <div className="qdp-rowControl">
-                  <QdpNumberField
-                    marker="queue-wait-attempts"
-                    min={0}
-                    max={QUEUE_WAIT_ATTEMPTS_MAX}
-                    value={settings.queueWaitAttempts}
-                    label={t('queueWaitAttemptsLabel')}
-                    disabled={!settingsReady}
-                    // 0 is meaningful — report the queue answer at once — so the
-                    // bound is 0..MAX, never a truthiness check.
-                    onCommit={attempts => { writeSetting('queueWaitAttempts', attempts) }}
-                  />
-                </div>
-              </div>
-              <div className="qdp-row">
-                <div className="qdp-rowText">
-                  <span className="qdp-rowTitle">{t('queueWaitSecondsLabel')}</span>
-                  <span className="qdp-rowDesc">{t('queueWaitSecondsHint')}</span>
-                </div>
-                <div className="qdp-rowControl">
-                  <QdpNumberField
-                    marker="queue-wait-seconds"
-                    min={QUEUE_WAIT_SECONDS_MIN}
-                    max={QUEUE_WAIT_SECONDS_MAX}
-                    value={settings.queueWaitSeconds}
-                    label={t('queueWaitSecondsLabel')}
-                    disabled={!settingsReady}
-                    onCommit={seconds => { writeSetting('queueWaitSeconds', seconds) }}
-                  />
-                  <span className="qdp-caption">{t('queueWaitSecondsUnit')}</span>
-                </div>
-              </div>
-              <div className="qdp-row">
-                <div className="qdp-rowText">
-                  <span className="qdp-rowTitle">{t('routingStrategyLabel')}</span>
-                  <span className="qdp-rowDesc">{t('routingStrategyHint')}</span>
-                </div>
-                <div className="qdp-rowControl">
-                  {/*
-                    A select rather than the card's segmented control: that
-                    control is a tablist, and the variant switcher has to stay
-                    the card's only level of tabs. Routing strategy is a plain
-                    settings choice, and a select says exactly that.
-                  */}
-                  <select
-                    className="qdp-select"
-                    value={routingStrategy}
-                    disabled={!routingWritable || !settingsReady}
-                    aria-label={t('routingStrategyLabel')}
-                    onChange={event => {
-                      chooseRoutingStrategy(event.target.value === 'custom' ? 'custom' : 'save-order')
-                    }}
-                  >
-                    <option value="save-order">{t('routingStrategySaveOrder')}</option>
-                    <option value="custom">{t('routingStrategyCustom')}</option>
-                  </select>
-                </div>
-              </div>
-              {/* The order list only exists for the custom strategy: on save
-                  order the list IS the account list above, and showing a
-                  second, uneditable copy of it would only invite the user to
-                  try reordering something that cannot move. */}
-              {routingStrategy !== 'custom' ? null : (
-                <div className="qdp-row qdp-rowStack">
-                  <div className="qdp-rowText">
-                    <span className="qdp-rowTitle">{t('routingOrderHeading')}</span>
-                    <span className="qdp-rowDesc">{t('routingOrderHint')}</span>
+              {/*
+                Everything that decides WHICH account serves a request is a
+                sub-menu of the switch above. The transport enforces the same
+                thing — the walk is skipped entirely — so hiding these rows
+                keeps the card honest instead of offering a policy that is
+                silently ignored.
+              */}
+              {settings.autoFailoverEnabled ? (
+                <>
+                  <div className="qdp-row qdp-subRow">
+                    <div className="qdp-rowText">
+                      <span className="qdp-rowTitle">{t('routingStrategyLabel')}</span>
+                      <span className="qdp-rowDesc">{t('routingStrategyHint')}</span>
+                    </div>
+                    <div className="qdp-rowControl">
+                      {/*
+                        A select rather than the card's segmented control: that
+                        control is a tablist, and the variant switcher has to
+                        stay the card's only level of tabs. Routing strategy is a
+                        plain settings choice, and a select says exactly that.
+                      */}
+                      <select
+                        className="qdp-select"
+                        value={routingStrategy}
+                        disabled={!routingWritable || !settingsReady}
+                        aria-label={t('routingStrategyLabel')}
+                        onChange={event => {
+                          chooseRoutingStrategy(event.target.value === 'custom' ? 'custom' : 'save-order')
+                        }}
+                      >
+                        <option value="save-order">{t('routingStrategySaveOrder')}</option>
+                        <option value="custom">{t('routingStrategyCustom')}</option>
+                      </select>
+                    </div>
                   </div>
-                  <RoutingOrderList
-                    ids={routingOrderIds}
-                    nameOf={routingNameOf}
-                    variantOf={routingVariantOf}
-                    accountOf={id => routing.accounts.find(entry => entry.id === id)}
-                    disabled={!routingWritable || !settingsReady}
-                    t={t}
-                    onMove={moveRoutingAccount}
-                  />
-                </div>
-              )}
-              {routingMixed ? (
-                <MixedRoutingWarning
-                  offendersCN={routingOffenders.cn}
-                  offendersGlobal={routingOffenders.global}
-                  t={t}
-                />
-              ) : null}
-              <div className="qdp-row">
-                <div className="qdp-rowText">
-                  <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
-                  <span className="qdp-rowDesc">{t('stickinessToggleHint')}</span>
-                </div>
-                <div className="qdp-rowControl">
-                  <QdpSwitch
-                    checked={settings.stickinessEnabled}
-                    label={t('stickinessLabel')}
-                    disabled={!settingsReady}
-                    onChange={next => { writeSetting('stickinessEnabled', next) }}
-                  />
-                </div>
-              </div>
-              {/* The three bounds only exist while the master switch is on:
-                  rendering them against a disabled stickiness would invite the
-                  user to tune limits that never apply. */}
-              {settings.stickinessEnabled ? (
-                <div className="qdp-row">
-                  <div className="qdp-rowText">
-                    <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
-                    <span className="qdp-rowDesc">{t('stickinessHint')}</span>
-                  </div>
-                  <div className="qdp-rowControl">
-                    <QdpNumberField
-                      marker="stickiness-rounds"
-                      min={0}
-                      max={STICKINESS_ROUNDS_MAX}
-                      value={settings.stickinessRounds}
-                      label={t('stickinessRoundsLabel')}
-                      disabled={!settingsReady}
-                      onCommit={rounds => { writeSetting('stickinessRounds', rounds) }}
+                  {/* The order list only exists for the custom strategy: on save
+                      order the list IS the account list above, and showing a
+                      second, uneditable copy of it would only invite the user to
+                      try reordering something that cannot move. */}
+                  {routingStrategy !== 'custom' ? null : (
+                    <div className="qdp-row qdp-rowStack qdp-subRow">
+                      <div className="qdp-rowText">
+                        <span className="qdp-rowTitle">{t('routingOrderHeading')}</span>
+                        <span className="qdp-rowDesc">{t('routingOrderHint')}</span>
+                      </div>
+                      <RoutingOrderList
+                        ids={routingOrderIds}
+                        nameOf={routingNameOf}
+                        variantOf={routingVariantOf}
+                        accountOf={id => routing.accounts.find(entry => entry.id === id)}
+                        disabled={!routingWritable || !settingsReady}
+                        t={t}
+                        onMove={moveRoutingAccount}
+                      />
+                    </div>
+                  )}
+                  {routingMixed ? (
+                    <MixedRoutingWarning
+                      offendersCN={routingOffenders.cn}
+                      offendersGlobal={routingOffenders.global}
+                      t={t}
                     />
-                    <span className="qdp-caption">{t('stickinessRoundsLabel')}</span>
-                    <QdpNumberField
-                      marker="stickiness-requests"
-                      min={0}
-                      max={STICKINESS_REQUESTS_MAX}
-                      value={settings.stickinessRequests}
-                      label={t('stickinessRequestsLabel')}
-                      disabled={!settingsReady}
-                      onCommit={requests => { writeSetting('stickinessRequests', requests) }}
-                    />
-                    <span className="qdp-caption">{t('stickinessRequestsLabel')}</span>
-                    <QdpNumberField
-                      marker="stickiness-minutes"
-                      min={0}
-                      max={STICKINESS_MINUTES_MAX}
-                      value={settings.stickinessMinutes}
-                      label={t('stickinessMinutesLabel')}
-                      disabled={!settingsReady}
-                      onCommit={minutes => { writeSetting('stickinessMinutes', minutes) }}
-                    />
-                    <span className="qdp-caption">{t('stickinessMinutesLabel')}</span>
-                  </div>
-                </div>
+                  ) : null}
+                </>
               ) : null}
             </>
           )}
+
           {settings.status === 'ready' && !settings.writable ? (
             <p className="qdp-error">{t('quotaSettingsSaveFailed')}</p>
           ) : null}
         </div>
       </section>
+
+      {/*
+        ── 4. 高级设置: the rows that tune a request, behind a switch ──
+        The card carries ONE switch, off by default, and the rows only exist
+        while it is on. Every row in here already has a working default, so a
+        user who never turns the switch on gets the behaviour of the defaults —
+        the switch decides what is drawn, nothing else.
+
+        The state lives in the browser store (see `advancedSettings`), so the
+        switch works against any loaded host version and no settings-file field
+        has to be invented for a purely visual choice. Turning it off is not a
+        reset: the values stay saved, and turning it back on shows them again.
+
+        The card disappears when it would be empty: a settings face that does
+        not carry these fields and a host with no reset route leave nothing to
+        reveal, and an empty card is worse than no card.
+      */}
+      {!hasAdvancedRows ? null : (
+        <section className="qdp-card">
+          <div className="qdp-sectionHead">
+            <h2 className="qdp-sectionTitle">{t('quotaSectionAdvanced')}</h2>
+            {advanced.open ? null : (
+              <span className="qdp-rowDesc">{t('advancedSettingsHint')}</span>
+            )}
+            <QdpSwitch
+              checked={advanced.open}
+              label={t('quotaSectionAdvanced')}
+              onChange={setAdvancedSettingsOpen}
+            />
+          </div>
+          {!advanced.open ? null : (
+            <div className="qdp-sectionBody">
+              {settings.status === 'unavailable' ? null : (
+                <>
+                  <div className="qdp-row">
+                    <div className="qdp-rowText">
+                      <span className="qdp-rowTitle">{t('queueWaitEnabledLabel')}</span>
+                      <span className="qdp-rowDesc">{t('queueWaitEnabledHint')}</span>
+                    </div>
+                    <div className="qdp-rowControl">
+                      <QdpSwitch
+                        checked={settings.queueWaitEnabled}
+                        label={t('queueWaitEnabledLabel')}
+                        disabled={!settingsReady}
+                        onChange={next => { writeSetting('queueWaitEnabled', next) }}
+                      />
+                    </div>
+                  </div>
+                  {/* The two bounds are a sub-menu of the switch above: with the
+                      switch off the transport never waits, so both numbers are
+                      dead — the same reasoning as the routing sub-menu in 设置. */}
+                  {settings.queueWaitEnabled ? (
+                    <>
+                      <div className="qdp-row qdp-subRow">
+                        <div className="qdp-rowText">
+                          <span className="qdp-rowTitle">{t('queueWaitAttemptsLabel')}</span>
+                          <span className="qdp-rowDesc">{t('queueWaitAttemptsHint')}</span>
+                        </div>
+                        <div className="qdp-rowControl">
+                          <QdpNumberField
+                            marker="queue-wait-attempts"
+                            min={0}
+                            max={QUEUE_WAIT_ATTEMPTS_MAX}
+                            value={settings.queueWaitAttempts}
+                            label={t('queueWaitAttemptsLabel')}
+                            disabled={!settingsReady}
+                            // 0 is meaningful — report the queue answer at once — so
+                            // the bound is 0..MAX, never a truthiness check.
+                            onCommit={attempts => { writeSetting('queueWaitAttempts', attempts) }}
+                          />
+                        </div>
+                      </div>
+                      <div className="qdp-row qdp-subRow">
+                        <div className="qdp-rowText">
+                          <span className="qdp-rowTitle">{t('queueWaitSecondsLabel')}</span>
+                          <span className="qdp-rowDesc">{t('queueWaitSecondsHint')}</span>
+                        </div>
+                        <div className="qdp-rowControl">
+                          <QdpNumberField
+                            marker="queue-wait-seconds"
+                            min={QUEUE_WAIT_SECONDS_MIN}
+                            max={QUEUE_WAIT_SECONDS_MAX}
+                            value={settings.queueWaitSeconds}
+                            label={t('queueWaitSecondsLabel')}
+                            disabled={!settingsReady}
+                            onCommit={seconds => { writeSetting('queueWaitSeconds', seconds) }}
+                          />
+                          <span className="qdp-caption">{t('queueWaitSecondsUnit')}</span>
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+                      <div className="qdp-row">
+                        <div className="qdp-rowText">
+                          <span className="qdp-rowTitle">{t('stickinessLabel')}</span>
+                          <span className="qdp-rowDesc">{t('stickinessToggleHint')}</span>
+                        </div>
+                        <div className="qdp-rowControl">
+                          <QdpSwitch
+                            checked={settings.stickinessEnabled}
+                            label={t('stickinessLabel')}
+                            disabled={!settingsReady}
+                            onChange={next => { writeSetting('stickinessEnabled', next) }}
+                          />
+                        </div>
+                      </div>
+                      {/*
+                        The three bounds only exist while the master switch is on:
+                        rendering them against a disabled stickiness would invite the
+                        user to tune limits that never apply.
+
+                        No title on this row, on purpose. The row above already says
+                        "conversation stickiness"; repeating it here put the same
+                        heading twice on one screen. The hint stays because it is
+                        what explains the three numbers, and each field carries its
+                        own unit caption.
+                      */}
+                      {settings.stickinessEnabled ? (
+                        <div className="qdp-row qdp-subRow">
+                          <div className="qdp-rowText">
+                            <span className="qdp-rowDesc">{t('stickinessHint')}</span>
+                          </div>
+                          <div className="qdp-rowControl">
+                            <QdpNumberField
+                              marker="stickiness-rounds"
+                              min={0}
+                              max={STICKINESS_ROUNDS_MAX}
+                              value={settings.stickinessRounds}
+                              label={t('stickinessRoundsLabel')}
+                              disabled={!settingsReady}
+                              onCommit={rounds => { writeSetting('stickinessRounds', rounds) }}
+                            />
+                            <span className="qdp-caption">{t('stickinessRoundsLabel')}</span>
+                            <QdpNumberField
+                              marker="stickiness-requests"
+                              min={0}
+                              max={STICKINESS_REQUESTS_MAX}
+                              value={settings.stickinessRequests}
+                              label={t('stickinessRequestsLabel')}
+                              disabled={!settingsReady}
+                              onCommit={requests => { writeSetting('stickinessRequests', requests) }}
+                            />
+                            <span className="qdp-caption">{t('stickinessRequestsLabel')}</span>
+                            <QdpNumberField
+                              marker="stickiness-minutes"
+                              min={0}
+                              max={STICKINESS_MINUTES_MAX}
+                              value={settings.stickinessMinutes}
+                              label={t('stickinessMinutesLabel')}
+                              disabled={!settingsReady}
+                              onCommit={minutes => { writeSetting('stickinessMinutes', minutes) }}
+                            />
+                            <span className="qdp-caption">{t('stickinessMinutesLabel')}</span>
+                          </div>
+                        </div>
+                      ) : null}
+                  {/*
+                    The switch above cannot act while switching is off: with no
+                    walk there is no other account to stay on. Said here rather
+                    than hidden, because the row is not under that switch any
+                    more — a silent no-op would be the worse answer.
+                  */}
+                  {settings.autoFailoverEnabled ? null : (
+                    <p className="qdp-note">{t('stickinessNeedsFailover')}</p>
+                  )}
+                </>
+              )}
+              {scope?.resetDeviceCodes === undefined ? null : (
+                <>
+                  <h3 className="qdp-subHeading">{t('deviceResetHeading')}</h3>
+                  <div className="qdp-row">
+                    <div className="qdp-rowText">
+                      <span className="qdp-rowDesc">{t('deviceResetHint')}</span>
+                    </div>
+                    <div className="qdp-rowControl">
+                      <QdpButton
+                        variant="danger"
+                        size="sm"
+                        disabled={resettingDevices}
+                        onClick={() => { void resetDeviceCodes() }}
+                      >
+                        {resettingDevices ? t('deviceResetBusy') : t('deviceResetButton')}
+                      </QdpButton>
+                    </div>
+                  </div>
+                  {deviceResetError === undefined ? null : (
+                    <p className="qdp-error" role="alert">{deviceResetError}</p>
+                  )}
+                  {deviceResetNotice === undefined ? null : (
+                    <p className="qdp-caption" role="status">{deviceResetNotice}</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
     </div>
   )
 }

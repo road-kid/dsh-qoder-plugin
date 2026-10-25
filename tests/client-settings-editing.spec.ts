@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { QoderPluginCard, type QoderPluginCardProps } from '../src/client/QoderPluginCard.tsx'
 import { en } from '../src/client/locales.ts'
 import type { QoderSettingsKey } from '../src/client/locales.ts'
-import { resetQuotaSignIn, resetQuotaStatusDocuments, setQuotaReadout } from '../src/client/quota-settings-store.ts'
+import {
+  resetQuotaSignIn,
+  resetQuotaStatusDocuments,
+  setAdvancedSettingsOpen,
+  setQuotaReadout,
+} from '../src/client/quota-settings-store.ts'
 import { QODER_GLOBAL_STATUS_PATH, QODER_STATUS_PATH } from '../src/status-paths.ts'
 import { QdpNumberField } from '../src/client/controls.tsx'
 import { OwnQuotaSettingsScope } from '../src/client/http-settings-scope.ts'
@@ -71,6 +76,9 @@ describe('Advanced settings editing', () => {
   const request = vi.fn()
 
   beforeEach(() => {
+    // 高级设置 ships with its switch off, so its rows are not in the document
+    // until it is opened. This whole file edits exactly those rows.
+    setAdvancedSettingsOpen(true)
     request.mockReset().mockImplementation(async (url: string) => {
       const path = String(url)
       if (path === QODER_STATUS_PATH) {

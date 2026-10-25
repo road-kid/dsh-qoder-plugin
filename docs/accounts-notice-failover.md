@@ -291,7 +291,7 @@ that names the account would still spend it.
 
 ### Settings that shape a request
 
-Seven Config fields, all under 高级设置, all read through functions of
+The Config fields below, all under 高级设置, all read through functions of
 `current()` — `apply()` mints the transport once and a settings write never
 re-mints it, so a captured value would freeze at whatever the file held at
 startup:
@@ -299,15 +299,17 @@ startup:
 | field | range | default | effect |
 |---|---|---|---|
 | `autoFailoverEnabled` | bool | `true` | `failover.enabled()` |
+| `queueWaitEnabled` | bool | `true` | gates `queueWaitAttempts` to 0 when off |
 | `queueWaitAttempts` | 0..10 | 0 | how many queue windows one request sits out |
 | `queueWaitSeconds` | 1..300 | 30 | fallback window when the upstream names none |
 | `routingStrategy` | `save-order` \| `custom` | `save-order` | walk order source |
 | `routingOrder` | `string[]` | `[]` | account ids, may mix both variants |
+| `stickinessEnabled` | bool | `true` | stickiness master switch |
 | `stickinessRounds` | 0..100 | 3 | completed rounds before the conversation moves on |
 | `stickinessRequests` | 0..10000 | 200 | requests before the conversation moves on |
 | `stickinessMinutes` | 0..1440 | 180 | minutes before the conversation moves on |
 
-All three stickiness bounds must be satisfied to stay put: any one of them
+`stickinessEnabled` must be on and all three stickiness bounds must be satisfied to stay put: any one of them
 reaching zero remaining moves the conversation to the **next account of the
 walk order** on the following request. A round is one chat whose model output
 was consumed to the end, so a request that throws never spends a round.

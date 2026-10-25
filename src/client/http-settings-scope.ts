@@ -14,7 +14,12 @@
  * against, so the card needs no change at all.
  */
 
-import type { QuotaSection, QuotaSettingsScope, QuotaSettingsSnapshot } from './QuotaSettingsCard.tsx'
+import type {
+  QuotaDeviceResetResult,
+  QuotaSection,
+  QuotaSettingsScope,
+  QuotaSettingsSnapshot,
+} from './QuotaSettingsCard.tsx'
 
 /** Base path of the host half's settings face. */
 const ROUTE_BASE = '/plugins/dsh-qoder-plugin'
@@ -274,6 +279,66 @@ export class OwnQuotaSettingsScope implements QuotaSettingsScope<QuotaSection> {
     this.lastFailureIsStaleKey = false
     this.publish()
     return true
+  }
+
+  /**
+   * Give every saved account a new device code.
+   *
+   * Not a settings write: the host rotates a seed file and drops its cached job
+   * tokens, and the answer is a verdict rather than a document, so it is sent to
+   * its own route. A rotated write key (the host plugin reloaded, which re-mints
+   * the key) is healed the same way a settings write is: re-read, then retry
+   * once. Without that the button would look broken until the page reloaded.
+   *
+   * @returns the host's verdict, or a failure carrying a message to show.
+   */
+  async resetDeviceCodes(): Promise<QuotaDeviceResetResult> {
+    const sent = await this.sendReset()
+    if (!sent.stale) return sent.result
+    const refreshed = await this.tryRead()
+    if (refreshed === undefined) return sent.result
+    return (await this.sendReset()).result
+  }
+
+  /** @returns the host's verdict plus whether the key needs a re-read. */
+  private async sendReset(): Promise<{ result: QuotaDeviceResetResult; stale: boolean }> {
+    // The button can be pressed before anything else on the card has read the
+    // settings face (a signed-out account never polls it). Read once here rather
+    // than answering "not loaded yet" to a user who cannot act on that.
+    if (this.document === undefined) await this.tryRead()
+    const key = this.document?.key
+    if (key === undefined) {
+      return { result: { ok: false, error: 'the settings service has not loaded yet' }, stale: false }
+    }
+    try {
+      const response = await fetch(`${ROUTE_BASE}/device-reset`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-Qoder-Settings-Key': key },
+        // The action carries no fields; a body keeps the request a plain POST
+        // that every proxy in front of the host already forwards.
+        body: '{}',
+      })
+      const value: unknown = await response.json().catch(() => undefined)
+      const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+      if (record !== undefined && record['ok'] === true) {
+        const accounts = typeof record['accounts'] === 'number' ? record['accounts'] : undefined
+        return { result: accounts === undefined ? { ok: true } : { ok: true, accounts }, stale: false }
+      }
+      const message = typeof record?.['error'] === 'string' ? record['error'] : `HTTP ${response.status}`
+      // The route was unmounted or re-keyed underneath us, so the refusal says
+      // nothing about the action itself. A 403 is only "re-keyed" when the host
+      // names the key: `request-not-trusted` (a cross-site or non-loopback
+      // caller) will not be fixed by re-reading, and retrying it would spend a
+      // round trip to learn the same thing.
+      const stale = response.status === 401
+        || response.status === 404
+        || response.status === 405
+        || (response.status === 403 && message === 'invalid-settings-key')
+      return { result: { ok: false, error: message }, stale }
+    } catch (error) {
+      return { result: { ok: false, error: describeFailure(error) }, stale: false }
+    }
   }
 
   /** Rebuild the cached snapshot and notify the subscribers. */

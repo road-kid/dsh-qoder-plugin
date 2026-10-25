@@ -1,5 +1,7 @@
 # 设备指纹 / 随机抖动 生效审计
 
+> **状态：已被后续实现取代。** 本文记录的是 `937a8ca` 时刻的审计结论与建议，其中的接线描述（例如 `resolveMachineId: () => getMachineId([qoderMachineIdPath()])`、`Cosy-MachineToken` 未生效）反映的是**当时**的代码。当前实现请以 `src/index.ts`、`src/qoder/transport/device-identity.ts`、`src/qoder/transport/device-seed.ts` 为准；文中行号也不再对应现在的文件。
+
 审计范围：`dsh-qoder-plugin` @ HEAD `937a8ca`。只读审计，未改动任何源码。
 审计方式：源码通读 + 本机实测（跑测试、直接调用导出函数、直接执行客户端 helper）。
 

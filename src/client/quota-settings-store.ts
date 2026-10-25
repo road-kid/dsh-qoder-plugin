@@ -1,18 +1,16 @@
 /**
  * Shared live flags for the quota cards, mirrored from the settings document.
  *
- * The settings scope lives in one place (the quota-settings card binds it),
- * but three surfaces read the derived values: the settings card itself, and
- * the two sidebar quota cards. This module is the meeting point — plain
- * mutable module state plus a revision counter, so React components can
- * subscribe through useSyncExternalStore and re-render when a saved toggle
- * flips, without prop-drilling through slot injections.
+ * The settings scope lives in one place (the plugin's own card binds it), and
+ * the derived values are read by that card and by the composer readout. This
+ * module is the meeting point — plain mutable module state plus a revision
+ * counter, so React components can subscribe through useSyncExternalStore and
+ * re-render when a saved value flips, without prop-drilling through slot
+ * injections.
  *
- * Sign-in state: every surface that polls a status route (the settings card's
- * own lightweight probe, the sidebar cards, the dashboard) reports what it
- * saw through {@link noteQuotaSignIn}. The settings card polls on its own
- * because it must gate its toggles even while both sidebar cards are OFF —
- * the sidebar cards' polls do not run then.
+ * Sign-in state: every surface that polls a status route reports what it saw
+ * through {@link noteQuotaSignIn}, so a variant's grey dot means "the host says
+ * this variant has no PAT" rather than "this surface has not looked yet".
  *
  * The composer-readout switches are different in kind: they are a BROWSER
  * preference persisted in localStorage (see {@link READOUT_STORAGE_KEY}), not
@@ -139,6 +137,63 @@ let readout: QuotaReadoutState = loadQuotaReadout()
 let readoutSnapshot: QuotaReadoutState = { ...readout }
 
 /**
+ * Whether the 高级设置 card is open: ONE browser preference, closed by default.
+ *
+ * Like the readout switch it is a BROWSER preference (see
+ * {@link ADVANCED_STORAGE_KEY}) rather than a settings-file field, because the
+ * switch only decides what the page draws — it is not a value the host acts on.
+ * Closed by default is the point: every row inside already has a working
+ * default, so a user who never opens it gets the same behaviour as before that
+ * card existed.
+ *
+ * Closing it again is purely visual and never writes anything: the tuned values
+ * stay in the settings file, so re-opening the card shows them exactly as they
+ * were left. That is the honest reading of "closed means the defaults" — for
+ * anyone who never opened it, the stored values ARE the defaults.
+ */
+export interface AdvancedSettingsState {
+  open: boolean
+}
+
+/** localStorage key holding the 高级设置 disclosure state. */
+const ADVANCED_STORAGE_KEY = 'dsh-qoder-plugin:advanced'
+
+/** The state used when nothing (or nothing valid) was stored: closed. */
+function defaultAdvancedSettings(): AdvancedSettingsState {
+  return { open: false }
+}
+
+/** Read the disclosure state once; missing/corrupt storage means closed. */
+function loadAdvancedSettings(): AdvancedSettingsState {
+  const storage = browserStorage()
+  if (storage === undefined) return defaultAdvancedSettings()
+  try {
+    const raw = storage.getItem(ADVANCED_STORAGE_KEY)
+    if (raw === null) return defaultAdvancedSettings()
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return defaultAdvancedSettings()
+    const stored = parsed as { open?: unknown }
+    return { open: stored.open === true }
+  } catch {
+    return defaultAdvancedSettings()
+  }
+}
+
+/** Persist the disclosure state; a blocked/full store only costs the preference. */
+function persistAdvancedSettings(state: AdvancedSettingsState): void {
+  const storage = browserStorage()
+  if (storage === undefined) return
+  try {
+    storage.setItem(ADVANCED_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Quota/blocked-storage errors are ignored: memory still carries the state.
+  }
+}
+
+let advanced: AdvancedSettingsState = loadAdvancedSettings()
+let advancedSnapshot: AdvancedSettingsState = { ...advanced }
+
+/**
  * localStorage key holding the last known sign-in fact per variant.
  *
  * The cards' grey dot is only honest when it means "the host says this variant
@@ -182,8 +237,6 @@ function persistQuotaSignIn(): void {
   }
 }
 
-const toggles = { cn: false, global: false }
-let togglesSnapshot: QuotaSignInState = { cn: false, global: false }
 const signIn: QuotaSignInState = loadQuotaSignIn()
 let signInSnapshot: QuotaSignInState = { ...signIn }
 let revision = 0
@@ -207,21 +260,6 @@ export function quotaPollMs(): number {
   return pollIntervalMs
 }
 
-/** Update both sidebar toggles (from the settings document). */
-export function setQuotaToggles(cn: boolean, global: boolean): void {
-  if (toggles.cn !== cn || toggles.global !== global) {
-    toggles.cn = cn
-    toggles.global = global
-    togglesSnapshot = { ...toggles }
-    bump()
-  }
-}
-
-/** Read the current toggles. */
-export function quotaToggles(): QuotaSignInState {
-  return togglesSnapshot
-}
-
 /**
  * Update the composer-readout switch.
  *
@@ -241,6 +279,43 @@ export function setQuotaReadout(enabled: boolean): void {
 /** Read the composer-readout switch. */
 export function quotaReadout(): QuotaReadoutState {
   return readoutSnapshot
+}
+
+/**
+ * Open or close the 高级设置 card.
+ *
+ * This is a CLIENT-SIDE preference (see {@link ADVANCED_STORAGE_KEY}): it
+ * persists to localStorage and bumps the revision so the card re-renders. It
+ * never touches the settings document, so closing the card cannot change how a
+ * request is served — the rows simply stop being drawn.
+ */
+export function setAdvancedSettingsOpen(open: boolean): void {
+  if (advanced.open !== open) {
+    advanced = { open }
+    advancedSnapshot = { ...advanced }
+    persistAdvancedSettings(advanced)
+    bump()
+  }
+}
+
+/** Read the 高级设置 disclosure state. */
+export function advancedSettings(): AdvancedSettingsState {
+  return advancedSnapshot
+}
+
+/**
+ * Put the disclosure back to its shipped default (closed).
+ *
+ * Test isolation uses this; production has no reason to — the stored
+ * preference is the user's own, and the default only applies before the first
+ * toggle.
+ */
+export function resetAdvancedSettings(): void {
+  if (advanced.open === false) return
+  advanced = defaultAdvancedSettings()
+  advancedSnapshot = { ...advanced }
+  persistAdvancedSettings(advanced)
+  bump()
 }
 
 /** Record a variant's sign-in state from any successful status poll. */

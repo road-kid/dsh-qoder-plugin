@@ -65,8 +65,17 @@ interface HintTarget {
   readonly session: HintSession
 }
 
+/**
+ * The install-time context, read only for its session store — structurally, so
+ * the module keeps compiling against a host that types no such service.
+ */
+interface HintContext {
+  readonly sessions?: HintSessions
+  readonly get?: (name: string, strict?: boolean) => unknown
+}
+
 /** The context captured at install time, for its session store. */
-let installed: { sessions?: HintSessions } | undefined
+let installed: HintContext | undefined
 
 /** Refresh time per agent id, so a later read can name when it happened. */
 const lastRefreshAt = new Map<string, number>()
@@ -91,6 +100,33 @@ const turnByAgent = new Map<string, number>()
 const lastNoticeByAgent = new Map<string, { turn: number; text: string }>()
 
 /**
+ * How many agent ids the per-agent bookkeeping above remembers at most.
+ *
+ * Nothing removes an entry when a conversation ends, so without a bound these
+ * maps grow for the life of the process — one entry per agent id ever seen,
+ * which a long-lived host with many conversations reaches. The cap is far above
+ * any plausible number of live conversations; eviction only costs an evicted
+ * agent its de-duplication (one notice may print twice) and its remembered
+ * refresh time.
+ */
+const AGENT_MEMORY_LIMIT = 256
+
+/**
+ * Record one per-agent fact, keeping the map bounded and in recency order.
+ *
+ * Re-inserting moves the key to the end, so the map's insertion order is also
+ * its recency order and evicting the first key evicts the least recently
+ * updated agent.
+ */
+function remember<T>(map: Map<string, T>, agentId: string, value: T): void {
+  map.delete(agentId)
+  map.set(agentId, value)
+  if (map.size <= AGENT_MEMORY_LIMIT) return
+  const oldest = map.keys().next().value
+  if (oldest !== undefined) map.delete(oldest)
+}
+
+/**
  * Start tracking which agent is running, and keep the session store reachable.
  *
  * `agent/status` is a plain `emit` event: a listener that returns nothing
@@ -107,15 +143,76 @@ const lastNoticeByAgent = new Map<string, { turn: number; text: string }>()
 export function installJobTokenHint(ctx: Context): void {
   // Read the store structurally rather than through its service types: this
   // module must keep working on a host that composes no session store at all
-  // (and on the bare contexts the tests build), where it is simply absent.
-  installed = ctx as unknown as { sessions?: HintSessions }
+  // (and on the bare contexts the tests build). It is NOT simply absent on a
+  // real host though — a Cordis context is a proxy that THROWS on a service
+  // property it was not injected with, which is why every read goes through
+  // `sessionStore()` and never through `ctx.sessions` directly.
+  installed = ctx as unknown as HintContext
   ctx.on('agent/status' as never, ((payload: { agent?: HintAgent, status?: string }) => {
     if (payload.status === 'running' && payload.agent !== undefined) {
       lastRunningAgent = payload.agent
       turnSeq += 1
-      turnByAgent.set(String(payload.agent.id), turnSeq)
+      remember(turnByAgent, String(payload.agent.id), turnSeq)
     }
   }) as never)
+}
+
+/**
+ * The session store, or `undefined` when this host has none.
+ *
+ * The two ways to read it, in order, and why neither may be a bare property
+ * read on the install-time context:
+ *
+ * 1. **The soft lookup `ctx.get`.** On a real host `ctx.sessions` is a service
+ *    property, and Cordis throws `cannot get property "sessions" without
+ *    inject` when the plugin's `inject` list does not name it. This module
+ *    deliberately declares nothing — the store is optional diagnostics
+ *    plumbing, not a reason to withhold the plugin until a service appears —
+ *    so the mixed-in `ctx.get(name, false)` is the way to ask for it: it walks
+ *    the same service table and answers `undefined` instead of throwing. The
+ *    `false` is the non-strict flag, which also accepts a store whose own
+ *    fiber is not active right now.
+ * 2. **The plain property.** Test contexts (and any host that hands a bare
+ *    object) provide `sessions` as an ordinary field, with no proxy in the
+ *    way. On a real Cordis context this read is exactly the one that throws,
+ *    so it stays wrapped.
+ *
+ * Either read can throw for a reason of its own (a host without a reflection
+ * layer, a getter that rejects), and a diagnostics line is never worth a
+ * request: a store that cannot be read is a store this host does not have.
+ */
+function sessionStore(): HintSessions | undefined {
+  const ctx = installed
+  if (ctx === undefined) return undefined
+  try {
+    const store = ctx.get?.('sessions', false)
+    if (store !== undefined && store !== null) return store as HintSessions
+  } catch {
+    // No reflection layer: fall through to the structural read.
+  }
+  try {
+    const direct = ctx.sessions
+    if (direct !== undefined && direct !== null) return direct as HintSessions
+  } catch {
+    // The Cordis proxy vetoing an undeclared service: absent, not fatal.
+  }
+  return undefined
+}
+
+/**
+ * The stored session for one id, or `undefined` when it is not in the store.
+ *
+ * `get` belongs to the host's store implementation, so it can throw as well;
+ * a miss is the same outcome as a store that is not there.
+ */
+function storedSession(sessionId: string): HintSession | undefined {
+  const store = sessionStore()
+  if (store === undefined) return undefined
+  try {
+    return store.get(sessionId)
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -147,7 +244,7 @@ function resolveTarget(sessionId: string | undefined): HintTarget | undefined {
     const agent = lastRunningAgent
     return agent?.session === undefined ? undefined : { id: String(agent.id), session: agent.session }
   }
-  const stored = installed?.sessions?.get(sessionId)
+  const stored = storedSession(sessionId)
   if (stored !== undefined) return { id: sessionId, session: stored }
   const agent = lastRunningAgent
   if (agent?.session !== undefined && String(agent.id) === sessionId) {
@@ -168,10 +265,20 @@ function resolveTarget(sessionId: string | undefined): HintTarget | undefined {
  *   {@link resolveTarget}.
  */
 export function emitJobTokenHint(at: number, text: string, sessionId?: string): void {
-  const target = resolveTarget(sessionId)
-  if (target === undefined) return
-  lastRefreshAt.set(target.id, at)
-  appendHintRow(target.session, 'success', text)
+  // Everything in this module runs on the request path (a heal or a queue
+  // answer is reported from inside the failing request), so the public entry
+  // points swallow their own failures: a diagnostics row may be lost, but it
+  // may never turn a recovered request into a failed one. That is exactly the
+  // shape of the bug this guard closes — an unguarded service read threw out
+  // of here and surfaced as an `(http 502)` upstream error.
+  try {
+    const target = resolveTarget(sessionId)
+    if (target === undefined) return
+    remember(lastRefreshAt, target.id, at)
+    appendHintRow(target.session, 'success', text)
+  } catch {
+    // Diagnostics-grade: the heal already happened, the row is a courtesy.
+  }
 }
 
 /**
@@ -192,9 +299,14 @@ export function emitJobTokenHint(at: number, text: string, sessionId?: string): 
  *   {@link resolveTarget}.
  */
 export function emitJobTokenRefreshFailedHint(at: number, text: string, sessionId?: string): void {
-  const target = resolveTarget(sessionId)
-  if (target === undefined) return
-  appendHintRow(target.session, 'error', text)
+  try {
+    const target = resolveTarget(sessionId)
+    if (target === undefined) return
+    appendHintRow(target.session, 'error', text)
+  } catch {
+    // See emitJobTokenHint: the failure this row describes has already been
+    // reported by the error the request returns.
+  }
 }
 
 /**
@@ -222,17 +334,23 @@ export function emitJobTokenRefreshFailedHint(at: number, text: string, sessionI
  */
 export function emitUpstreamNotice(text: string, sessionId?: string): void {
   if (text === '') return
-  const target = resolveTarget(sessionId)
-  if (target === undefined) return
-  const id = target.id
-  const turn = turnByAgent.get(id) ?? 0
-  const printed = lastNoticeByAgent.get(id)
-  if (printed !== undefined && printed.turn === turn && printed.text === text) return
-  // Recorded before the append, which swallows its own failures: a row that
-  // could not be written must not be retried by a later identical attempt in
-  // the same turn.
-  lastNoticeByAgent.set(id, { turn, text })
-  appendHintRow(target.session, 'error', text)
+  try {
+    const target = resolveTarget(sessionId)
+    if (target === undefined) return
+    const id = target.id
+    const turn = turnByAgent.get(id) ?? 0
+    const printed = lastNoticeByAgent.get(id)
+    if (printed !== undefined && printed.turn === turn && printed.text === text) return
+    // Recorded before the append, which swallows its own failures: a row that
+    // could not be written must not be retried by a later identical attempt in
+    // the same turn.
+    remember(lastNoticeByAgent, id, { turn, text })
+    appendHintRow(target.session, 'error', text)
+  } catch {
+    // See emitJobTokenHint. This one is the sharpest: it runs while the
+    // upstream is already refusing requests, so a throw here replaced the
+    // upstream's real answer with an error about a diagnostics line.
+  }
 }
 
 /** Append one log-only command pair carrying `text` as its outcome. */

@@ -52,6 +52,17 @@ export const QODER_GLOBAL_PROBE_PATH = '/plugins/dsh-qoder-plugin/global/probe'
 export const QODER_GLOBAL_AUTH_PATH = '/plugins/dsh-qoder-plugin/global/auth'
 
 /**
+ * Plugin-owned device-code reset endpoint.
+ *
+ * One POST rotates the host-level device seed and drops every cached job token,
+ * which is what makes each saved account present a new `Cosy-Machineid` /
+ * `Cosy-Machinehostname` on its next request. A write (it changes what every
+ * account claims to be), so it carries the same loopback Host/Origin guard and
+ * the in-process settings key as the other control routes.
+ */
+export const QODER_DEVICE_RESET_PATH = '/plugins/dsh-qoder-plugin/device-reset'
+
+/**
  * One action the PAT route accepts.
  *
  * `save-pat` validates the pasted token against the variant's region and, only

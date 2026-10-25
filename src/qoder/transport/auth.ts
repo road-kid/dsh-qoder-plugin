@@ -4,7 +4,7 @@ import type { CosyCredentials } from './wire/cosy.ts'
 import { getQoderExchangeUrl, getQoderUserInfoUrl, type QoderRegion } from './endpoints.ts'
 import { QoderLlmError } from '../errors.ts'
 import type { QoderLogger } from './logging.ts'
-import { deriveMachineHostname, deriveMachineId } from './device-identity.ts'
+import { deriveMachineHostname, deriveMachineId, machineIdSalt } from './device-identity.ts'
 import { getMachineId } from './machine-id.ts'
 import {
   opaqueCredentialKey,
@@ -38,6 +38,15 @@ export interface QoderAuthServiceOptions {
   fetch?: typeof fetch | undefined
   timeoutMs?: number | undefined
   resolveMachineId?: (() => string) | undefined
+  /**
+   * The host-level seed that perturbs this account's derived device id.
+   *
+   * Read once per credential mint, not per request: the seed only changes when
+   * the user resets the device codes, and that path clears this service's cache
+   * so the next mint sees the new value. A provider rather than a string
+   * because the seed lives on disk and may legitimately be absent.
+   */
+  resolveDeviceSeed?: (() => string | undefined) | undefined
   region?: QoderRegion | undefined
   logger?: QoderLogger | undefined
 }
@@ -74,12 +83,14 @@ export class QoderAuthService {
   private readonly fetchImpl: typeof fetch
   private readonly timeoutMs: number
   private readonly resolveMachineId: () => string
+  private readonly resolveDeviceSeed: () => string | undefined
   private readonly region: QoderRegion
   private readonly logger: QoderLogger | undefined
   constructor(options: QoderAuthServiceOptions = {}) {
     this.fetchImpl = options.fetch ?? globalThis.fetch
     this.timeoutMs = options.timeoutMs ?? defaultAuthTimeoutMs
     this.resolveMachineId = options.resolveMachineId ?? getMachineId
+    this.resolveDeviceSeed = options.resolveDeviceSeed ?? ((): undefined => undefined)
     this.region = options.region ?? 'global'
     this.logger = options.logger
   }
@@ -221,7 +232,11 @@ export class QoderAuthService {
      * `fetchUserInfo` already rejects an empty id, so the derivation is always
      * possible; the fallback covers a future upstream that answers without one
      * rather than inventing a device for no account.
+     *
+     * The seed is read ONCE per mint and folded into both derivations, so the
+     * two headers of one credential always belong to the same reset epoch.
      */
+    const deviceSeed = this.resolveDeviceSeed()
     const creds: CosyCredentials = {
       userID: userInfo.userID,
       authToken: jobToken,
@@ -230,8 +245,8 @@ export class QoderAuthService {
       machineID: this.resolveMachineId(),
       ...userInfo.userID
         ? {
-            derivedMachineID: deriveMachineId(userInfo.userID),
-            machineHostname: deriveMachineHostname(userInfo.userID),
+            derivedMachineID: deriveMachineId(userInfo.userID, machineIdSalt, deviceSeed),
+            machineHostname: deriveMachineHostname(userInfo.userID, deviceSeed),
           }
         : {},
     }

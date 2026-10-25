@@ -10,7 +10,12 @@ import {
 import { ModelsPane } from '../src/client/ModelsPane.tsx'
 import { en } from '../src/client/locales.ts'
 import { noteQuotaStatus, quotaReadout, setQuotaReadout } from '../src/client/quota-settings-store.ts'
-import { resetQuotaSignIn, resetQuotaStatusDocuments } from '../src/client/quota-settings-store.ts'
+import {
+  resetAdvancedSettings,
+  resetQuotaSignIn,
+  resetQuotaStatusDocuments,
+  setAdvancedSettingsOpen,
+} from '../src/client/quota-settings-store.ts'
 import type { QoderWebStatus } from '../src/status-paths.ts'
 
 /**
@@ -87,6 +92,10 @@ describe('Qoder plugin card', () => {
 
   beforeEach(() => {
     signedIn()
+    // 高级设置 ships with its switch off, so its rows are not in the document
+    // at all. Most cases below are about those rows, so open it up front; the
+    // one case that cares about the shipped default resets it explicitly.
+    setAdvancedSettingsOpen(true)
     statusFails = false
     holdPosts = false
     posts.length = 0
@@ -149,12 +158,15 @@ describe('Qoder plugin card', () => {
 
   interface SettingsSeed {
     autoCheckInCN?: boolean
+    autoCheckInGlobal?: boolean
     quotaPollMs?: number
     autoFailoverEnabled?: boolean
+    queueWaitEnabled?: boolean
     queueWaitAttempts?: number
     queueWaitSeconds?: number
     routingStrategy?: 'save-order' | 'custom'
     routingOrder?: readonly string[]
+    stickinessEnabled?: boolean
     stickinessRounds?: number
     stickinessRequests?: number
     stickinessMinutes?: number
@@ -211,6 +223,16 @@ describe('Qoder plugin card', () => {
     .findAll(node => node.props.className === 'qdp-sectionTitle')
     .map(node => node.children.join(''))
   const sectionCount = (): number => view!.root.findAll(node => node.props.className === 'qdp-card').length
+  /**
+   * The 高级设置 card: the section whose subtree carries the disclosure switch.
+   *
+   * Found by the switch's accessible name rather than by position, so the case
+   * that resets the switch to its shipped state still finds the card it is
+   * about (the switch exists whether the rows do or not).
+   */
+  const advancedCard = () => view!.root
+    .findAll(node => node.props.className === 'qdp-card')
+    .find(node => node.findAll(child => child.props['aria-label'] === en.quotaSectionAdvanced).length > 0)
   const rendered = (): string => JSON.stringify(view!.toJSON())
 
   const buttons = () => view!.root.findAllByType('button')
@@ -254,23 +276,26 @@ describe('Qoder plugin card', () => {
 
   it('renders the signed-in page as exactly three cards, in contract order', async () => {
     await mount()
+    // No settings face is bound, so 高级设置 has nothing to reveal and is not
+    // drawn: an empty card is worse than no card.
     expect(sectionCount()).toBe(3)
     expect(titles()).toEqual([
       en.accountHeading,
       en.paneModels,
-      en.quotaSectionAdvanced,
+      en.quotaSectionSettings,
     ])
+    expect(titles()).not.toContain(en.quotaSectionAdvanced)
     // The 可用额度 card is gone: the composer chip owns the quota readout now.
     expect(rendered()).not.toContain(en.creditsHeading)
   })
 
-  it('keeps only the account and advanced cards while signed out', async () => {
+  it('keeps only the account and settings cards while signed out', async () => {
     signedOut()
     await mount()
     // Check-in and model preferences belong to an account nobody is signed
     // into; the PAT entry is the only action such a page can offer.
     expect(sectionCount()).toBe(2)
-    expect(titles()).toEqual([en.accountHeading, en.quotaSectionAdvanced])
+    expect(titles()).toEqual([en.accountHeading, en.quotaSectionSettings])
     expect(patInputs()).toHaveLength(1)
   })
 
@@ -284,8 +309,8 @@ describe('Qoder plugin card', () => {
     // The checkbox pair lives in the unified header's segmented switcher.
     await mountWithSettings(fakeSettingsScope(), undefined, true)
     // These rows are configuration, not account state: a signed-out page keeps
-    // 账号 + 高级设置 and still reflects the stored values.
-    expect(titles()).toEqual([en.accountHeading, en.quotaSectionAdvanced])
+    // 账号 + 设置 + 高级设置 and still reflects the stored values.
+    expect(titles()).toEqual([en.accountHeading, en.quotaSectionSettings, en.quotaSectionAdvanced])
     const tree = rendered()
     expect(tree).toContain(en.quotaReadoutEnabledLabel)
     expect(tree).toContain(en.quotaReadoutEnabledDesc)
@@ -1192,6 +1217,262 @@ describe('Qoder plugin card', () => {
     expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('3')
     expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('200')
     expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('180')
+  })
+
+  // ---- advanced card: master switches own their sub-menus --------------------
+
+  /**
+   * A sub-menu is a promise: the switch above it governs the rows below it.
+   *
+   * Each case here pins one such promise, because the failure mode is silent —
+   * a bound rendered under a switch that is off invites the user to tune a
+   * number the transport never reads.
+   */
+
+  it('hides the queue bounds behind the queue-retry switch and writes it', async () => {
+    const scope = fakeSettingsScope({ queueWaitEnabled: false, queueWaitAttempts: 3 })
+    await mountWithSettings(scope)
+    const labels = inputs().map(node => String(node.props['aria-label']))
+    expect(labels).not.toContain(en.queueWaitAttemptsLabel)
+    expect(labels).not.toContain(en.queueWaitSecondsLabel)
+    // The switch itself stays: it is how the user gets the bounds back.
+    expect(switchFor(en.queueWaitEnabledLabel)?.props['aria-checked']).toBe(false)
+    await flip(en.queueWaitEnabledLabel)
+    expect(scope.set).toHaveBeenCalledWith('queueWaitEnabled', true)
+  })
+
+  it('shows the queue bounds when the queue-retry switch is on', async () => {
+    const scope = fakeSettingsScope({ queueWaitEnabled: true, queueWaitAttempts: 3 })
+    await mountWithSettings(scope)
+    expect(inputFor(en.queueWaitAttemptsLabel).props.value).toBe('3')
+    expect(switchFor(en.queueWaitEnabledLabel)?.props['aria-checked']).toBe(true)
+  })
+
+  it('hides routing behind the automatic account switch and flags stickiness as inert', async () => {
+    // Switching off means the transport never walks to another account, so a
+    // routing order could not take effect if it stayed. Stickiness no longer
+    // lives under that switch — it moved to 高级设置 — so it stays on screen
+    // with a line saying it cannot act, which is the honest version of hiding.
+    const scope = fakeSettingsScope({ autoFailoverEnabled: false })
+    await mountWithSettings(scope)
+    expect(view!.root.findAllByType('select')).toHaveLength(0)
+    expect(switchFor(en.stickinessLabel)?.props['aria-checked']).toBe(true)
+    // The rendered JSON escapes the quotes in the copy, so match the stem.
+    expect(rendered()).toContain('Takes effect only while')
+    // The switch that owns the routing rows is still there, so the group is
+    // reachable.
+    expect(switchFor(en.autoFailoverLabel)?.props['aria-checked']).toBe(false)
+  })
+
+  it('shows routing while the automatic account switch is on, without the caveat', async () => {
+    const scope = fakeSettingsScope({ autoFailoverEnabled: true })
+    await mountWithSettings(scope)
+    expect(view!.root.findAllByType('select')).toHaveLength(1)
+    expect(switchFor(en.stickinessLabel)?.props['aria-checked']).toBe(true)
+    expect(rendered()).not.toContain('Takes effect only while')
+  })
+
+  it('labels the stickiness bounds once, not once per row', async () => {
+    // The bounds used to repeat the switch's own heading above the three
+    // numbers, so the same title appeared twice in one screen.
+    const scope = fakeSettingsScope()
+    await mountWithSettings(scope)
+    const headings = view!.root
+      .findAll(node => node.props.className === 'qdp-rowTitle')
+      .map(node => node.children.join(''))
+      .filter(text => text === en.stickinessLabel)
+    expect(headings).toHaveLength(1)
+  })
+
+  it('hides the check-in time until automatic check-in is on', async () => {
+    const scope = fakeSettingsScope({ autoCheckInCN: false })
+    await mountWithSettings(scope)
+    const parts = (): string[] => inputs().map(node => String(node.props['aria-label']))
+    expect(parts().some(label => label.startsWith(en.checkInTime))).toBe(false)
+  })
+
+  it('shows the check-in time once automatic check-in is on', async () => {
+    const scope = fakeSettingsScope({ autoCheckInCN: true })
+    await mountWithSettings(scope)
+    const parts = inputs().map(node => String(node.props['aria-label']))
+    expect(parts).toContain(`${en.checkInTime} — hour`)
+    expect(parts).toContain(`${en.checkInTime} — minute`)
+  })
+
+  it('closes the check-in time with THIS variant even when the other is armed', async () => {
+    // The moment is one shared field, but the row follows the switch on screen:
+    // turning 自动签到 off must close the row the user is looking at, even while
+    // the other variant's scheduler is still armed. Otherwise the card answers
+    // "off" with a control that stays put.
+    const scope = fakeSettingsScope({ autoCheckInCN: false, autoCheckInGlobal: true })
+    await mountWithSettings(scope)
+    const parts = (): string[] => inputs().map(node => String(node.props['aria-label']))
+    expect(parts().some(label => label.startsWith(en.checkInTime))).toBe(false)
+  })
+
+  it('hides the poll interval while the composer readout is off', async () => {
+    // The interval refreshes the composer label; with the label hidden there is
+    // nothing on screen for it to refresh.
+    setQuotaReadout(false)
+    const scope = fakeSettingsScope()
+    await mountWithSettings(scope)
+    const labels = inputs().map(node => String(node.props['aria-label']))
+    expect(labels).not.toContain(en.quotaPollLabel)
+    // The readout switch is a card-owned preference, not a settings write.
+    expect(switchFor(en.quotaReadoutEnabledLabel)?.props['aria-checked']).toBe(false)
+  })
+
+  it('shows the poll interval while the composer readout is on', async () => {
+    setQuotaReadout(true)
+    const scope = fakeSettingsScope()
+    await mountWithSettings(scope)
+    expect(inputFor(en.quotaPollLabel)).toBeDefined()
+  })
+
+  // ---- advanced card: what waits behind the switch ---------------------------
+
+  /**
+   * 设置 keeps the policy a request meets day to day; queueing and stickiness
+   * are tuning, and live behind a switch in 高级设置 with the device codes.
+   *
+   * The split is by question, not by importance: 设置 answers "which account
+   * may answer, and how is the page read", 高级设置 answers "how is a retry
+   * waited out, and how long does a conversation stay put".
+   */
+  it('puts queueing and stickiness in the advanced card, below the settings card', async () => {
+    const scope = fakeSettingsScope({ queueWaitEnabled: true, autoFailoverEnabled: true })
+    await mountWithSettings(scope)
+    const tree = rendered()
+    const queue = tree.indexOf(en.queueWaitEnabledLabel)
+    const failover = tree.indexOf(en.autoFailoverLabel)
+    expect(queue).toBeGreaterThanOrEqual(0)
+    expect(failover).toBeGreaterThanOrEqual(0)
+    expect(queue).toBeGreaterThan(failover)
+
+    // Membership, not order: the card is a real subtree, so ask it. Its switch
+    // is the only control-role node whose name is the card's own title.
+    const advanced = advancedCard()
+    expect(advanced).toBeDefined()
+    const inside = (label: string): boolean =>
+      advanced!.findAll(node => node.props['aria-label'] === label).length > 0
+    expect(inside(en.queueWaitEnabledLabel)).toBe(true)
+    expect(inside(en.stickinessLabel)).toBe(true)
+    expect(inside(en.autoFailoverLabel)).toBe(false)
+  })
+
+  it('keeps the advanced rows hidden until its switch is on, and shows them once it is', async () => {
+    // The shipped state is off, which is the whole point: every row behind it
+    // has a working default, so a user who never turns the switch on gets the
+    // defaults. `beforeEach` opens it for the other cases, so reset it here.
+    resetAdvancedSettings()
+    const scope = fakeSettingsScope({ queueWaitEnabled: true })
+    await mountWithSettings(scope)
+
+    expect(switchFor(en.quotaSectionAdvanced)?.props['aria-checked']).toBe(false)
+    expect(rendered()).not.toContain(en.queueWaitEnabledLabel)
+    expect(rendered()).not.toContain(en.stickinessLabel)
+    // The card is still there: the switch is how it gets opened.
+    expect(advancedCard()).toBeDefined()
+
+    await flip(en.quotaSectionAdvanced)
+    expect(switchFor(en.quotaSectionAdvanced)?.props['aria-checked']).toBe(true)
+    expect(switchFor(en.queueWaitEnabledLabel)).toBeDefined()
+
+    // Closing it again hides the rows and writes nothing to the settings file.
+    const writes = scope.set.mock.calls.length
+    await flip(en.quotaSectionAdvanced)
+    expect(rendered()).not.toContain(en.queueWaitEnabledLabel)
+    expect(scope.set.mock.calls.length).toBe(writes)
+  })
+
+  it('keeps the queue switch reachable while the automatic switch is off', async () => {
+    // The two are independent: hiding the queue switch behind the switching
+    // switch would make "retry in place, never move accounts" unreachable.
+    const scope = fakeSettingsScope({ queueWaitEnabled: true, autoFailoverEnabled: false })
+    await mountWithSettings(scope)
+    expect(switchFor(en.queueWaitEnabledLabel)?.props['aria-checked']).toBe(true)
+    expect(inputFor(en.queueWaitAttemptsLabel)).toBeDefined()
+  })
+
+  // ---- advanced card: the device-code reset ---------------------------------
+
+  /**
+   * The reset is the one control that changes nothing on screen.
+   *
+   * What the card owes the user is: the button appears only when the host can
+   * honour it, it reports how many accounts it re-identified, and a refusal is
+   * shown where the button is rather than swallowed.
+   */
+  it('renders no device reset section when the host serves no reset route', async () => {
+    const scope = fakeSettingsScope()
+    await mountWithSettings(scope)
+    expect(rendered()).not.toContain(en.deviceResetHeading)
+    expect(buttonLabels()).not.toContain(en.deviceResetButton)
+  })
+
+  it('resets the device codes and reports how many accounts moved', async () => {
+    const scope = { ...fakeSettingsScope(), resetDeviceCodes: vi.fn(async () => ({ ok: true, accounts: 2 })) }
+    await mountWithSettings(scope)
+    // The device block is a heading INSIDE the folded card, not a card of its
+    // own: one disclosure holds all three tuning groups.
+    expect(titles()).not.toContain(en.deviceResetHeading)
+    expect(rendered()).toContain(en.deviceResetHeading)
+    await press(en.deviceResetButton)
+    expect(scope.resetDeviceCodes).toHaveBeenCalledTimes(1)
+    expect(rendered()).toContain(t('deviceResetDone', { count: 2 }))
+  })
+
+  it('reports a refused reset instead of looking like it worked', async () => {
+    const scope = {
+      ...fakeSettingsScope(),
+      resetDeviceCodes: vi.fn(async () => ({ ok: false, error: 'EACCES: permission denied' })),
+    }
+    await mountWithSettings(scope)
+    await press(en.deviceResetButton)
+    expect(rendered()).toContain(t('deviceResetFailed', { message: 'EACCES: permission denied' }))
+    // The message itself reaches the screen, not just the template around it.
+    expect(rendered()).toContain('EACCES: permission denied')
+    expect(rendered()).not.toContain(en.deviceResetDoneBare)
+  })
+
+  it('reports a thrown reset as a failure with its message', async () => {
+    const scope = {
+      ...fakeSettingsScope(),
+      resetDeviceCodes: vi.fn(async () => { throw new Error('host went away') }),
+    }
+    await mountWithSettings(scope)
+    await press(en.deviceResetButton)
+    expect(rendered()).toContain(t('deviceResetFailed', { message: 'host went away' }))
+  })
+
+  /**
+   * The real scope is a class, so its reset is a PROTOTYPE method that reads
+   * `this.document`. A card that pulls the function out and calls it bare works
+   * against every arrow-function stub above and throws on the first real click,
+   * so this case is the one that keeps the call bound to the scope.
+   */
+  it('calls the reset on the scope, so a method that reads `this` still works', async () => {
+    const inner = fakeSettingsScope()
+    const calls: string[] = []
+    class ClassScope {
+      readonly resets: string[] = []
+      getSnapshot = (): ReturnType<typeof inner.getSnapshot> => inner.getSnapshot()
+      subscribe = (): (() => void) => inner.subscribe()
+      set = inner.set
+      async resetDeviceCodes(): Promise<{ ok: boolean; accounts?: number }> {
+        // The failure this guards against is `this` being undefined here.
+        this.resets.push('reset')
+        calls.push('reset')
+        return { ok: true, accounts: 4 }
+      }
+    }
+    const scope = new ClassScope()
+    await mountWithSettings(scope as unknown as SettingsScope)
+    await press(en.deviceResetButton)
+    expect(calls).toEqual(['reset'])
+    expect(scope.resets).toEqual(['reset'])
+    expect(rendered()).toContain(t('deviceResetDone', { count: 4 }))
+    expect(rendered()).not.toContain(en.deviceResetFailed.slice(0, 8))
   })
 
   // ---- advanced card: the mixed-variant warning ------------------------------

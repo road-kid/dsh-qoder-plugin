@@ -262,3 +262,56 @@ test('QoderAuthService keeps a shared heal exchange alive when one healer aborts
   const cached = await service.getCredentials('pt-survivor')
   assert.equal(cached.authToken, 'jt-survivor')
 })
+
+test('QoderAuthService mints the device id from the seed it is given', async () => {
+  // The reset control's whole mechanism: the seed is read at mint time, so
+  // rotating it and dropping the cache is all it takes to change the
+  // fingerprint an account presents.
+  const fetchMock = async (input: URL | Request): Promise<Response> => {
+    if (String(input).includes('/jobToken/exchange')) {
+      return new Response(JSON.stringify({ token: 'jt-seeded', expires_in: 3_600_000 }))
+    }
+    return new Response(JSON.stringify({ id: 'user-seeded' }))
+  }
+  let seed: string | undefined = 'seed-a'
+  const service = new QoderAuthService({
+    fetch: fetchMock as typeof fetch,
+    resolveMachineId: () => 'machine-test',
+    resolveDeviceSeed: () => seed,
+  })
+
+  const first = await service.getCredentials('pt-seeded')
+  assert.equal(first.derivedMachineID, deriveMachineId('user-seeded', undefined, 'seed-a'))
+  assert.equal(first.machineHostname, deriveMachineHostname('user-seeded', 'seed-a'))
+  // Not the unseeded derivation, and not the shared host id.
+  assert.notEqual(first.derivedMachineID, deriveMachineId('user-seeded'))
+  assert.notEqual(first.derivedMachineID, 'machine-test')
+
+  // Rotate: the cached credential still holds the old id (nothing re-derives on
+  // its own) — that is exactly why the reset also clears the cache.
+  seed = 'seed-b'
+  const cached = await service.getCredentials('pt-seeded')
+  assert.equal(cached, first)
+  service.clear()
+  const reminted = await service.getCredentials('pt-seeded')
+  assert.equal(reminted.derivedMachineID, deriveMachineId('user-seeded', undefined, 'seed-b'))
+  assert.notEqual(reminted.derivedMachineID, first.derivedMachineID)
+  // Same device hostname epoch: both headers move together.
+  assert.equal(reminted.machineHostname, deriveMachineHostname('user-seeded', 'seed-b'))
+})
+
+test('QoderAuthService without a seed resolver derives exactly as before', async () => {
+  const fetchMock = async (input: URL | Request): Promise<Response> => {
+    if (String(input).includes('/jobToken/exchange')) {
+      return new Response(JSON.stringify({ token: 'jt-plain', expires_in: 3_600_000 }))
+    }
+    return new Response(JSON.stringify({ id: 'user-plain' }))
+  }
+  const service = new QoderAuthService({
+    fetch: fetchMock as typeof fetch,
+    resolveMachineId: () => 'machine-test',
+  })
+  const credentials = await service.getCredentials('pt-plain')
+  assert.equal(credentials.derivedMachineID, deriveMachineId('user-plain'))
+  assert.equal(credentials.machineHostname, deriveMachineHostname('user-plain'))
+})

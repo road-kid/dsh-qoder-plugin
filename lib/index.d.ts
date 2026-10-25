@@ -990,6 +990,17 @@ interface QoderTransport {
     minIntervalMs?: number | undefined;
   }): Promise<QoderAccountInfo>;
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>;
+  /**
+   * Drop every cached job token, so the next request re-derives its device id.
+   *
+   * Called after the host rotates the device seed: the per-account
+   * `Cosy-Machineid`/`Cosy-Machinehostname` are minted during the token exchange
+   * and cached with it, so this is the only way an already-signed-in account can
+   * pick up a new fingerprint. Optional so a host or a test double that does not
+   * model device identity stays a valid transport; the host reports the reset as
+   * failed rather than pretending when it is missing.
+   */
+  resetDeviceIdentity?(): void;
 }
 /**
  * One account the pool can hand to the transport.
@@ -1968,9 +1979,15 @@ interface Config {
   variantEnabledCN?: boolean;
   /** The global variant's master switch; see {@link Config.variantEnabledCN}. */
   variantEnabledGlobal?: boolean;
-  /** Show the China variant's sidebar quota card. */
+  /**
+   * Legacy sidebar-quota toggle, kept so older settings files still parse.
+   *
+   * The sidebar card was removed in 0.4.0 and the composer readout replaced it,
+   * so this field has no effect. It stays declared because dropping a field from
+   * the schema would make an existing file's value unreadable rather than inert.
+   */
   sidebarQuotaCN?: boolean;
-  /** Show the global variant's sidebar quota card. */
+  /** Legacy global-variant sidebar toggle; see {@link Config.sidebarQuotaCN}. */
   sidebarQuotaGlobal?: boolean;
   /** Automatically check in daily at 10:00 (UTC+8) to claim credits for China variant. */
   autoCheckInCN?: boolean;
@@ -1998,6 +2015,16 @@ interface Config {
    * behaviour off without deleting accounts.
    */
   autoFailoverEnabled?: boolean;
+  /**
+   * The queue-retry master switch.
+   *
+   * On by default so an existing document keeps the behaviour it already had;
+   * off makes the transport treat every queue answer as final, whatever the
+   * two bounds below say. The switch exists because "0 retries" and "retries
+   * off" are different statements: the first is a bound the user can move, the
+   * second is a decision to stop waiting for a busy model at all.
+   */
+  queueWaitEnabled?: boolean;
   /**
    * How many times a queued answer is retried before it is reported.
    *
@@ -2063,7 +2090,7 @@ declare const Config: z<Config>;
  */
 declare const CN_SECTION_KEYS: readonly ["probeConsent", "useMaximumContextWindowCN", "modelContextWindowsCN", "disabledModelsCN", "variantEnabledCN"];
 declare const GLOBAL_SECTION_KEYS: readonly ["useMaximumContextWindow", "modelContextWindows", "disabledModels", "variantEnabledGlobal"];
-declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessEnabled", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
+declare const QUOTA_SECTION_KEYS: readonly ["sidebarQuotaCN", "sidebarQuotaGlobal", "autoCheckInCN", "autoCheckInGlobal", "checkInMinute", "quotaPollMs", "autoFailoverEnabled", "queueWaitEnabled", "queueWaitAttempts", "queueWaitSeconds", "routingStrategy", "routingOrder", "stickinessEnabled", "stickinessRounds", "stickinessRequests", "stickinessMinutes"];
 /**
  * Whether a connection failure could be absorbed by switching accounts.
  *
@@ -2133,16 +2160,26 @@ interface PoolMember {
  * instead of looping back to an account it has already tried.
  */
 declare function poolOrder(pool: () => readonly PoolMember[], variant: Pick<QoderVariant, 'id'>): readonly PoolMember[];
-/** The variant whose credential file stores `accountId`, if any file holds it. */
+/**
+ * The variant whose credential file stores `accountId`, if any file holds it.
+ *
+ * The same PAT can be saved in both files (the copy-paste case {@link poolRing}
+ * collapses), and one copy can be parked while the other is usable. The pool
+ * decides a seat is usable when ANY copy is, so the file named here is the one
+ * holding a usable copy: moving the active pointer in the parked file would
+ * leave the account that actually serves requests unpinned.
+ */
 declare function poolOwner(order: readonly PoolMember[], accountId: string): Promise<PoolMember | undefined>;
 /**
  * By-id resolution across the pool, for custom routing and pinned sessions.
  *
- * Ids are globally unique (the id is a hash of the PAT), so a row is found in
- * at most one file. A parked row resolves to nothing — the same "skip this id"
- * answer the save-order walk gives — and because ids cannot collide there is no
- * point looking for it in the other file. A row no file holds resolves to
- * nothing too, which is how the walk skips an account removed in another tab.
+ * The id is a hash of the PAT, so a row normally lives in one file — but the
+ * same PAT saved in both files gives the id two copies, and one copy can be
+ * parked while the other is usable. {@link poolRing} seats the id when ANY copy
+ * is usable, so resolution has to agree: a parked copy must not hide the usable
+ * one, or a seat the ring hands the walk becomes one the walk cannot name. A row
+ * no file holds resolves to nothing, which is how the walk skips an account
+ * removed in another tab.
  */
 declare function pooledAccountById(order: readonly PoolMember[], accountId: string): Promise<QoderPooledAccount | undefined>;
 /**
@@ -2160,6 +2197,15 @@ declare function pooledAccountById(order: readonly PoolMember[], accountId: stri
  * pool has two files at most.
  */
 declare function poolRing(order: readonly PoolMember[]): Promise<readonly QoderPooledAccount[]>;
+/**
+ * How many accounts the pool has SAVED, parked ones included.
+ *
+ * Distinct ids across every file, so a PAT stored in both files counts once —
+ * the same identity rule {@link poolRing} uses, minus the usability filter. The
+ * device-code reset rotates one host-level seed, which re-identifies a parked
+ * account exactly like a serving one, so this is the number the card reports.
+ */
+declare function savedAccountCount(pool: () => readonly PoolMember[]): Promise<number>;
 /**
  * The account after `accountId`, continuing across the pool's files.
  *
@@ -2201,4 +2247,4 @@ declare function adoptPooledAccount(order: readonly PoolMember[], accountId: str
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, PoolMember, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, adoptFailoverAccount, adoptPooledAccount, apply, autoFailoverActive, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, poolOrder, poolOwner, poolRing, poolSeatFlags, pooledAccountById, pooledNextAccount, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, variantFor };
+export { CHINA_VARIANT, CN_SECTION_KEYS, Config, FALLBACK_QODER_MODELS, GLOBAL_SECTION_KEYS, GLOBAL_VARIANT, KIND_STATUS, PROBE_EFFORT_CANDIDATES, PoolMember, type ProbeAttempt, type ProbeOutcome, type ProbeSender, QODER_AUTH_FILENAME, QODER_AUTH_PATH, QODER_DATA_DIR_ENV, QODER_DATA_DIR_NAME, QODER_GLOBAL_AUTH_PATH, QODER_GLOBAL_PROBE_PATH, QODER_GLOBAL_SETTINGS_NS, QODER_GLOBAL_STATUS_PATH, QODER_HOST_HEARTBEAT_FILENAME, QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QODER_PROBE_FILENAME, QODER_PROBE_PATH, QODER_PROVIDER, QODER_SETTINGS_NS, QODER_STATUS_PATH, QODER_STREAM_IDLE_TIMEOUT_MS, QODER_VARIANTS, QUOTA_POLL_DEFAULT_MS, QUOTA_POLL_MIN_MS, QUOTA_SECTION_KEYS, type QoderAdapter, type QoderAuthRequest, type QoderAuthRouteOptions, type QoderAuthSaveResult, type QoderAuthStatus, QoderCatalog, type QoderCatalogFetch, type QoderCatalogModelSnapshot, QoderCatalogStore, type QoderCatalogStoreOptions, type QoderChatResult, type QoderCredential, QoderCredentialStore, type QoderCreditAccount, type QoderCredits, type QoderEffort, type QoderHostHeartbeat, type QoderModelBilling, type QoderModelInfo, type QoderModelReasoning, type QoderPatSummary, type QoderProbeAction, type QoderProbeRecord, QoderProbeService, type QoderProbeStatus, QoderProbeStore, type QoderProbeValidation, type QoderShim, QoderUpstreamClient, type QoderVariant, type QoderVariantId, type QoderWebCatalog, type QoderWebCreditAccount, type QoderWebCredits, type QoderWebProbeModel, type QoderWebProbeSection, type QoderWebStatus, type ShimLogger, type UpstreamErrorKind, adoptFailoverAccount, adoptPooledAccount, apply, autoFailoverActive, classifyUpstreamError, clearHostHeartbeat, createAuthKey, createQoderAdapter, createQoderShim, fingerprintModel, inject, isHeartbeatProcessAlive, kindFromQoderFailure, modelInfoOf, name, normalizeCredits, patTail, poolOrder, poolOwner, poolRing, poolSeatFlags, pooledAccountById, pooledNextAccount, probeModel, processStartTimeMs, qoderAuthHandler, qoderCatalogPath, qoderCredentialIdentity, qoderHostHeartbeatPath, qoderOwnAuthPath, qoderPluginDataDir, qoderProbePath, randomSentinel, readHostHeartbeat, registerQoderAuthRoute, savedAccountCount, variantFor };

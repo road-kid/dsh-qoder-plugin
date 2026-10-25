@@ -104,6 +104,31 @@ export const QUOTA_CSS = `
 .qdp-row + .qdp-row {
   border-top: 0.5px solid var(--dsw-alias-border-l2);
 }
+/*
+ * A row that only exists because the master switch above it is on.
+ *
+ * Indented so the hierarchy is visible without a second heading: the switch
+ * says what the group is, and these rows are the group's contents. The indent
+ * is the ONLY difference from a normal row — an extra rule down the left edge
+ * was tried and removed: the card already separates rows with a hairline, so a
+ * second vertical border turned a quiet sub-menu into a boxed panel.
+ */
+.qdp-subRow {
+  padding-left: 16px;
+}
+
+/*
+ * A heading for a group inside a card (the device codes), one level below the
+ * card's own title. The rule above it is what separates it from the rows it
+ * follows without opening a second card for three lines of content.
+ */
+.qdp-subHeading {
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  font: var(--dsw-font-xs-strong-13);
+  color: var(--dsw-alias-label-secondary);
+}
 .qdp-rowText {
   display: flex;
   flex: 1 1 auto;

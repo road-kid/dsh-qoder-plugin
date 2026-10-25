@@ -303,6 +303,14 @@ export class DefaultQoderTransport implements QoderTransport {
   private readonly responseHeaderTimeoutMs: number
   private readonly metadataTimeoutMs: number | undefined
   private readonly resolveMachineId: (() => string) | undefined
+  /**
+   * The host-level seed every account's derived device id is built from.
+   *
+   * Held as a provider, not a value: the seed lives on disk, may be absent, and
+   * changes when the user resets the device codes. Each credential mint reads it
+   * once, so all headers of one job token belong to the same reset epoch.
+   */
+  private readonly resolveDeviceSeed: (() => string | undefined) | undefined
   private readonly imageUploadTimeoutMs: number | undefined
   private readonly imageUrlCacheTtlMs: number | undefined
   private readonly auth: QoderAuthService
@@ -414,6 +422,7 @@ export class DefaultQoderTransport implements QoderTransport {
     this.responseHeaderTimeoutMs = options.responseHeaderTimeoutMs ?? defaultResponseHeaderTimeoutMs
     this.metadataTimeoutMs = options.metadataTimeoutMs
     this.resolveMachineId = options.resolveMachineId
+    this.resolveDeviceSeed = options.resolveDeviceSeed
     this.imageUploadTimeoutMs = options.imageUploadTimeoutMs
     this.imageUrlCacheTtlMs = options.imageUrlCacheTtlMs
     this.attachments = options.attachments
@@ -466,6 +475,27 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
+   * Forget every cached job token, so the next request re-derives its device id.
+   *
+   * The derived `Cosy-Machineid` / `Cosy-Machinehostname` are minted while a job
+   * token is exchanged and then cached with it, so clearing the caches is the
+   * only way a rotated seed can reach an account that is already signed in —
+   * and it must cover EVERY region, because one transport serves a pool that may
+   * span both.
+   *
+   * What this deliberately does NOT touch: the real machine id (a host fact, not
+   * a per-account claim), the PATs, the account pins, and the penalty ledger.
+   * Resetting a fingerprint is not a logout and not a clean slate for the
+   * upstream's opinion of an account; it only changes what that account claims
+   * to be.
+   *
+   * The cost is one extra token exchange per account on its next use.
+   */
+  resetDeviceIdentity(): void {
+    for (const auth of this.authByRegion.values()) auth.clear()
+  }
+
+  /**
    * The auth service for one region, built once and reused.
    *
    * A chat attempt resolves the account's OWN region first (see
@@ -483,6 +513,7 @@ export class DefaultQoderTransport implements QoderTransport {
       logger: this.logger,
       region,
       resolveMachineId: this.resolveMachineId,
+      resolveDeviceSeed: this.resolveDeviceSeed,
     })
     this.authByRegion.set(region, created)
     return created

@@ -67,6 +67,14 @@ export default [
     outDir: 'lib',
     format: ['cjs'],
     platform: 'browser',
+    /*
+     * No declarations for the client bundle: it is not a typed module. The host
+     * loads it through `window.__ModuleLoader__` (see the banner below), no
+     * TypeScript consumer imports it, and tsdown emits nothing for this entry
+     * even with `dts: true` — verified against a full build. `package.json`
+     * therefore exposes `./client` as a runtime path only, without a `types`
+     * condition that would point at a file the build never writes.
+     */
     dts: false,
     clean: false,
     define: VERSION_DEFINE,

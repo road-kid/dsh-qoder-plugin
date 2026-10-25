@@ -831,3 +831,53 @@ test('QoderUsageReader retries a 401 usage read once with a fresh job token', as
   assert.equal(account.usage?.userQuota?.total, 300)
 })
 
+
+test('resetDeviceIdentity drops the cached credentials so the next mint uses a new seed', async () => {
+  // The settings card's reset is exactly this pair: rotate the seed file, then
+  // ask the transport to forget what it minted. Without the second half the
+  // cached credentials — and with them the old device id — would keep serving
+  // until they expired.
+  let exchangeCalls = 0
+  let seed = 'seed-before'
+  const transport = createQoderTransport({
+    region: 'global',
+    resolvePat: () => Promise.resolve('pt-reset'),
+    resolveMachineId: () => 'machine-test',
+    resolveDeviceSeed: () => seed,
+    fetch: (async (input: URL | Request): Promise<Response> => {
+      const url = String(input)
+      if (url.includes('/jobToken/exchange')) {
+        exchangeCalls++
+        return new Response(JSON.stringify({ token: `jt-${exchangeCalls}` }))
+      }
+      if (url.includes('/userinfo')) return new Response(JSON.stringify({ id: 'user-reset' }))
+      if (url.includes('/model/list')) return new Response(catalog)
+      throw new Error(`unexpected URL: ${url}`)
+    }) as typeof fetch,
+  })
+
+  await transport.discoverModels()
+  assert.equal(exchangeCalls, 1)
+  // A second discovery reuses the cached credentials: nothing is re-minted.
+  await transport.discoverModels()
+  assert.equal(exchangeCalls, 1)
+
+  seed = 'seed-after'
+  assert.equal(typeof transport.resetDeviceIdentity, 'function')
+  transport.resetDeviceIdentity?.()
+  await transport.discoverModels()
+  // Re-minted, i.e. the cache really was dropped; the new mint reads the new seed.
+  assert.equal(exchangeCalls, 2)
+})
+
+test('resetDeviceIdentity is safe before any credential was minted', () => {
+  // The card can be clicked before anything ever talked upstream; an empty
+  // per-region cache must be a no-op rather than a throw.
+  const transport = createQoderTransport({
+    region: 'china',
+    resolvePat: () => Promise.resolve('pt-none'),
+    resolveMachineId: () => 'machine-test',
+    fetch: (async () => new Response('', { status: 500 })) as typeof fetch,
+  })
+  assert.doesNotThrow(() => { transport.resetDeviceIdentity?.() })
+})

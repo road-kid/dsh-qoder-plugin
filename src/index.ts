@@ -29,6 +29,8 @@ import { QoderUpstreamClient, validateApiKey } from './upstream.ts'
 import { createQoderTransport, type QoderCheckInResult, type QoderPooledAccount, type QoderTransport } from './qoder/transport/index.ts'
 import type { QoderRegion } from './qoder/region.ts'
 import { getMachineId } from './qoder/transport/machine-id.ts'
+import { readDeviceSeed, rotateDeviceSeed } from './qoder/transport/device-seed.ts'
+import { registerQoderDeviceResetRoute, type QoderDeviceResetOutcome } from './device-reset-route.ts'
 import { registerQoderStatusRoute, webPlan } from './web-status.ts'
 import { createProbeKey, registerQoderProbeRoute } from './probe-route.ts'
 import { CheckInScheduler, DEFAULT_CHECK_IN_MINUTE, JsonFileCheckInStore, normalizeCheckInMinute } from './checkin-scheduler.ts'
@@ -254,9 +256,15 @@ export interface Config {
   variantEnabledCN?: boolean
   /** The global variant's master switch; see {@link Config.variantEnabledCN}. */
   variantEnabledGlobal?: boolean
-  /** Show the China variant's sidebar quota card. */
+  /**
+   * Legacy sidebar-quota toggle, kept so older settings files still parse.
+   *
+   * The sidebar card was removed in 0.4.0 and the composer readout replaced it,
+   * so this field has no effect. It stays declared because dropping a field from
+   * the schema would make an existing file's value unreadable rather than inert.
+   */
   sidebarQuotaCN?: boolean
-  /** Show the global variant's sidebar quota card. */
+  /** Legacy global-variant sidebar toggle; see {@link Config.sidebarQuotaCN}. */
   sidebarQuotaGlobal?: boolean
   /** Automatically check in daily at 10:00 (UTC+8) to claim credits for China variant. */
   autoCheckInCN?: boolean
@@ -284,6 +292,16 @@ export interface Config {
    * behaviour off without deleting accounts.
    */
   autoFailoverEnabled?: boolean
+  /**
+   * The queue-retry master switch.
+   *
+   * On by default so an existing document keeps the behaviour it already had;
+   * off makes the transport treat every queue answer as final, whatever the
+   * two bounds below say. The switch exists because "0 retries" and "retries
+   * off" are different statements: the first is a bound the user can move, the
+   * second is a decision to stop waiting for a busy model at all.
+   */
+  queueWaitEnabled?: boolean
   /**
    * How many times a queued answer is retried before it is reported.
    *
@@ -422,9 +440,16 @@ const DISABLED_MODELS_FIELD = volatileField(z.array(z.string()).default([])
  */
 const VARIANT_ENABLED_FIELD = volatileField(z.boolean().default(true)
   .description('启用该版本的全部模型（默认开启）'))
-/** Sidebar quota toggle (one per variant; both live on the shared quota card). */
+/**
+ * Legacy sidebar-quota toggle (one per variant).
+ *
+ * The sidebar card no longer exists — the composer readout shows credits — so
+ * this field is declared only so older settings files keep validating. The
+ * description says as much, because the settings reference documents it as a
+ * no-op and a promise of a sidebar card here would contradict that.
+ */
 const QUOTA_TOGGLE_FIELD = volatileField(z.boolean().default(false)
-  .description('Show this variant’s remaining-credit card in the sidebar footer (off by default)'))
+  .description('历史字段：侧栏额度卡已取消，此开关不再有任何效果（保留仅为兼容旧配置文件）'))
 /** Automatic check-in toggle. */
 const AUTO_CHECK_IN_FIELD = volatileField(z.boolean().default(false)
   .description('每天自动签到领取算力额度（默认关闭）'))
@@ -459,6 +484,10 @@ const QUOTA_POLL_FIELD = volatileField(z.number()
 /** Automatic failover master switch (on by default; one account makes it inert). */
 const AUTO_FAILOVER_FIELD = volatileField(z.boolean().default(true)
   .description('账号连接失败时自动切换到下一个账号（默认开启）'))
+/** Queue wait master switch: off reports a queued answer at once (on by default). */
+const QUEUE_WAIT_ENABLED_FIELD = volatileField(z.boolean()
+  .default(true)
+  .description('排队重试总开关：关闭后上游排队直接报错，不再等待重试（默认开启）'))
 /** Queue wait retry count: 0 = report at once, 1..10 retries. */
 const QUEUE_WAIT_ATTEMPTS_FIELD = volatileField(z.number()
   .default(0)
@@ -527,6 +556,7 @@ export const Config: z<Config> = z.object({
   checkInMinute: CHECK_IN_MINUTE_FIELD,
   quotaPollMs: QUOTA_POLL_FIELD,
   autoFailoverEnabled: AUTO_FAILOVER_FIELD,
+  queueWaitEnabled: QUEUE_WAIT_ENABLED_FIELD,
   queueWaitAttempts: QUEUE_WAIT_ATTEMPTS_FIELD,
   queueWaitSeconds: QUEUE_WAIT_SECONDS_FIELD,
   routingStrategy: ROUTING_STRATEGY_FIELD,
@@ -572,6 +602,7 @@ export const QUOTA_SECTION_KEYS = [
   'checkInMinute',
   'quotaPollMs',
   'autoFailoverEnabled',
+  'queueWaitEnabled',
   'queueWaitAttempts',
   'queueWaitSeconds',
   'routingStrategy',
@@ -835,13 +866,23 @@ export function autoFailoverActive(
 export async function poolSeatFlags(
   members: readonly PoolMember[],
 ): Promise<readonly { readonly enabled?: boolean }[]> {
-  const flags: { readonly enabled?: boolean }[] = []
+  /*
+   * One seat per account id, and a seat is usable when ANY copy of it is.
+   *
+   * Both rules follow {@link poolRing}: the same PAT saved in both files is one
+   * account, not two, and because the ring skips a parked row and takes the
+   * other file's copy, a parked duplicate must not make the seat count as
+   * unusable either. Without this the derived 「自动切换」 fact could advertise
+   * failover on the strength of a duplicate row — and a duplicate row is
+   * exactly the configuration that used to break the walk.
+   */
+  const seats = new Map<string, boolean>()
   for (const member of members) {
     for (const account of await member.store.list()) {
-      flags.push(account.enabled === false ? { enabled: false } : {})
+      seats.set(account.id, (seats.get(account.id) ?? false) || account.enabled !== false)
     }
   }
-  return flags
+  return [...seats.values()].map(usable => (usable ? {} : { enabled: false }))
 }
 
 /**
@@ -906,15 +947,26 @@ export function poolOrder(pool: () => readonly PoolMember[], variant: Pick<Qoder
   return [...own, ...siblings]
 }
 
-/** The variant whose credential file stores `accountId`, if any file holds it. */
+/**
+ * The variant whose credential file stores `accountId`, if any file holds it.
+ *
+ * The same PAT can be saved in both files (the copy-paste case {@link poolRing}
+ * collapses), and one copy can be parked while the other is usable. The pool
+ * decides a seat is usable when ANY copy is, so the file named here is the one
+ * holding a usable copy: moving the active pointer in the parked file would
+ * leave the account that actually serves requests unpinned.
+ */
 export async function poolOwner(
   order: readonly PoolMember[],
   accountId: string,
 ): Promise<PoolMember | undefined> {
   for (const runtime of order) {
     const found = await runtime.store.byId(accountId)
-    if (found !== undefined) return runtime
+    if (found === undefined || found.enabled === false) continue
+    return runtime
   }
+  // Every copy is parked: the id names no usable seat, which is the same answer
+  // the ring gives, and a switch to it must warn rather than adopt.
   return undefined
 }
 
@@ -933,11 +985,13 @@ function pooledAccount(account: QoderStoredAccount): QoderPooledAccount {
 /**
  * By-id resolution across the pool, for custom routing and pinned sessions.
  *
- * Ids are globally unique (the id is a hash of the PAT), so a row is found in
- * at most one file. A parked row resolves to nothing — the same "skip this id"
- * answer the save-order walk gives — and because ids cannot collide there is no
- * point looking for it in the other file. A row no file holds resolves to
- * nothing too, which is how the walk skips an account removed in another tab.
+ * The id is a hash of the PAT, so a row normally lives in one file — but the
+ * same PAT saved in both files gives the id two copies, and one copy can be
+ * parked while the other is usable. {@link poolRing} seats the id when ANY copy
+ * is usable, so resolution has to agree: a parked copy must not hide the usable
+ * one, or a seat the ring hands the walk becomes one the walk cannot name. A row
+ * no file holds resolves to nothing, which is how the walk skips an account
+ * removed in another tab.
  */
 export async function pooledAccountById(
   order: readonly PoolMember[],
@@ -945,8 +999,7 @@ export async function pooledAccountById(
 ): Promise<QoderPooledAccount | undefined> {
   for (const runtime of order) {
     const found = await runtime.store.byId(accountId)
-    if (found === undefined) continue
-    if (found.enabled === false) return undefined
+    if (found === undefined || found.enabled === false) continue
     return pooledAccount(found)
   }
   return undefined
@@ -968,13 +1021,44 @@ export async function pooledAccountById(
  */
 export async function poolRing(order: readonly PoolMember[]): Promise<readonly QoderPooledAccount[]> {
   const ring: QoderPooledAccount[] = []
+  /*
+   * ONE seat per account id, even when both files hold the same row.
+   *
+   * The id is a hash of the PAT, so the same PAT saved in both files — a
+   * copy-paste misconfiguration, and the only way one row can appear twice —
+   * arrives here as the same id twice. That used to reach the transport as two
+   * seats, and the walk reads a repeated id as "already tried" and STOPS the
+   * whole lap, so every account after the duplicate became unreachable rather
+   * than just the duplicate's twin. Dropping the copy keeps the ring's promise
+   * that each id names one seat; the first file to hold it wins, which is the
+   * same precedence {@link pooledAccountById} resolves the id with.
+   */
+  const seen = new Set<string>()
   for (const runtime of order) {
     for (const account of await runtime.store.list()) {
       if (account.enabled === false) continue
+      if (seen.has(account.id)) continue
+      seen.add(account.id)
       ring.push(pooledAccount(account))
     }
   }
   return ring
+}
+
+/**
+ * How many accounts the pool has SAVED, parked ones included.
+ *
+ * Distinct ids across every file, so a PAT stored in both files counts once —
+ * the same identity rule {@link poolRing} uses, minus the usability filter. The
+ * device-code reset rotates one host-level seed, which re-identifies a parked
+ * account exactly like a serving one, so this is the number the card reports.
+ */
+export async function savedAccountCount(pool: () => readonly PoolMember[]): Promise<number> {
+  const saved = new Set<string>()
+  for (const runtime of pool()) {
+    for (const account of await runtime.store.list()) saved.add(account.id)
+  }
+  return saved.size
 }
 
 /**
@@ -1022,7 +1106,7 @@ export async function adoptPooledAccount(
 ): Promise<boolean> {
   const owner = await poolOwner(order, accountId)
   if (owner === undefined) {
-    warn(`dsh-qoder-plugin: could not adopt the failover account (${accountId}): no variant stores it`)
+    warn(`dsh-qoder-plugin: could not adopt the failover account (${accountId}): no variant can serve it`)
     return false
   }
   return await adoptFailoverAccount(owner.store, accountId, warn)
@@ -1090,6 +1174,13 @@ function createVariantRuntime(
      * registered with the upstream — see `machine-id.ts`.
      */
     resolveMachineId: () => getMachineId(),
+    /*
+     * The host-level seed each account's derived device id is built from. Read
+     * on every credential mint (a file read that only happens when a job token
+     * is exchanged), so the settings card's reset reaches the very next
+     * request. Absent means the historical derivation — see `device-seed.ts`.
+     */
+    resolveDeviceSeed: () => readDeviceSeed(),
     attachments,
     /*
      * Automatic next-account failover.
@@ -1333,7 +1424,10 @@ function createVariantRuntime(
      */
     queueWait: {
       // Retries to sit out INSIDE one request when the upstream names a delay.
-      attempts: () => current().queueWaitAttempts ?? 0,
+      // The master switch collapses the count to zero rather than hiding the
+      // two bounds: the transport's budget is the ONE place that decides how
+      // long a caller waits, so "off" has to be visible there and nowhere else.
+      attempts: () => (current().queueWaitEnabled === false ? 0 : current().queueWaitAttempts ?? 0),
       seconds: () => current().queueWaitSeconds ?? 30,
     },
     stickiness: {
@@ -1573,28 +1667,17 @@ async function startVariant(ctx: Context, runtime: VariantRuntime, seedCatalog: 
     try {
       releaseAdapter = ctx.llm.registerAdapter([variant.id], qoder.adapter)
       // The settings namespace the Models page resolves this directory row
-      // against differs by host line, and the difference is not cosmetic:
+      // against is the profile ENTRY's id: 0.1.7 serves one settings form per
+      // entry, keyed by `entry.options.id` (dsh-settings `describe()`), so the
+      // row must name that id — naming the pre-0.1.7 namespace (`qoder` /
+      // `qoder-global`) makes the page resolve a name the Host never served and
+      // the row renders with no configuration at all.
       //
-      //  - 0.1.7 serves one settings form per profile ENTRY, keyed by
-      //    `entry.options.id` (dsh-settings `describe()`), so the row must name
-      //    that id — naming the 0.1.5 namespace (`qoder` / `qoder-global`) makes
-      //    the page resolve a name the Host never served, and the row renders
-      //    with no configuration at all.
-      //  - 0.1.5 serves the namespaces this plugin installs, which is what
-      //    `settingsNamespaceFor` returns.
-      //
-      // `configEditor` exists only on 0.1.7, which is the same probe the write
-      // path and the migration use.
-      const host017 = ((): boolean => {
-        try {
-          const probe = ctx as unknown as { get?: (name: string) => unknown }
-          return probe.get?.('configEditor') !== undefined
-        } catch {
-          return false
-        }
-      })()
+      // The namespace fallback below is not a host-version branch: it covers a
+      // context built without a profile entry (the tests, and any embedding
+      // that applies the plugin directly), where there is no entry id to name.
       const entryId = (ctx as unknown as { fiber?: { entry?: { options?: { id?: string } } } }).fiber?.entry?.options?.id
-      const settingsNs = host017 && entryId !== undefined ? (entryId as SettingsNamespace) : settingsNamespaceFor(variant)
+      const settingsNs = entryId !== undefined ? (entryId as SettingsNamespace) : settingsNamespaceFor(variant)
       releaseDirectory = ctx.llm.registerConfigurableProviders([{
         provider: variant.id,
         displayName: variant.displayName,
@@ -1716,6 +1799,7 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       checkInMinute: 600,
       quotaPollMs: 300_000,
       autoFailoverEnabled: true,
+      queueWaitEnabled: true,
       queueWaitAttempts: 0,
       queueWaitSeconds: 30,
       routingStrategy: 'save-order',
@@ -1832,6 +1916,7 @@ function validateSettingsPatch(patch: Record<string, unknown>): string | undefin
       case 'autoCheckInCN':
       case 'autoCheckInGlobal':
       case 'autoFailoverEnabled':
+      case 'queueWaitEnabled':
         if (typeof value !== 'boolean') return `${field} must be a boolean`
         break
       case 'disabledModels':
@@ -1909,7 +1994,7 @@ export function apply(ctx: Context, config: Config): void {
   // `settings-store` module for why: a profile-patch write costs a full tree
   // reconcile and a fiber reload on every switch).
   const store = new SettingsStore()
-  let current = (): Config => ({ ...readConfig(config), ...store.values() }) as Config
+  const current = (): Config => ({ ...readConfig(config), ...store.values() }) as Config
 
   /** Timers and in-flight work belonging to this plugin instance. */
   let stopped = false
@@ -2489,6 +2574,37 @@ export function apply(ctx: Context, config: Config): void {
       apply: applyCatalogSettings,
       rearm: () => { runStartupCatchUpOnce(); checkInScheduler.rearm() },
     })
+
+    /*
+     * The device-code reset: rotate the host-level seed, then forget every
+     * cached job token so the next request re-derives its fingerprint.
+     *
+     * Order matters twice. Every transport is checked for the capability
+     * BEFORE the seed is written, so a host that cannot honour the reset leaves
+     * the seed (and therefore every identity) untouched rather than landing in a
+     * half-rotated state. And the seed is written before the caches are
+     * dropped: a write failure must not clear tokens that would then be re-minted
+     * from the OLD seed.
+     *
+     * The count is every SAVED account, parked ones included, deduplicated by id:
+     * the reset rotates one host-level seed, so it really does re-identify an
+     * account the user parked as well as one that is serving. Counting only the
+     * usable seats ({@link poolRing}) would report a smaller number than the
+     * account list the user is looking at.
+     */
+    const resetDeviceCodes = async (): Promise<QoderDeviceResetOutcome> => {
+      for (const runtime of runtimes) {
+        if (typeof runtime.transport.resetDeviceIdentity !== 'function') {
+          throw new Error('this host cannot reset device codes')
+        }
+      }
+      rotateDeviceSeed()
+      for (const runtime of runtimes) runtime.transport.resetDeviceIdentity?.()
+      return { accounts: await savedAccountCount(pool) }
+    }
+    // Same key as the settings face: both are control writes the browser card
+    // performs, and the card already holds that key from its settings document.
+    registerQoderDeviceResetRoute(webCtx, { reset: resetDeviceCodes }, controlKeys().probe)
   })
 
   // Each settings section is what makes its namespace "served" — which is how
@@ -2600,6 +2716,17 @@ export function apply(ctx: Context, config: Config): void {
     checkInScheduler.dispose()
     for (const timer of timers) clearInterval(timer)
     timers.length = 0
+    /*
+     * Abort any catalog fetch still in flight. `stopped` is set first, so the
+     * fetch's own catch reports nothing (a disposed plugin has no card left to
+     * warn) and its promise resolves rather than rejecting; what this buys is
+     * the socket — a disposed fiber must not leave an upstream request open,
+     * and the request may outlive the plugin by the whole fetch timeout.
+     */
+    for (const runtime of runtimes) {
+      runtime.inflightFetch?.controller.abort()
+      runtime.inflightFetch = undefined
+    }
     detach(ctx, clearHostHeartbeat(), 'host heartbeat cleanup')
   })
 

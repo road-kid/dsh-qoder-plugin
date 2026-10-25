@@ -133,7 +133,10 @@ describe('Unified Qoder Plugin Card', () => {
   const titles = (): string[] => view!.root
     .findAll(node => node.props.className === 'qdp-sectionTitle')
     .map(node => node.children.join(''))
-  const cards = () => view!.root.findAll(node => node.props.className === 'qdp-card')
+  // A card is anything carrying the class, not the exact string: a card is free
+  // to carry extra classes beside it.
+  const cards = () => view!.root.findAll(node =>
+    typeof node.props.className === 'string' && node.props.className.split(' ').includes('qdp-card'))
   const tabButtons = () => {
     const tabList = view!.root.find(node => node.props.role === 'tablist' && node.props['aria-label'] === en.variantSwitcherAria)
     return tabList.findAllByType('button')
@@ -143,22 +146,27 @@ describe('Unified Qoder Plugin Card', () => {
   const hostParts = (name: string) =>
     view!.root.findAll(node => node.props['data-checkin-part'] === name && typeof node.type === 'string')
 
-  it('draws a three-card configuration page with no disclosure chrome', async () => {
+  it('draws a four-card configuration page with no hand-rolled chrome', async () => {
     await mountUnified()
-    // Root wrapper is the page grid; each section is its own card.
+    // Root wrapper is the page grid; each section is its own card, and the
+    // fourth (高级设置) is an ordinary card whose body follows a switch.
     expect(view!.root.findAll(node => node.props.className === 'qdp-page')).toHaveLength(1)
-    expect(cards()).toHaveLength(3)
+    expect(cards()).toHaveLength(4)
+    // No disclosure element and no second-level header: the switch is a normal
+    // control, so nothing on the page can grow chrome of its own.
+    expect(view!.root.findAll(node => node.type === 'details')).toHaveLength(0)
     expect(view!.root.findAll(node => node.props.className === 'qdp-cardHeader')).toHaveLength(0)
     expect(json()).not.toContain('aria-expanded')
     // The variant switcher is the ONE level of tabs, and only one is selected.
     expect(view!.root.findAllByProps({ 'aria-selected': true })).toHaveLength(1)
   })
 
-  it('lays the three cards out in contract order — the quota and check-in cards are gone', async () => {
+  it('lays the four cards out in contract order — the quota and check-in cards are gone', async () => {
     await mountUnified()
     expect(titles()).toEqual([
       en.accountHeading,
       en.paneModels,
+      en.quotaSectionSettings,
       en.quotaSectionAdvanced,
     ])
     // 可用额度 moved to the composer chip: the page must not draw it again.
@@ -193,7 +201,9 @@ describe('Unified Qoder Plugin Card', () => {
   })
 
   it('opens on the China account with its settings scoped to that variant', async () => {
-    await mountUnified()
+    // The check-in moment is a sub-menu of the automatic check-in switch, so
+    // the switch has to be on for the row to exist at all.
+    await mountUnified({ scope: fakeScope({ autoCheckInCN: true }) })
     expect(json()).toContain(t('patTail', { tail: '****1111' }))
     // Settings render flat (no fold). The check-in time is ONE control shared
     // by both variants: no per-variant copy exists any more.
@@ -204,7 +214,7 @@ describe('Unified Qoder Plugin Card', () => {
   })
 
   it('puts the daily check-in above the failover policy', async () => {
-    await mountUnified()
+    await mountUnified({ scope: fakeScope({ autoCheckInCN: true }) })
     const text = json()
     // Reading the card top to bottom: the once-a-day housekeeping action comes
     // first, the policy that changes how a running conversation is served
@@ -322,9 +332,9 @@ describe('Unified Qoder Plugin Card', () => {
     const scope = fakeScope()
     await mountUnified({ scope, reported: { cn: false, global: false } })
 
-    // Signed out: only 账号 + 高级设置 are mounted.
-    expect(cards()).toHaveLength(2)
-    expect(titles()).toEqual([en.accountHeading, en.quotaSectionAdvanced])
+    // Signed out: only 账号 + 设置 + 高级设置 are mounted.
+    expect(cards()).toHaveLength(3)
+    expect(titles()).toEqual([en.accountHeading, en.quotaSectionSettings, en.quotaSectionAdvanced])
 
     // The readout switch is configuration, not account state: the signed-out
     // page keeps it and it reflects the stored (default-on) value.
@@ -465,12 +475,17 @@ describe('Unified Qoder Plugin Card', () => {
     await act(async () => { part('hour').props.onBlur() })
     expect(scope.set).toHaveBeenCalledWith('checkInMinute', 870)
 
-    // The shared row does not re-scope when the tab changes: CN is signed in,
-    // so the control stays live on the Global tab and keeps its value.
+    // The row follows the switch ON SCREEN: the Global tab's own check-in
+    // switch is off in this seed, so switching there closes the row. The
+    // shared moment is not re-scoped — it is simply not editable from a tab
+    // whose own check-in is off.
     await act(async () => { tabButtons()[1]!.props.onClick() })
-    expect(hostParts('hour')[0]!.props.disabled).toBe(false)
-    expect(hostParts('minute')[0]!.props.disabled).toBe(false)
-    expect(hostParts('hour')[0]!.props.value).toBe('14')
+    expect(hostParts('hour')).toHaveLength(0)
+    // Back on the China tab the one shared row returns, reading the shared
+    // field: the fake scope records writes without applying them, so it shows
+    // the stored 10:00 — the row holds no per-tab state of its own.
+    await act(async () => { tabButtons()[0]!.props.onClick() })
+    expect(hostParts('hour')[0]!.props.value).toBe('10')
   })
 
   // ---- stale-while-revalidate: instant paint, background truth -------------

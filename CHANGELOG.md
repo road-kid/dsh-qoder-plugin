@@ -2,6 +2,107 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.0.3 — 2026-10-25
+
+A follow-up to 1.0.2. The first fix below is the pool counting rows in the two
+credential files while the walk that serves a request counts accounts; the
+second is unrelated — a catalog fetch that outlived the plugin.
+
+### Changed — the settings page splits into 设置 and a 高级设置 behind a switch
+
+**The card you configure every day got shorter.** The third card is now 设置 and
+holds what a request meets day to day: the composer readout and its interval,
+auto check-in and its time, automatic account switching with the routing
+strategy and order. Queueing and stickiness moved out.
+
+**They moved into 高级设置, which ships switched off.** The card carries one
+switch in its header, off by default; while it is off the queue-retry switch
+with its two bounds, the stickiness switch with its three bounds and the device
+codes are simply not drawn — so a user who never turns it on gets the behaviour
+of the defaults, exactly as before that card existed. The switch is a browser
+preference, not a settings-file field: it decides what the page draws, never how
+a request is served, so turning it off cannot change behaviour and turning it
+back on shows the values exactly as they were left.
+
+**Stickiness is no longer nested under automatic account switching.** It is a
+tuning row now, so it stays visible when switching is off, with one line saying
+it only takes effect while switching is on — rather than disappearing and taking
+its explanation with it.
+
+### Fixed — one credential saved in both files no longer stops the walk
+
+**The same PAT saved twice read as two accounts.** Pasting a PAT into 国内版 and
+国际版 — or copying one settings file into the other — put the same credential
+in both files, and the pool handed the transport the same account id twice. The
+walk treats a repeated id as "already tried" and stops the whole lap there, so
+when that account failed, every account *behind* the duplicate went untried:
+healthy spares the user had added were never reached, and the request failed
+with the first account's error. One credential is now one account no matter how
+many files hold it, and the local file's copy is the one that represents it.
+
+**The 「自动切换」 badge counted rows, not accounts.** In the same configuration
+the card could claim automatic switching was ready while the pool held exactly
+one usable account. The badge now counts accounts, so it agrees with what the
+walk can actually reach.
+
+### Fixed — unloading the plugin cancels a catalog fetch it started
+
+A model-list fetch still in flight when the plugin was disposed ran to
+completion with nothing left to receive it, holding the upstream socket for up
+to the whole fetch timeout. Disposal now aborts it.
+
+### Changed — advanced settings show only what their switches govern
+
+**A control that cannot take effect is no longer on screen.** 高级设置 rendered
+every failover, routing, stickiness, check-in and polling control at all times,
+so a user who had turned automatic switching off still saw a routing order, and
+one who had turned auto check-in off still saw a time for it. The card now nests
+each group under the switch that governs it: routing strategy, the custom order
+and conversation stickiness appear only while **账号自动切换** is on, the
+check-in time only while auto check-in is on, the refresh interval only while
+the composer readout is on, and the two queue bounds only while a new **排队重试**
+switch is on. The nesting is not cosmetic — the transport already ignores those
+settings when their switch is off, and queue retry is now the same kind of
+switch: with it off a queued answer is reported at once instead of being waited
+out.
+
+**The stickiness bounds stopped repeating their own heading.** The three numbers
+used to sit under a second 「会话粘性」 title directly below the switch of the
+same name; they are now an indented sub-row of the switch itself, with the
+explanation but without the duplicate title.
+
+The sub-rows are also what makes the defaults readable: save order already walks
+from one variant's file into the other's, so the default configuration needs no
+custom order to reach a mixed pool.
+
+### Changed — queue retry sits above automatic account switching
+
+The two master switches now read in the order a request meets them: **排队重试**
+first (is this request retried at all?), then **账号自动切换** (which account
+serves the retry). Neither is a sub-menu of the other — retrying in place without
+ever moving accounts stays a valid configuration.
+
+### Added — reset every account's device code
+
+**The card can now re-identify all saved accounts at once.** Each account already
+presents a device fingerprint derived from its own identity, so the upstream sees
+several devices instead of one shared machine; that derivation was fixed for the
+life of the account, which also meant an account whose fingerprint the upstream
+had learned could never change it. A new **设备码** card at the bottom of the
+settings page does exactly that: one button rotates the host-level seed and drops
+the cached tokens, so the next request from every account registers as a new
+device. Nothing is signed out, no PAT is deleted, and the machine's real id is
+untouched. The seed lives in `~/.dsh/qoder/device_seed`; deleting it is the same
+as never having reset.
+
+### Removed — the sidebar quota card's last remnants
+
+The sidebar quota card itself went away in 0.4.0, but `sidebarQuotaCN` /
+`sidebarQuotaGlobal` were still declared as if they did something, and the
+settings reference promised they were "forced off at boot". Nothing forced them
+and nothing read them. The two fields stay in the schema so older settings files
+keep parsing, and the reference now says plainly that they have no effect.
+
 ## 1.0.2 — 2026-10-24
 
 The pool was documented as spanning 国内版 and 国际版 from the first release —

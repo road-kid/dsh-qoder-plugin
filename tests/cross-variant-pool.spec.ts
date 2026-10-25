@@ -7,10 +7,12 @@ import {
   adoptPooledAccount,
   autoFailoverActive,
   poolOrder,
+  poolOwner,
   pooledAccountById,
   pooledNextAccount,
   poolRing,
   poolSeatFlags,
+  savedAccountCount,
   type PoolMember,
 } from '../src/index.ts'
 import { QoderCredentialStore, qoderCredentialIdentity } from '../src/auth.ts'
@@ -164,9 +166,11 @@ describe('cross-variant pool: adoption and the 「自动切换」 fact', () => {
     const order = poolOrder(() => members, { id: CHINA_VARIANT.id })
     const warn = vi.fn()
 
-    // Adoption failure must never turn a recovered request into an error.
+    // Adoption failure must never turn a recovered request into an error. The
+    // wording covers both reasons an id cannot be adopted: no file holds it, or
+    // every copy of it is parked.
     expect(await adoptPooledAccount(order, 'pat:gone', warn)).toBe(false)
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no variant stores it'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no variant can serve it'))
   })
 
   it('advertises automatic switching for a pool split one seat per file', async () => {
@@ -330,5 +334,100 @@ describe('cross-variant pool: the transport signs each account on its own region
     expect((await files.global.current())?.pat).toBe(GLOBAL_PAT)
     expect((await files.cn.current())?.pat).toBe(CN_PAT)
     expect(cnId).not.toBe(globalId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Duplicate identities across the two files
+// ---------------------------------------------------------------------------
+
+/**
+ * The same PAT saved under both files is one identity, not two seats.
+ *
+ * The id is a hash of the PAT, so the two rows carry the same id — the one
+ * thing `pooledAccountById` assumes cannot happen ("a row is found in at most
+ * one file") and nothing enforced. A ring holding the id twice made the
+ * transport's walk stop dead on the duplicate: `nextWalkAccount` breaks on the
+ * first id it has already tried, so every account *behind* the duplicate became
+ * unreachable, not just the sibling copy.
+ */
+describe('cross-variant pool: one PAT saved in both files is one seat', () => {
+  it('collapses the duplicate so the accounts behind it stay reachable', async () => {
+    const files = await twoFiles({ cn: [CN_PAT], global: [CN_PAT, GLOBAL_PAT] })
+    const order = poolOrder(() => files.members, { id: CHINA_VARIANT.id })
+    const dupId = qoderCredentialIdentity({ pat: CN_PAT })
+    const globalId = qoderCredentialIdentity({ pat: GLOBAL_PAT })
+
+    const ring = await poolRing(order)
+    // One seat per identity, and the local file's copy is the one that wins:
+    // the Global duplicate adds nothing the walk could not already reach.
+    expect(ring.map(account => account.id)).toEqual([dupId, globalId])
+    expect(ring.map(account => account.region)).toEqual(['china', 'global'])
+
+    // The duplicate used to be its own successor, so this returned the same id
+    // and the walk died before GLOBAL_PAT was ever tried.
+    expect((await pooledNextAccount(order, dupId))?.id).toBe(globalId)
+  })
+
+  it('still fails over past a duplicated identity', async () => {
+    const files = await twoFiles({ cn: [CN_PAT], global: [CN_PAT, GLOBAL_PAT] })
+    const { fetch, signed } = signedUpstream(pat => pat === CN_PAT
+      ? new Response('', { status: 503 })
+      : sseChat('from-spare'))
+    const transport = createQoderTransport({
+      region: 'china',
+      resolvePat: async () => CN_PAT,
+      resolveMachineId: () => 'machine-test',
+      fetch,
+      failover: hooksOver(files, 'china'),
+    })
+
+    const chunks = await drain(transport)
+
+    // The spare is signed by its own region's host, after the China seat failed.
+    expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'from-spare')).toBe(true)
+    expect(signed.chatPats).toEqual([CN_PAT, GLOBAL_PAT])
+    expect(signed.chatUrls[1]).toBe(getQoderChatUrl('global'))
+  })
+
+  it('counts a duplicated identity as one seat in the badge', async () => {
+    const files = await twoFiles({ cn: [CN_PAT], global: [CN_PAT] })
+
+    // Two rows, one identity: nowhere for the walk to move, so the 「自动切换」
+    // badge must stay off. Counting rows instead of seats claimed otherwise.
+    expect(autoFailoverActive(true, await poolSeatFlags(files.members))).toBe(false)
+  })
+
+  it('keeps the identity usable when only one copy is parked', async () => {
+    const files = await twoFiles({ cn: [CN_PAT], global: [CN_PAT, GLOBAL_PAT] })
+    await files.cn.setEnabled(qoderCredentialIdentity({ pat: CN_PAT }), false)
+    const order = poolOrder(() => files.members, { id: CHINA_VARIANT.id })
+    const dupId = qoderCredentialIdentity({ pat: CN_PAT })
+    const globalId = qoderCredentialIdentity({ pat: GLOBAL_PAT })
+
+    // Parked in China, still stored in Global: the seat survives through the
+    // Global copy, so the pool reports two usable seats rather than one.
+    const ring = await poolRing(order)
+    expect(ring.map(account => account.id)).toEqual([dupId, globalId])
+    expect(ring[0]?.region).toBe('global')
+    expect(autoFailoverActive(true, await poolSeatFlags(files.members))).toBe(true)
+
+    // Resolution has to agree with the ring, or a seat the walk is handed is one
+    // it cannot name: the parked China copy must not hide the usable Global one.
+    expect((await pooledAccountById(order, dupId))?.region).toBe('global')
+    expect((await poolOwner(order, dupId))?.variant.id).toBe(GLOBAL_VARIANT.id)
+  })
+
+  it('reports every saved account, parked ones included, when counting a reset', async () => {
+    const files = await twoFiles({ cn: [CN_PAT, GLOBAL_PAT], global: [CN_PAT] })
+    await files.cn.setEnabled(qoderCredentialIdentity({ pat: GLOBAL_PAT }), false)
+
+    // Two identities, one of them parked, and the China PAT duplicated across
+    // the files: the reset re-identifies both accounts, and the duplicate is one
+    // account rather than two.
+    expect(await savedAccountCount(() => files.members)).toBe(2)
+    // The ring is narrower on purpose — it answers "who can serve", not "who
+    // exists" — and the card must not report the narrower number.
+    expect(await poolRing(files.members)).toHaveLength(1)
   })
 })

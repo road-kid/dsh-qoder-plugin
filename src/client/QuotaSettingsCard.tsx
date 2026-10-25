@@ -59,6 +59,24 @@ export interface QuotaSettingsScope<T> {
    * reload. A scope that never serves documents simply omits it.
    */
   ensureLoaded?: (() => void) | undefined
+  /**
+   * Give every saved account a new device code, then report what happened.
+   *
+   * Optional: the action is a host write, and a host that serves no reset route
+   * must leave the card without a button rather than with one that cannot work.
+   * A resolved `ok: false` is an ANSWER (the host refused or the write failed)
+   * and is shown as such; only a thrown error means the card could not ask.
+   */
+  resetDeviceCodes?: (() => Promise<QuotaDeviceResetResult>) | undefined
+}
+
+/** What one device-code reset did, as the card reports it. */
+export interface QuotaDeviceResetResult {
+  ok: boolean
+  /** How many saved accounts were re-identified; absent when the host omitted it. */
+  accounts?: number
+  /** Why the reset failed, as a message for the user. */
+  error?: string
 }
 
 /** One settings form's sync state, identical in both hosts. */
@@ -112,6 +130,8 @@ export interface QuotaSection {
    */
   /** Whether a connection failure walks on to the next account at all. */
   autoFailoverEnabled?: boolean
+  /** The queue-retry master switch (on by default; off reports a queue at once). */
+  queueWaitEnabled?: boolean
   /** How many times a queued answer is retried (0 = report at once). */
   queueWaitAttempts?: number
   /** How long each queue retry waits, in seconds. */

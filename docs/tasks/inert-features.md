@@ -1,5 +1,7 @@
 # Inert features audit — account selection, routing, stickiness, health
 
+> **状态：已被后续实现取代。** 本文记录的是 `937a8ca` 时刻的审计结论，其中的行号与接线描述（例如 finish chunk 之后才做的轮数记账、池不跨版本）反映的是**当时**的代码：「终块计轮」由 `cb3b4c4` 修复、「池跨两个凭证文件」由 `f52102f` 修复，粘性/排队的总开关由 1.0.3 补上。当前实现请以 `src/qoder/transport/default-transport.ts` 与 `src/index.ts` 为准；文中行号也不再对应现在的文件。
+
 Read-only audit of `dsh-qoder-plugin` at **HEAD `937a8ca`**. All line numbers below are
 HEAD's. Two working-tree changes exist and are *not* mine: a pre-existing formatting diff in
 `src/qoder/transport/account-limiter.ts` (`266→267` lines, shifts that file by +1), and the

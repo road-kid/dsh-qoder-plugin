@@ -27,6 +27,17 @@ export interface QoderTransport {
    */
   readAccount(options?: { force?: boolean | undefined; signal?: AbortSignal | undefined; pat?: string | undefined; minIntervalMs?: number | undefined }): Promise<QoderAccountInfo>
   checkIn(signal?: AbortSignal): Promise<QoderCheckInResult>
+  /**
+   * Drop every cached job token, so the next request re-derives its device id.
+   *
+   * Called after the host rotates the device seed: the per-account
+   * `Cosy-Machineid`/`Cosy-Machinehostname` are minted during the token exchange
+   * and cached with it, so this is the only way an already-signed-in account can
+   * pick up a new fingerprint. Optional so a host or a test double that does not
+   * model device identity stays a valid transport; the host reports the reset as
+   * failed rather than pretending when it is missing.
+   */
+  resetDeviceIdentity?(): void
 }
 
 /**
@@ -138,6 +149,15 @@ export interface QoderTransportOptions {
   responseHeaderTimeoutMs?: number
   metadataTimeoutMs?: number
   resolveMachineId?: () => string
+  /**
+   * The host-level seed that perturbs each account's derived device id.
+   *
+   * Read once per credential mint; rotating the seed (and calling
+   * {@link QoderTransport.resetDeviceIdentity}) is how the reset control gives
+   * every account a new fingerprint. Absent means the historical derivation,
+   * which is what keeps an upgrade from changing anyone's identity.
+   */
+  resolveDeviceSeed?: (() => string | undefined) | undefined
   attachments?: Pick<AttachmentStore, 'imageLimits' | 'readImageRequest'>
   /** Deadline for one center image publication attempt. */
   imageUploadTimeoutMs?: number
