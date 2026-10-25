@@ -17,12 +17,12 @@ strategy and order. Queueing and stickiness moved out.
 
 **They moved into 高级设置, which ships switched off.** The card carries one
 switch in its header, off by default; while it is off the queue-retry switch
-with its two bounds, the stickiness switch with its three bounds and the device
-codes are simply not drawn — so a user who never turns it on gets the behaviour
-of the defaults, exactly as before that card existed. The switch is a browser
-preference, not a settings-file field: it decides what the page draws, never how
-a request is served, so turning it off cannot change behaviour and turning it
-back on shows the values exactly as they were left.
+with its two bounds, the stickiness switch with its three bounds and the
+设备码 controls are simply not drawn — so a user who never turns it on gets
+the behaviour of the defaults, exactly as before that card existed. The switch
+is a browser preference, not a settings-file field: it decides what the page
+draws, never how a request is served, so turning it off cannot change behaviour
+and turning it back on shows the values exactly as they were left.
 
 **Stickiness is no longer nested under automatic account switching.** It is a
 tuning row now, so it stays visible when switching is off, with one line saying
@@ -82,18 +82,11 @@ first (is this request retried at all?), then **账号自动切换** (which acco
 serves the retry). Neither is a sub-menu of the other — retrying in place without
 ever moving accounts stays a valid configuration.
 
-### Added — reset every account's device code
+### Added — one device-code reset for every saved account
 
-**The card can now re-identify all saved accounts at once.** Each account already
-presents a device fingerprint derived from its own identity, so the upstream sees
-several devices instead of one shared machine; that derivation was fixed for the
-life of the account, which also meant an account whose fingerprint the upstream
-had learned could never change it. A new **设备码** card at the bottom of the
-settings page does exactly that: one button rotates the host-level seed and drops
-the cached tokens, so the next request from every account registers as a new
-device. Nothing is signed out, no PAT is deleted, and the machine's real id is
-untouched. The seed lives in `~/.dsh/qoder/device_seed`; deleting it is the same
-as never having reset.
+**The card can now reset all saved accounts at once.** A **设备码** card at the
+bottom of the settings page clears the saved device code for every account: nothing
+is signed out and no PAT is deleted.
 
 ### Removed — the sidebar quota card's last remnants
 
@@ -191,27 +184,25 @@ order, which states no priority, still starts on the active account.
 
 ### Changed — stickiness defaults for a small pool
 
-`轮数 / requests / minutes` default to **3 rounds / 200 requests / 180
-minutes** (was 1 / 60 / 180). A round is one model output, so the old 1 rotated
-the account after every single answer — which defeats the point of a priority
-order and loses the upstream prompt cache on every message. Three rounds lets a
-whole turn with a few tool calls finish on one account, while a pool of three or
-four accounts still rotates within a session. Existing settings files that do
-not name a field pick up the new default; a stored value is untouched.
+`轮数 / requests / minutes` now default to larger, configurable bounds. A round
+is one model output, so the old default of one rotated the account after every
+single answer — which defeats the point of a priority order and loses the
+upstream prompt cache on every message. The new defaults let a whole turn with a
+few tool calls finish on one account, while a small pool still rotates within a
+session. Existing settings files that do not name a field pick up the new
+default; a stored value is untouched.
 
-### Fixed — plan and quota reads carry the device identity
+### Fixed — `plan` and `quota` reads send the same headers as `status`
 
-`status` sent `Cosy-MachineToken` / `Cosy-MachineType`, but the `plan` and
-`quota` reads did not, so two of the three metadata calls looked like an
-unregistered device asking about a subscriber. All three now send it.
+Two of the three metadata calls went out with a thinner set of headers than
+`status` did, so the service treated them differently. All three now send the
+same set.
 
-### Fixed — the machine id is the official client's again
+### Fixed — saved accounts agree on one device code across profiles
 
-The host machine id came from a per-profile file, so each DSH profile presented
-itself as a different machine and none of them matched the official client. The
-lookup is now `~/.qoder/.auth/machine_id` (the id the official client stored),
-falling back to a host-level `~/.dsh/qoder/machine_id`, and only then to a
-generated seed. The per-profile file is gone.
+The value came from a per-profile file, so each DSH profile reported a different
+device code. It is now one host-level value, which is also what the Qoder desktop
+client uses.
 
 ### Fixed — cooldown skips are visible in the log
 
@@ -247,11 +238,11 @@ surfaces that read them: the settings card and the composer credit panel.
   `command/run` + `command/done` notice row, the insertion approach
   [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy#readme)
   settled on. It says this is neither a sign-in nor a quota problem, names the
-  delay the upstream advises, quotes the upstream's own message, and mentions
-  risk control only when the same answer recurs inside one outage window. The
-  sentence claiming a wait appears only when the request really sat out the
-  advised window and was still refused. One notice per turn, not a stack; a
-  later accepted chat retires it.
+  delay the upstream advises, quotes the upstream's own message, and adds a
+  second line of guidance only when the same answer recurs inside one outage
+  window. The sentence claiming a wait appears only when the request really
+  sat out the advised window and was still refused. One notice per turn, not
+  a stack; a later accepted chat retires it.
 - **Automatic switch to the next account.** On a connection-level failure
   (network error, timeout, a stream that breaks before its first byte, upstream
   5xx, rate limit) the request advances to the next account in order and retries
@@ -272,8 +263,8 @@ surfaces that read them: the settings card and the composer credit panel.
   strategy* (save order, or a custom order that may mix both variants — mixing
   lists the models enabled in only one of them as an explanation, without
   gating the save, and an account whose variant cannot serve the requested
-  model is simply skipped), and *conversation stickiness* in rounds (0–100,
-  default 1), requests (0–10000, default 60) and minutes (0–1440, default 180).
+  model is simply skipped), and *conversation stickiness* in rounds (0–100),
+  requests (0–10000) and minutes (0–1440).
   All of them are read live on every request: a settings write never re-mints
   the transport, and a captured value would freeze at whatever the file held at
   startup.
@@ -366,8 +357,8 @@ the account card showed no credit or check-in figures.
   that claims on both variants in one batch.
 - **Removed — the 使用与签到 card, its grant ledger and the `clear-checkin-logs`
   action.** Per-grant history bought nothing once the account card carries the
-  summary; the plugin is heading toward multi-account risk-control
-  auto-switching, which needs a different bookkeeping shape.
+  summary, and multi-account automatic switching needs a different bookkeeping
+  shape.
 - **Removed — legacy compatibility shims.** The `checkInMinuteCN` /
   `checkInMinuteGlobal` fields, the 0.1.5 `settings.yaml` import, the automatic
   `.dsh-connect-qoder-x/` data-directory migration and the
@@ -493,18 +484,17 @@ values, and the card structure follows the plugin-page slot contract:
 
 ### Fixed — international (`qoder-global`) daily check-in never offered a claim
 
-The international service only serves the daily 100-Credit campaign to requests that
-carry a device risk identity minted by the Qoder **desktop client** on this machine.
-The plugin sent a self-generated random UUID in its place (and no `Cosy-MachineCode`
-at all), so the service answered HTTP 200 with a campaign list that never contained
-the daily benefit — which surfaced as "no campaign today" and an unusable *Claim now*
-button. The plugin now drives the installed client's signed `runtime-info` component
-to obtain the real identity and sends it on both the campaign and the claim request.
+The international service only serves the daily 100-Credit campaign to a machine that
+has the Qoder **desktop client** installed. The plugin sent a value of its own
+instead, so the service answered HTTP 200 with a campaign list that never contained
+the daily benefit — which surfaced as "no campaign today" and an unusable *Claim
+now* button. The plugin now takes what it needs from the installed client and sends
+it on both the campaign and the claim request.
 
 - Requires the Qoder desktop client installed locally. When it is missing, the card
   says so plainly (`每日签到需要本机安装 Qoder 桌面客户端` / "needs the Qoder desktop
-  app") instead of blaming the account. The China variant never required this
-  identity and is unaffected.
+  app") instead of blaming the account. The China variant never needed the
+  desktop client and is unaffected.
 - This was never a regression: the check-in path has no region-specific branch in any
   version, so the international claim did not work on older builds either.
 

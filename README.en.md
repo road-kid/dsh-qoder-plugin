@@ -2,334 +2,141 @@
 
 **English** | [简体中文](./README.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plugin that brings your **Qoder subscription** models into DSH through a Personal Access Token (PAT). One plugin serves both Qoder product lines — each with its own provider id, credential file and saved catalog, never mixed:
+Bring your **Qoder subscription** models into [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH). Paste a Personal Access Token (PAT) and Qoder's models show up in DSH's model picker — no browser sign-in flow, and nothing about DSH's own conversation loop, compaction or permissions changes.
 
-Release notes: [CHANGELOG.md](./CHANGELOG.md).
+China (qoder.com.cn) and Global (qoder.com) are two independent entries: separate credentials, separate model catalogues, separate credit. Configure only the one you use — the other never appears.
 
-| Variant | Provider id | Where the PAT is minted |
-|---|---|---|
-| China (国内版) | `qoder` | qoder.com.cn |
-| International (国际版) | `qoder-global` | qoder.com |
+![Where the plugin sits in DSH](assets/overview.svg)
 
-Configure only what you use: a variant with no saved PAT shows no model group and never interferes with the other one. Streaming, reasoning content and tool calls ride the plugin's built-in Qoder transport; the conversation loop, compaction and permissions stay Harness-owned.
+## What it does
 
----
-
-## What this repository is
-
-`dsh-qoder-plugin` is a community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): it brings Qoder's models into DSH through a Personal Access Token (PAT), with China and Global served by separate credentials, providers and model catalogs that never mix.
-
-**This plugin's identity** (what you need when installing, troubleshooting, or looking for its data):
-
-| Item | Value |
-|---|---|
-| Package name | `dsh-qoder-plugin` |
-| Profile row id | `qoder-plugin` |
-| Data directory | `<profile>/.dsh-qoder-plugin/` |
-| HTTP route prefix | `/plugins/dsh-qoder-plugin/*` |
-| CLI command | `dsh-qoder-plugin` |
-
-**Why the row id differs from the package name**: DSH keys a plugin-configuration seat by `` `${package name}#${row id}` `` — the package name comes from `package.json`, the row id from the `id` this plugin's patch declares. Spelling both out in full is what keeps that key unique in any profile and clear of other Qoder plugins. See [Settings surface and DSH versions](#settings-surface-and-dsh-versions).
-
----
-
-## Features
-
-- **PAT: save it and it works** — paste a PAT into the settings card and press *Save*; the token is validated live against that variant's region before anything is written, and the model group appears immediately — no DSH restart. Once signed in, *Replace PAT* (the new token overwrites only after it validates, so a mistyped paste can never strand a working credential) and *Clear PAT* are one click away.
-- **Two independent variants** — `qoder` (china) and `qoder-global` (global) keep separate credential files, routes and saved catalogs: a token minted on qoder.com does not work against the China deployment and vice versa.
-- **Account pool with automatic failover** — either variant can hold several PATs, listed row by row on the card (order, token tail, account name, plan, remaining credit); one click switches, and any row can be removed. Failover to the next account is **on by default**: when a request cannot reach the upstream on one account (network error, timeout, a stream that breaks before its first byte, an upstream 5xx, a rate limit) the next account in order is tried, at most one pass over the pool. The walk **continues from the end of one variant's file into the other's**, so a mixed pool really does reach every seat, and each account is always signed against **its own region's endpoints** — a China token never gets exchanged against the Global gateway. A refused request (the request itself is invalid) does not switch — another account would answer the same thing — and neither does a *queued model*, because that is a fact about the model, not the account. The **Settings** card lets you turn the switch off (which also folds away — and stops — routing and the custom order), while the **Advanced settings** card — off by default, behind one switch in its header — holds the **queue retry** master switch that decides whether to wait a queue out at all and then set **queue wait attempts / queue wait seconds** (when the upstream says the model is queued, sit out the advised window inside that same request, up to N times for up to S seconds each), pick a **routing strategy** (save order, or a hand-ordered list that may mix both variants — the custom order is a *priority*: a new conversation starts on the first usable account of the list, and failures and stickiness rotations continue down it — mixing lists the models enabled in only one variant as an explanation without gating the save), and **conversation stickiness** (one account serves a conversation until **rounds / requests / minutes** runs out, whichever comes first, and the conversation then **moves on to the next account in the order** — a round counts only when a chat's model output finished, the defaults are 3 rounds / 200 requests / 180 minutes, and 0 in a field turns that bound off).
-- **Per-account park checkbox and health** — every account row carries a checkbox; unticking it *parks* the account: nothing is deleted and the token stays, it simply takes no part in routing or failover and the composer panel shows its credits as parked rather than as a spendable balance. Each row also carries a health chip — **normal / queued / limited**. A queued answer marks it queued; three connection failures in a row escalate it to limited — a queue never escalates by itself, because it says the upstream is busy rather than that the account is throttled; one accepted chat clears it back to normal.
-- **Per-account device codes, resettable in one click** — the device fingerprint each account presents upstream is derived from the account plus a host-level seed: stable for one account on one machine (a restart never looks like a new device) and distinct between accounts (they never share one "device"). The last card on the settings page, **Device codes**, re-identifies every saved account in one click — no PAT is deleted, nothing is signed out and the real machine id is untouched; the next request from each account simply registers as a new device. The seed lives in `~/.dsh/qoder/device_seed`, and deleting it is the same as never having reset (the historical fingerprints come back).
-- **An explanation when the upstream cannot serve a model, instead of a bare error** — when the upstream answers *model queued / not serviceable*, the plugin inserts an explanation into the conversation (reusing the plugin's existing `command/run` + `command/done` notice row, the approach dsh-connect-workbuddy settled on). It states that this is neither a sign-in nor a quota problem, how many seconds the upstream advises waiting, and quotes the upstream's own message, and it raises the possibility of risk control when the same answer recurs inside one outage window. The sentence "waited the advised 30 seconds and it is still not serviceable" appears **only when the wait really happened** — the request actually sat out a full advised window and was refused again afterwards; otherwise it reports only the facts. The same notice is inserted once per turn rather than stacking rows, and a later accepted chat retires it, so it never hangs on screen after the condition is over.
-- **Three-tier model catalog (live → saved → fallback)** — the card states where the list on screen came from: *“Model list updated …”* (fetched now), *“Showing the saved model list from …”* (this account's last successful fetch, restored after a restart or a failed fetch), or *“Showing the built-in model list (not yet updated from Qoder)”* (the roster compiled into the plugin). The reason of the most recent failed fetch is shown too, and a *Refresh model list* button sits right there.
-- **Per-model context window (staged, one save)** — every model row carries a thick solid Qoder-style slider (tick labels under the track; releasing snaps to the windows the model declares — 200K / 400K / 1M). Dragging is continuous again — nothing quantises under the pointer — and only the release settles on the nearest allowed window. Dragging only edits a local draft — nothing is written per drag tick — and the enable switches plus window changes are committed together by one *Save*; a sticky *“N unsaved change(s)”* bar appears while the draft is dirty and *Cancel* restores the saved state. Requests carry the selected window; a row that declares none falls back to the plugin's conservative built-in default (180K). The two variants keep independent settings.
-- **Model visibility toggles** — the *Models* card lists every model of the selected variant in Qoder's own order (no re-sorting — it matches the official GUI), with each model's reasoning efforts and the upstream default labelled. Disabled models are hidden from the DSH model picker, keeping it tidy. Toggles stage locally like the window sliders and are committed by the same *Save*.
-- **Daily check-in (automatic + manual)** — 100 Credits are claimable every day. The claim window is **10:00 → 10:00 the next day (UTC+8)**, not a calendar day — the plugin judges "already claimed" strictly by the window: claim at 23:00 and the card still reads *Claimed today* at 00:44, flipping back to *Claim now* only when the next window opens at 10:00. Automatic check-in is **off by default** and lives in *Advanced*; **one** *Check-in time* row drives both the China and the Global scheduler (default 10:00 UTC+8, the moment Qoder resets the campaign, and a custom time moves both window boundaries), and once enabled it also catches up on startup so a missed window is not lost. The account card shows the figures directly — 剩余积分 / 签到状态 / 当前使用 — beside a one-click **一键签到** that claims on both variants. **The international variant requires the Qoder desktop app to be installed on this machine**: the international service only serves the daily campaign to requests carrying a client-minted device risk identity, and when none is found the plugin says so plainly instead of falsely reporting "no campaign today". The China variant has no such requirement.
-- **Composer quota readout + credit panel** — a `Qoder · remaining` readout sits in the composer toolbar, and **only while this session uses a Qoder model** (switch to another model and it steps aside rather than occupying shared toolbar space). Clicking it opens a compact panel anchored above the readout: one row for the variant that owns the selected model, with plan tag, *remaining / total*, solid bar, percentage and expiry, a manual refresh and the auto-refresh note. The figures sum what the account really holds (`credits.unlimited` no longer hides real remaining credit). The readout is toggled by a single *Show credits in the composer* switch at the top of *Advanced* — one switch cannot contradict itself the way a per-variant pair could — and is stored as a per-browser preference rather than in the plugin settings file. The old sidebar widget and centre-column quota dashboard are gone; quota lives where it is used. Both share one refresh interval (default 5 min, minimum 1 min).
-- **Rate display `x<priceFactor>`** — each model name is suffixed with the Qoder-reported price multiplier (in the model picker: `Some Model · x0.79`, free is `x0.0`), spelled `x<n>` from the catalog's `price_factor`. Whole factors are padded to one decimal (`x1.0`) so a zero rate reads as a rate beside its fractional neighbours; fractional factors keep Qoder's own value (`x0.79`, `x1.6`). Display only — it never changes the request; models whose rate Qoder does not report simply show no suffix. The card's own model list spells the same number as `0.5x`; the value is identical, only the layout direction differs.
-
----
-
-## A look at the UI
-
-The settings page is four cards, top to bottom: **Account** (sign-in state, plan, the remaining-credit / check-in / current-account strip and 一键签到, the variant switch with its whole-variant checkboxes, credential source, replace/clear PAT, and the **multi-account list** — one row per saved account with a park checkbox, switch, remove and a health chip), **Models** (catalog provenance + refresh, per-model switches, context-window sliders, one save) and **Settings** (show credits in the composer, credit refresh interval, **auto check-in and its time**, the **auto-failover switch**, **routing strategy and order**), plus **Advanced settings** — off by default, behind one switch: the **queue-retry switch with its attempts / seconds**, the **stickiness switch with rounds / requests / minutes**, and the **device codes** reset. The switch decides what is drawn and nothing else: while it is off the rows inside are not rendered and each of them keeps its saved value (the defaults, if you never changed them), so a user who never turns it on gets exactly the behaviour of the defaults. Every everyday control stays on the **Settings** card. The sub-menu relationships are explicit: **routing strategy and custom order appear only while automatic account switching is on**, **the check-in time only while auto check-in is on**, **the refresh interval only while *Show credits in the composer* is on**, **the queue bounds only while *Queue retry* is on**, and **the three stickiness bounds only while stickiness is on** — turning a master switch off turns its rows and their behaviour off together, so no number is left on screen that cannot take effect. Stickiness is no longer nested under automatic account switching — it lives in **Advanced settings** — so it stays visible while switching is off, with a line saying it only takes effect then. Nothing is collapsed behind tabs and no card draws its own chrome. Both the account list and the custom-priority list now print each account's **remaining credit** and **health** (normal / queued / rate-limited) right next to its name, so you can see which seats are usable without opening anything.
-
-The **China / Global** segmented switch sits at the top of the account card, and the checkbox on each tab enables or disables that whole variant's models; under it the summary strip carries the signed-in account's remaining credit, today's check-in state and the current account, with a *Check in all* button on the right:
-
-![The account card: variant switch, remaining credit and check-in](assets/plugin-page.png)
-
-The *Models* card lists models in Qoder's own order, labels their reasoning efforts, and sets each model's context window with a free-sliding slider that snaps on release; changes stay staged until *Save*, and a hidden model disappears from the DSH model picker:
-
-![Model toggles and context windows](assets/model-toggles.png)
-
-The quota readout in the composer toolbar (only while the session uses a Qoder model) opens an anchored panel with the selected variant's remaining credit, plan and expiry:
-
-![Composer quota readout](assets/composer-quota.png)
-
-![Quota panel](assets/quota-panel.png)
-
----
-
-## Where to find the settings UI
-
-DSH 0.1.7 gathers every plugin's configuration into the **Plugins page** (0.2.x keeps the same seats — verified). Once installed, the plugin appears under **Installed** on that page:
-
-![The installed-plugins group on the Plugins page](assets/plugin-list.png)
-
-Click it to open the package page; the settings body renders **inline** under the package description — that is this plugin's settings UI:
-
-![Settings cards: four cards stacked in the page body](assets/plugin-page.png)
-
-The card draws no disclosure shell of its own (the page supplies the title, the icon and the breadcrumb), so it renders the configuration body alone: four cards stacked top to bottom — accounts, models, settings, and an **Advanced settings** card that starts switched off. No second-level tabs and no hand-rolled disclosure: the switch in that card's header decides whether its rows are drawn at all (while it is off they are not rendered, and each keeps its saved value), rather than hiding something already on the page. Dark theme, compact sidebar and keyboard focus come from the DSH theme tokens — the plugin ships no palette of its own, and its buttons reuse the host's three official shapes: *Save* is a filled primary button (near-black on the light theme, near-white on the dark one), *Clear PAT* is the outlined danger button the Plugins page uses for uninstall (without the trash glyph, so the two remain distinguishable), and every other action is the borderless white button used across the other plugins.
-
-> **Can't find the settings?** This plugin's card appears on the *Plugins* page only. There is no entry under *Settings* — plugin configuration has lived on the *Plugins* page since DSH 0.1.7.
-
----
+- **Paste and go** — paste a PAT into the settings card and press *Save*; the token is validated against that region first and only then written, and the models appear in DSH's picker immediately — no restart. *Replace PAT* and *Clear PAT* are one click away, and a new token overwrites the old one only after it validates, so a mistyped paste can never strand a working credential.
+- **Two independent variants** — `qoder` (China) and `qoder-global` (Global) keep separate credentials and model catalogues. A token minted on qoder.com does not work against the China deployment and vice versa; the two never mix.
+- **Model visibility** — every model of the selected variant is listed in Qoder's own order (no re-sorting), with its reasoning levels and the upstream default labelled. A model you switch off disappears from DSH's model picker right away.
+- **Per-model context window** — one thick slider per model, with the windows that model declares ticked underneath. Dragging only edits a local draft, releasing snaps to the nearest allowed window, and the changes commit together with one *Save*.
+- **Three-tier model catalogue** — live fetch first; the last saved catalogue when the network or a restart gets in the way; a built-in roster as the final fallback. The card says which one you are looking at, and refreshes in place.
+- **Composer credit readout** — while the session uses a Qoder model, a `Qoder · remaining` readout sits in the composer toolbar. Click it for a compact anchored panel with plan, remaining / total, progress and expiry. Switch to another model and it steps aside.
+- **Daily check-in** — 100 Credits are claimable every day. The window is **10:00 → 10:00 the next day (UTC+8)**, not a calendar day: claim at 23:00 and the card still reads *Claimed today* after midnight. The account card shows the check-in state and remaining credit, claims in one click, and *Settings* holds an optional automatic check-in (off by default) with one shared check-in time.
+- **Multiple accounts** — save several PATs per variant and switch at will, with each account's remaining credit and health shown in the list. Automatic switching to the next usable account is on by default; everything about it lives under *Settings* / *Advanced settings*, and the defaults are meant to be left alone.
+- **A plain explanation when the upstream cannot serve a model** — instead of a bare error, the conversation gets a notice saying this is neither a sign-in nor a credit problem, how long the upstream suggests waiting, and what it actually said. It retires itself once a later chat is accepted.
+- **Rate display `x<priceFactor>`** — each model name carries the Qoder-reported multiplier (`x0.79`; free reads `x0.0`). Display only — it never changes a request.
 
 ## Install
 
 Prerequisites:
 
-- DSH core **`>=0.1.7-rc.1 <0.3.0`** (both 0.1.7 and 0.2.x are served; the range is declared in `peerDependencies`, which is the field DSH actually validates at install time — `app-boot`'s compatibility preflight reads peer dependencies only, never `engines.dsh`);
-- Node.js `^22.19.0 || >=24.0.0` (per `package.json` engines);
-- your own Qoder account and at least one Personal Access Token.
-
-> **Supported DSH range**
->
-> This plugin registers on the **plugin-configuration seats** introduced in
-> DSH 0.1.7, so it **requires DSH ≥ 0.1.7**. On **0.1.5 / 0.1.6** the **host
-> half still works** (models, PAT, catalog, check-in), but **the settings card
-> does not appear**, because those versions have no `plugins.row.config` seat.
->
-> The cap is `<0.3.0`: diffing the tags `dsh-v0.1.7-rc.2` → `dsh-v0.2.0-rc.1`
-> shows **zero changed source files** across all nine packages this plugin
-> imports, so 0.2.x runs with no code change. The range lives in
-> `peerDependencies` — the field DSH validates at install time.
+- DSH **≥ 0.1.7** (the settings card relies on the plugin-configuration seats introduced there), up to `< 0.3.0`;
+- Node.js `^22.19.0 || >=24.0.0`;
+- A Qoder account and at least one personal access token.
 
 ```sh
-# From GitHub
-dsh plugin --profile web add github:road-kid/dsh-qoder-plugin
+dsh plugin --profile web add dsh-qoder-plugin
 ```
 
-Swap the `--profile` value for the profile you use (`web` / `desktop` / `tui`) — data stays inside that profile, so web / desktop / tui never collide.
+Swap `--profile` for the profile you use (`web` / `desktop` / `tui`). The profile you install into owns the data directory; profiles stay independent.
 
-> **Coexists with other Qoder plugins**: this plugin's package name, row id, route prefix and data directory are all independently named, so it can be installed alongside other Qoder plugins without either configuration touching the other. (Installing *this* plugin twice is a different matter — a profile should carry only one row of the same name.)
+Installing from GitHub works with the same command — hand it the repository address: `dsh plugin --profile web add github:<user>/dsh-qoder-plugin`.
 
-> **Upgrading from 0.4.x**: the plugin moved from `dsh-connect-qoder-x` to
-> `dsh-qoder-plugin` (package name, module id, route prefix, data directory and
-> repository all changed). **Since 0.6.0 the profile row id also moved, from
-> `llm-qoder-x` to `qoder-plugin`** — after reinstalling, press *Configure* on the
-> row once more; the providers (`qoder` / `qoder-global`) and existing model
-> selections are unaffected, and `<profile>/.dsh-qoder-plugin/` stays where it is.
-> Re-run the install command above.
+> **DSH versions** — on 0.1.5 / 0.1.6 the host side (models, PAT, catalogue, check-in) still works, but **the settings card does not appear**: those versions have no plugin-configuration seats. The supported range is declared in `peerDependencies`, which is what DSH validates at install time.
 
+> **Upgrading from an older release** — this plugin used to be called `dsh-connect-qoder-x`; since 0.6.0 its profile row id is `qoder-plugin`. Re-run the install command above; the data directory stays where it is. If the plugin manager shows a new *Configure* entry, open it once.
 
-
-### Distribution and market listings
-
-- **Install from GitHub** (above, recommended): the repository ships the built
-  `lib/`, so the sources are usable as-is with no build-script permission.
-- **Install from npm**: `dsh plugin --profile web add dsh-qoder-plugin` installs
-  prebuilt code and needs no build permission (see DSH's
-  [publish guide](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)).
-  The npm package and the GitHub `v*` tags ship from the same commit, so
-  `pnpm add dsh-qoder-plugin@<version>` pins a specific release.
-- **Why doesn't the market find it by name?** DSH's plugin market searches the
-  configured **market indexes** (`index.json`), not the npm registry directly, so
-  an npm package that no index lists is still invisible there. To make it
-  searchable, publish to npm and generate an index with DSH's
-  `plugin-market-generator`, or add your own index URL under "Custom plugin
-  markets".
-
----
-
-## Configuration
+## Configure
 
 ### Mint a PAT
 
-- **Qoder (China)**: sign in at qoder.com.cn → account settings → Personal Access Token, then copy it. [Open the page](https://qoder.cn/account/integrations)
-- **Qoder Global**: sign in at qoder.com → account settings → Personal Access Token, then copy it. [Open the page](https://qoder.com/account/integrations)
+- **China** — sign in at [qoder.com.cn](https://qoder.com.cn) → account settings → personal access token, then copy it.
+- **Global** — sign in at [qoder.com](https://qoder.com) → account settings → personal access token, then copy it.
 
 ### Save it on the card
 
-Open the settings UI by the path above, paste the PAT into the password field and press *Save* (*“Validating and saving…”* while it runs). The token is validated against that variant's region first, and nothing is saved on a refusal. **The two kinds of refusal are reported apart**: Qoder rejected this token → *“That PAT was rejected — generate a new one in your account settings and try again.”*; Qoder could not be reached (timeout / network / 5xx) → *“Could not reach Qoder to verify the PAT (…). The token was not saved — check the network and try again.”* — a network problem is never blamed on a working token. Do this on both cards to run both groups side by side.
+Open the settings surface (next section) and paste the PAT into the password field, then press *Save*. The plugin validates the token against that region before writing anything, and it tells the two failure modes apart: a token Qoder actually rejected, versus **Qoder being unreachable** — a network problem never gets reported as a bad token.
 
-### Environment-variable fallback
+### Environment fallback
 
-For headless setups, the plugin reads an environment fallback **only when no credential file exists**:
+When no credential file has been saved, the plugin falls back to an environment variable:
 
-| Variant | Environment variable |
+| Variant | Variable |
 |---|---|
-| `qoder` (china) | `QODER_CN_PERSONAL_ACCESS_TOKEN` |
-| `qoder-global` | `QODER_PERSONAL_ACCESS_TOKEN` |
+| `qoder` (China) | `QODER_CN_PERSONAL_ACCESS_TOKEN` |
+| `qoder-global` (Global) | `QODER_PERSONAL_ACCESS_TOKEN` |
 
-The precedence is **file > env**: as soon as a valid credential file is saved, a stray environment token stops mattering.
+The file wins over the environment: once that variant has a saved credential, the variable no longer applies.
 
----
+## Command line (optional)
 
-## Data & privacy
+You can configure everything without the GUI:
 
-### File layout
-
-Everything the plugin owns lives in one data directory: `<profile>/.dsh-qoder-plugin/` — credentials at the root, rebuildable caches under `state/` (so “clear the cache” can never touch a credential):
-
-```text
-<profile>/.dsh-qoder-plugin/
-├── .qoder-auth.json              # China account pool ({version:3, activeId, accounts:[{id, pat, region, savedAt, enabled?}]})
-├── .qoder-global-auth.json       # Global account pool (same shape; the two never mix)
-├── settings.json                 # refresh interval / check-in time / per-variant enable, own config
-├── checkin-status.json           # check-in state (claimed today + when), no ledger
-└── state/
-    ├── .qoder-catalog.json       # China per-account saved catalog
-    ├── .qoder-global-catalog.json
-    ├── .qoder-probe.json         # China reasoning-effort probe records
-    ├── .qoder-global-probe.json
-    └── .qoder-host-heartbeat.json
+```sh
+dsh-qoder-plugin status            # credential state and remaining credit
+dsh-qoder-plugin pat set <PAT>     # validate and store a token
+dsh-qoder-plugin pat clear         # remove the stored token (logout is an alias)
+dsh-qoder-plugin catalog refresh   # re-fetch and save the model catalog
+dsh-qoder-plugin doctor            # secret-free environment diagnostics
 ```
 
-`DSH_QODER_DATA_DIR` overrides the directory explicitly.
+`--provider` picks the variant to act on (`qoder` / `qoder-global`, default `qoder`); `status` and `doctor` accept `--json`; `pat set` can also read the token from `--file <path>` or `-` (standard input) so it never lands in your shell history. On DSH versions where the settings card does not appear, this is the only way to configure the plugin.
+## Where the settings surface is
 
-Two **host-level** files live outside it, because they belong to the machine
-rather than to one profile: `~/.dsh/qoder/machine_id` (the real machine id,
-created on first use) and `~/.dsh/qoder/device_seed` (the seed behind each
-account's device fingerprint — see *Per-account device codes*). Profile-scoped
-machine identity would make one machine look like several devices across
-profiles, which invites the anti-abuse flag rather than clearing it.
+Since DSH 0.1.7 plugin configuration lives on the **Plugins** page: open it, click this plugin in the installed list, and the settings body renders inline under the package description. Do not go looking under DSH's own *Settings* — there is no entry for this plugin there.
 
-The two `auth.json` files now hold an **account pool**, not a single token: a
-`version: 3` document stores several accounts plus one `activeId` pointer, and an
-`enabled` field appears only while an account is parked (*not in use*). Removing
-that field restores the account, so "never parked" and "restored" are
-indistinguishable on disk — deliberately. Old `version: 2` single-token files
-still read fine and upgrade to v3 in place on the next write, without losing the
-token already saved.
+Four cards, top to bottom:
 
-**Device identity for the international check-in**: the international campaign
-only reaches requests that carry a device risk identity, and that identity
-cannot be synthesized — it is minted live by the signed `runtime-info` component
-that ships inside the installed Qoder desktop client, fingerprinting
-**this machine's real hardware/virtualization state**. The three risk headers it
-returns (`Cosy-MachineToken/Code/Type`) travel only on the check-in's campaign
-and claim requests, are never written to disk and never cached — every check-in
-re-mints them on the spot. Without a client installed, the plugin reports the
-missing dependency plainly and skips the international check-in (China is
-unaffected). Note that the model catalog / chat / image requests carry a **per-account**
-derived device fingerprint (`Cosy-Machineid` / `Cosy-Machinehostname`, from the
-account plus the host-level seed — see *Per-account device codes* above), which
-is separate from and not derived from the check-in identity here; the real
-machine id (`~/.dsh/qoder/machine_id`) is only a fallback when no derived
-fingerprint is available.
+1. **Account** — China / Global switch, sign-in state, plan, remaining credit and check-in, and the saved-account list (switch / remove / park);
+2. **Models** — catalogue provenance and refresh, per-model switches, context windows;
+3. **Settings** — show credits in the composer, credit refresh interval, automatic check-in and its time, automatic account switching and routing order;
+4. **Advanced settings** (collapsed by default) — queue retry, conversation stickiness, device-code reset. While it is off its rows are not drawn and every setting keeps its saved value; turn it on to change them.
 
----
+The cards draw no chrome of their own: theme, colours and button shapes all come from DSH, so dark mode and keyboard focus follow the host.
 
-## Settings surface and DSH versions
+## Data and privacy
 
-Since DSH 0.1.7, plugin configuration is carried by `ui-plugin-manager`'s **keyed slots**: `settings.section` no longer exposes a third-party plugin-settings child, the Built-in plugins page became a tab container that reads only `settings.plugins.tab`, and the old `settings.plugin.item` entry was removed from the `SlotMap`. This plugin therefore registers two slots:
-
-| Slot | Key | Effect |
-|---|---|---|
-| `plugins.row.config` | `dsh-qoder-plugin#qoder-plugin` | the row gains a *Configure* control that opens this card |
-| `plugins.bundle.config` | `dsh-qoder-plugin` | the same card renders inline on the package page |
-
-The row key is `` `${package name}#${row id}` `` — the package name comes from `package.json`, the row id from the `id` this plugin's patch declares. **Spelling both out in full is what keeps that key unique in any profile**, clear of other Qoder plugins.
-
-The card component follows the owner's `view` contract accordingly:
-
-- `view === 'summary'` → the one-liner alone (the card row's description)
-- `view === 'page'` → the settings body, drawing **no title and no disclosure shell** of its own
-
----
-
-## Settings reference
-
-Every control on the settings cards maps to one of the `Config` fields below, with one exception: the reset button on the Device codes card is a route action and writes no configuration (the schema in `src/index.ts` is the source of truth; the card only sends values inside the stated range and refuses out-of-range input instead of silently clamping it). Fields that exist per variant are stored separately for China and Global, except the check-in time and the stickiness bounds, which both variants share.
-
-| Setting | Where | Type / range | Default | What it does |
-|---|---|---|---|---|
-| `variantEnabledCN` / `variantEnabledGlobal` | right of the account tabs | boolean | on | Enables or disables the whole variant's models; a disabled variant's models leave the DSH model picker |
-| `disabledModelsCN` / `disabledModels` | Models card, per-row checkbox | string array | empty | Model ids that are switched off; the checkboxes write straight here |
-| `useMaximumContextWindowCN` / `useMaximumContextWindow` | Models card | boolean | on | Prefer the largest context window Qoder declares, when alternatives exist |
-| `modelContextWindowsCN` / `modelContextWindows` | Models card slider | dict (model id → tokens, ≥1) | empty | Per-model context-window overrides, written when the slider is released |
-| `probeConsent` | Models card | boolean | off | Authorises reasoning-effort probes, which send real requests and can spend credit |
-| `quotaPollMs` | Settings: credit refresh interval | number (≥60000 ms) | 300000 | How often the composer credit readout refreshes |
-| `autoCheckInCN` / `autoCheckInGlobal` | Settings: auto check-in | boolean | off | Daily automatic check-in, independently per variant |
-| `checkInMinute` | Settings: check-in time | number 0–1439 (minutes past UTC+8 midnight) | 600 (10:00) | The single check-in time both variants share; it sets the 10:00 → next-day-10:00 claim window |
-| `autoFailoverEnabled` | Settings: automatic account switching | boolean | on | With it off, a failure is returned as-is and no account is switched; **routing strategy and custom order are shown — and act — only while it is on** (stickiness moved to *Advanced settings*; it does not act while switching is off, and the card says so) |
-| `queueWaitEnabled` | Advanced: queue retry | boolean | on | The queue-retry master switch; with it off a queued answer is reported at once and the two bounds below disappear (the count behaves as 0) |
-| `queueWaitAttempts` | Advanced: queue wait attempts | number 0–10 | 0 | How many extra times a queued request retries inside the same turn (0 = report the queue fact immediately) |
-| `queueWaitSeconds` | Advanced: queue wait seconds | number 1–300 | 30 | How long to wait before each retry; an upstream-advised delay wins over this |
-| `routingStrategy` | Settings: routing strategy | `save-order` \| `custom` | `save-order` | Which order accounts are tried in: save order, or the custom order below |
-| `routingOrder` | Settings: custom priority | string array (account ids) | empty | The custom order, may mix China and Global accounts. Under the custom strategy a **new conversation starts on the first usable account of the list**, and failures plus stickiness rotations continue down it; an empty list falls back to save order |
-| `stickinessEnabled` | Advanced: session stickiness | boolean | on | The stickiness master switch; with it off no conversation is pinned and the three bounds below disappear |
-| `stickinessRounds` | Advanced: session stickiness | number 0–100 | 3 | Switch accounts after this many rounds with one account (0 = unlimited) |
-| `stickinessRequests` | Advanced: session stickiness | number 0–10000 | 200 | Switch after this many requests with one account (0 = unlimited) |
-| `stickinessMinutes` | Advanced: session stickiness | number 0–1440 | 180 | Switch after this many minutes with one account (0 = unlimited) |
-| `sidebarQuotaCN` / `sidebarQuotaGlobal` | — (no UI) | boolean | off | Legacy: the sidebar quota card was removed; these switches have no effect and are kept only to stay compatible with older settings files |
-
-The three stickiness bounds are ORed: whichever is reached first switches the account. Turning `stickinessEnabled` off closes stickiness entirely, and so does setting all three bounds to 0 (there is no boundary left to reach).
-
----
+- Everything the plugin owns lives under `<profile>/.dsh-qoder-plugin/`: credentials, settings, check-in state, and a rebuildable model-catalogue cache under `state/`.
+- `DSH_QODER_DATA_DIR` overrides that location explicitly.
+- Credentials stay on this machine and go nowhere except Qoder's own endpoints. The plugin ships no telemetry, collects no usage data, and does not read your conversations for statistics.
+- Deleting that directory clears all of the plugin's local state, saved accounts included.
 
 ## Troubleshooting
 
-**The card says "not signed in".** That variant has no usable credential. Paste a PAT on the card, or set the matching environment variable (see [environment-variable fallback](#environment-variable-fallback)). China and Global keep separate credential stores — filling in one does not light up the other.
+**The card says "Not signed in"** — that variant has no usable credential yet. Paste a PAT, or set the matching environment variable. China and Global are separate credentials: filling in one does not light up the other.
 
-**A message appears in the conversation saying the upstream model is queued.** That is not a sign-in or a quota problem: the upstream is temporarily not serving that model. The plugin inserts the explanation once per turn, naming the delay the upstream advised and quoting its own message. If the same answer recurs inside one outage it also mentions that the account may have been risk-controlled — switch accounts or wait it out. A later accepted chat clears the notice.
+**The conversation shows "Upstream model unavailable"** — your sign-in and your credit are fine; the upstream is not serving that model right now. The notice states the suggested retry time and quotes the upstream message, and it retires itself once a later chat is accepted.
 
-**An account is labelled queued or rate-limited.** A queued upstream answer marks 排队; two queued answers more than an hour apart, or three consecutive connection failures, escalate to 限流; the next successful chat resets it to normal. The label only informs you — no account is ever deleted automatically.
+**An account is marked queued or limited** — an upstream queue reply marks it queued; a few connection failures in a row escalate it to limited; one accepted chat clears it back to normal. The label only describes the account — nothing is deleted automatically.
 
-**One-click check-in reports a conflict.** The upstream refused the claim with a 409 (already claimed, or not claimable in this window). The plugin re-reads the campaign list and answers truthfully: it says the benefit was already granted, or says explicitly that nothing was granted this time — it no longer reports the 409 as a network error.
+**One-click check-in reports a conflict** — the upstream refused the claim with 409 (already claimed this window, or the window is not open). The plugin re-reads the campaign list and tells you whether credits were actually granted this time.
 
-**Auto-failover is on but the request never switched accounts.** Switching only happens on account-level failures *before the first byte* reaches the client (connection drop, timeout, truncated stream, upstream 5xx, rate limit, auth rejection). An invalid request would fail on every account, and bytes already sent cannot be recalled — neither switches.
+**The model list is empty or short** — the top of the card says whether the list is live, saved or the built-in fallback, and refreshes in place. If the whole variant is switched off, or every model is disabled, that variant naturally has nothing to show in the picker.
 
-**A settings change does not stick.** Controls only accept values inside their range; out-of-range input is never written. Number fields commit on blur and on Enter, and a rejected commit reverts the control to the stored value.
+**A settings change does not stick** — controls only accept values inside the allowed range; out-of-range input is not written. Number fields commit on blur, and a refused commit falls back to the saved value.
 
-**The model list is empty or short.** The card states where the current list came from (live fetch / saved catalog / built-in fallback) and offers a manual refresh. A disabled variant, or one with every model unchecked, legitimately shows nothing in the picker.
-
----
+**Global check-in asks for the Qoder desktop app** — the Global service only offers that campaign to machines with the Qoder desktop client installed. Install it and retry; China has no such requirement.
 
 ## Development
 
 ```sh
 pnpm install
 pnpm run build      # tsdown → lib/ (host bundle + client bundle)
-pnpm test           # vitest run (tests/**/*.spec.ts)
-pnpm run test:qoder # node --test (tests/qoder/*.test.ts, the Qoder transport suite)
-pnpm run typecheck  # tsc across the host and client tsconfigs
-pnpm run check      # typecheck + test + test:qoder + build in one gate
+pnpm test           # vitest run
+pnpm run test:qoder # node --test (Qoder transport suite)
+pnpm run typecheck  # tsc: host + client tsconfigs
+pnpm run check      # typecheck + test + test:qoder + build
 ```
 
-> **Known failures:** the full suite is **799** cases, and a run lands at **792 passed / 7 failed**. The failures sit in three files: `tests/adapter.spec.ts` (1 — the code and the test expectation contradict each other), `tests/catalog-lifecycle.spec.ts` (1 — module-level state leaks between cases), and `tests/reasoning-merge.spec.ts` (5 — 5-second-timeout flakes that fire after `boot()`, varying between 4 and 5 per run, which is why the failed count swings 6–7). These three files are long-standing baseline failures that also fail on the release before 1.0.0, so they are not introduced by this version. Separately, `test:qoder` (the node --test Qoder transport suite) is **199/199** green.
-
-### Releasing
-
-The version in `package.json` and the committed `lib/` are the single source of truth; a release is always these four steps:
-
-```sh
-pnpm run check                                       # gate: typecheck + test + test:qoder + build
-npm version <patch|minor|major> --no-git-tag-version
-npm publish --registry https://registry.npmjs.org    # prepack re-runs build; the tarball is the files whitelist
-git tag -a v<version> -m "v<version>" && git push origin main --tags
-```
-
-- If your `.npmrc` points the default registry at a mirror (e.g. `registry.npmmirror.com`), publishing must name `--registry https://registry.npmjs.org` explicitly — mirrors are read-only and cannot be published to.
-- The `prepack` script is pinned to `npm run build`, so publishing from a fresh clone still ships the current `lib/`, matching what the repository commits.
-- Write the CHANGELOG entry first, tag afterwards: every `v*` tag maps 1:1 to an npm version, so a rollback is just a checkout of that tag.
-
----
+Layout and architecture: [docs/architecture.md](./docs/architecture.md). Build, test baseline and release flow: [docs/development.md](./docs/development.md). Release notes: [CHANGELOG.md](./CHANGELOG.md).
 
 ## Acknowledgements
 
-This project's implementation was informed by the following open-source projects — thanks to their authors:
+This project's implementation was informed by these open-source projects. Thanks to their authors:
 
 - [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect) — plugin skeleton and the connect mechanism
-- [dsh-connect-workbuddy](https://github.com/masknull/dsh-workbuddy-connect) — the shape of the composer readout and its anchored panel; the insertion approach and wording strategy of the *upstream cannot service this model* notice are informed by this project too ([mirror](https://github.com/dingminhua/dsh-connect-workbuddy#readme))
-- [dsh-provider-qoder](https://github.com/mo-n/dsh-provider-qoder) — Qoder transport protocol details
+- [dsh-connect-workbuddy](https://github.com/masknull/dsh-workbuddy-connect) — shape of the settings card and the composer readout
+- [dsh-provider-qoder](https://github.com/mo-n/dsh-provider-qoder) — Qoder transport details
 
-All of them are released under the MIT License, as is this project — see [LICENSE](./LICENSE). This is a community adapter — not affiliated with, authorized by, or endorsed by Qoder or DeepSeek, and not an official implementation.
+All three are MIT-licensed; this project is too — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). It is a community adapter, unaffiliated with Qoder or DeepSeek.
 
 ## Disclaimer
 
-- Qoder's endpoints are served by Qoder and may change at any time: they may change, rate-limit or block callers without notice, breaking part or all of this plugin, with no compatibility window to promise.
-- For personal learning and research only; this tool drives **your own** Qoder account. Do not use it commercially or beyond reasonable personal use. You are responsible for complying with Qoder's terms of service and for any consequence — account restriction, quota loss, service interruption — of using this project.
-- The authors are not liable for any direct or indirect loss arising from use or misuse of this project. The names Qoder, DeepSeek and related marks belong to their respective owners and appear here only to describe compatibility.
+- Qoder's endpoints are run by its own service and may change at any time; they can be modified, rate-limited or closed to callers, which can break some or all of this plugin. No compatibility window is guaranteed.
+- This tool is for personal study and research, driving **your own** Qoder account. Do not use it for commercial resale or anything beyond reasonable personal use. Using it means you accept the consequences — account restrictions, lost credit, service interruptions — and that you comply with Qoder's terms of service.
+- The authors accept no liability for direct or indirect damages arising from use or misuse of this plugin. Qoder, DeepSeek and other names are trademarks of their respective owners and appear here only to describe compatibility.
