@@ -2,6 +2,70 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.1.0 — 2026-10-27
+
+The Global daily check-in no longer requires the Qoder desktop app. The identity
+that endpoint gates on — a signed machine identity minted by Qoder's own native
+component — is now something this plugin can install, verify and cache for
+itself, so a machine with no client can still claim. Everything else stays where
+it was: the campaign wire constants, the inference headers and the China path are
+byte-identical to 1.0.5.
+
+### Added — `umid` commands: install, inspect, reset
+
+**`dsh-qoder-plugin umid install`** fetches Qoder's native component from npm,
+verifies it, self-checks it, and only then promotes it into `~/.dsh/qoder/umid/`.
+The ordering is the feature: a download that fails verification leaves the
+previous component untouched rather than replacing a working one with a broken
+one, and `--from-tarball <path>` runs the same path for machines with no registry
+access. `umid status` reports the component, its manifest and the identity cache
+without printing any secret; `umid reset-native --yes` forgets the device seed
+and the cached identity together, which is the only supported way to change what
+this machine looks like upstream.
+
+### Added — the settings card offers to install it
+
+A new section on the card shows whether the native component is present, offers
+the install button when it is not, and polls while an install runs, so a slow
+download looks like progress instead of a dead button. It only appears on the
+Global variant, because China never asks for the identity. A check-in that fails
+for want of the component now says so in the user's language instead of
+surfacing the upstream's empty answer.
+
+### Changed — the identity is resolved once, cached, and survives a broken component
+
+**Every check-in used to spawn the component again, and a component that had
+started failing turned into "no campaign today".** The resolved identity is now
+written to `~/.dsh/qoder/machine-identity.json` (one entry per realm, mode
+`0600`), re-read across restarts, and — when the component cannot be asked — the
+stale copy keeps working instead of degrading to a missing client. `QODER_UMID_IDENTITY_CACHE=0`
+turns the cache off; `QODER_UMID_IDENTITY_TTL` sets its lifetime in milliseconds
+(default `0`, never expires); `QODER_UMID_SELF_HEAL=1` allows at most one
+background re-sample per day.
+
+### Changed — the campaign machine headers are a switch, defaulting to what works
+
+The campaign family keeps sending the three headers a real desktop client mints.
+`QODER_CAMPAIGN_MACHINE_HEADERS=six` additionally sends the derived
+`machineid`/`machineos`/`machinehostname` trio that a reference implementation
+uses, for evaluating whether the extra headers buy anything. It is off by
+default and a typo in the variable falls back to the three-header shape, because
+the failure mode here is silent: a wrong fingerprint returns HTTP 200 with an
+empty campaign list. `QODER_CAMPAIGN_DERIVED_HOSTNAME=1` swaps the real hostname
+for an account-derived one.
+
+### Notes
+
+- The six-header mode has no production measurements yet. Its acceptance is
+  non-inferiority against `three` (every campaign visible in `three` must still be
+  visible in `six`); that comparison is pending and is the reason the branch
+  stays opt-in.
+- `cosy-machineos` for the campaign family is `x86_64_win32` / `aarch64_darwin` /
+  `x86_64_linux` — the desktop app's vocabulary, in a constant of its own. The
+  inference path's spelling is untouched.
+- Updating in place needs no migration: an absent cache or seed reproduces the
+  previous identity byte for byte.
+
 ## 1.0.5 — 2026-10-26
 
 A packaging release. 1.0.4 shipped the README's four screenshots inside the

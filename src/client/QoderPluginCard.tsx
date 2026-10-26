@@ -143,6 +143,16 @@ export type QoderPluginCardProps =
 
 /** Page-level poll period, in milliseconds. */
 const POLL_INTERVAL_MS = 60_000
+/**
+ * Poll period while a native-component install is running, in milliseconds.
+ *
+ * Deliberately much shorter than {@link POLL_INTERVAL_MS}: an install usually
+ * finishes in well under a minute, so the page cadence would leave the button
+ * showing "installing" long after the job ended. It is a separate constant
+ * rather than a shared one because the two poll different things on different
+ * timescales — balances age slowly, a download does not.
+ */
+const UMID_POLL_INTERVAL_MS = 3_000
 /** 10:00 UTC+8, the upstream campaign's reset moment (mirrors QuotaSettingsCard). */
 const CHECK_IN_MINUTE_DEFAULT = 600
 /** Default billing-endpoint poll period, in milliseconds (mirrors the settings face). */
@@ -1112,6 +1122,21 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
   const [resettingDevices, setResettingDevices] = useState(false)
   const [deviceResetError, setDeviceResetError] = useState<string>()
   const [deviceResetNotice, setDeviceResetNotice] = useState<string>()
+  /**
+   * The native-component install at the bottom of the card.
+   *
+   * Its own busy/notice pair, for the same reason the reset has one: the answer
+   * is a job id, and "started" / "already running" / "could not start" have
+   * nowhere else to appear. Kept separate from `resettingDevices` because the
+   * two buttons touch unrelated host state and one must not disable the other.
+   *
+   * The busy flag only covers the REQUEST. Once it is answered the install keeps
+   * running host-side, and `nativeDevice.installing` from the status document is
+   * what keeps the button disabled until it finishes.
+   */
+  const [installingUmid, setInstallingUmid] = useState(false)
+  const [umidError, setUmidError] = useState<string>()
+  const [umidNotice, setUmidNotice] = useState<string>()
   const mounted = useRef(true)
   const manualControllers = useRef(new Set<AbortController>())
 
@@ -1279,6 +1304,41 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
     }
   }, [currentSignIn, currentVariant, isUnified, readVariant])
 
+  /*
+   * The install poll: a short cadence that lives only while a job is running.
+   *
+   * It cannot ride the 60s poll above, for two independent reasons.
+   *
+   * That poll bails out for a variant known to be signed out, and a missing
+   * native component is most often seen BEFORE sign-in — installing it is the
+   * thing that makes signing in work, not the other way round. Leaning on the
+   * page poll would leave the button stuck on "installing" for a minute, or
+   * forever on a signed-out card.
+   *
+   * And the cadence is wrong: an install normally ends inside half a minute, so
+   * the page interval would show a finished job as still running for up to two
+   * minutes. `installing` is component state, not account state, which is why
+   * this effect is gated on it alone and not on `currentSignIn`.
+   *
+   * The read is forced (`refresh` is the card's forced entry point) because the
+   * host's freshness gate would otherwise answer from cache and never surface
+   * the moment the job finished. The result notice is left alone here: the
+   * effect only refreshes the document, and the outcome the user must read is
+   * whatever `installNativeDevice` or the document's `lastError` already set.
+   */
+  const umidInstalling = status?.nativeDevice?.installing === true
+  useEffect(() => {
+    if (!umidInstalling) return
+    const controller = new AbortController()
+    const timer = window.setInterval(() => {
+      void refresh(controller.signal)
+    }, UMID_POLL_INTERVAL_MS)
+    return () => {
+      window.clearInterval(timer)
+      controller.abort()
+    }
+  }, [umidInstalling, refresh])
+
   const manualRefresh = async (): Promise<void> => {
     setBusy(true)
     const controller = trackController()
@@ -1393,11 +1453,13 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
               ? t('autoCheckInStatusAlready')
               : result.state === 'no-campaign'
                 ? t('autoCheckInStatusNoCampaign')
-                : result.reasonCode === 'no-client'
-                  ? t('checkInNeedsClient')
-                  : result.reason === undefined
-                    ? undefined
-                    : t('autoCheckInStatusError', { message: result.reason })
+                : result.reasonCode === 'no-native-component'
+                  ? t('checkInNeedsUmid')
+                  : result.reasonCode === 'no-client'
+                    ? t('checkInNeedsClient')
+                    : result.reason === undefined
+                      ? undefined
+                      : t('autoCheckInStatusError', { message: result.reason })
           if (text !== undefined) sentences.push(`${name} · ${text}`)
         } catch (error: unknown) {
           if (controller.signal.aborted === true) return
@@ -1458,6 +1520,56 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
       if (mounted.current) setResettingDevices(false)
     }
   }, [scope, t])
+
+  /**
+   * Install the native device-identity component.
+   *
+   * Goes through the scope, never to the route directly: the route requires the
+   * in-process settings key, and the scope is the only half that holds it (and
+   * the only half that can heal a rotated key). A `fetch` from here would have
+   * to re-derive the key, which is exactly the duplication this indirection
+   * exists to prevent.
+   *
+   * The answer is a job, not an install. `started` and `alreadyRunning` are both
+   * successes — the second one is the user pressing twice, or the sibling card
+   * asking — so both re-read the status document instead of reporting an error:
+   * the document carries `nativeDevice.installing`, and the short install poll
+   * above (see {@link UMID_POLL_INTERVAL_MS}) turns the button back on when the
+   * job ends. Reporting `alreadyRunning` as a failure would show an error for
+   * the state the user asked for.
+   */
+  const installNativeDevice = useCallback(async (): Promise<void> => {
+    // Called ON the scope, like the reset: the real implementation is a class
+    // method that reads `this.document`, so a detached function would throw on
+    // the first click while every test that stubs the scope still passed.
+    const active = scope
+    if (active?.installUmid === undefined) return
+    setUmidError(undefined)
+    setUmidNotice(undefined)
+    setInstallingUmid(true)
+    try {
+      const result = await active.installUmid()
+      if (!mounted.current) return
+      if (!result.ok) {
+        setUmidError(t('umidInstallFailed', { message: result.error ?? t('requestFailed') }))
+        return
+      }
+      setUmidNotice(result.alreadyRunning === true ? t('umidInstallRunning') : t('umidInstallStarted'))
+      // Re-read so the job's own state shows at once, and so the poll interval
+      // below carries the rest of it. `refresh` is the card's existing forced
+      // read; a failure here is already reported by the read path, so it is not
+      // allowed to overwrite the notice just set.
+      await refresh()
+    } catch (error: unknown) {
+      if (mounted.current) {
+        setUmidError(t('umidInstallFailed', {
+          message: error instanceof Error ? error.message : t('requestFailed'),
+        }))
+      }
+    } finally {
+      if (mounted.current) setInstallingUmid(false)
+    }
+  }, [refresh, scope, t])
 
   /**
    * One probe-route write, WITHOUT a status re-read.
@@ -1959,11 +2071,22 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
    */
   const settingsReady = settings.status === 'ready'
   /**
+   * The native device-identity component, as this variant's document reports it.
+   *
+   * Read off the CURRENT variant's document rather than off the signed-in one:
+   * the field rides every arm (a signed-out or failed card is exactly where the
+   * install entry is needed), and the two variants differ in whether it applies
+   * at all — a China-only card is told `applicable: false` and draws nothing.
+   */
+  const nativeDevice = status?.nativeDevice
+  /**
    * Whether 高级设置 has anything to fold: the tuning rows need a settings
    * face that carries them, and the device card needs a host that serves the
    * reset route. With neither, the disclosure is not drawn at all.
    */
-  const hasAdvancedRows = settings.status !== 'unavailable' || scope?.resetDeviceCodes !== undefined
+  const hasAdvancedRows = settings.status !== 'unavailable'
+    || scope?.resetDeviceCodes !== undefined
+    || (nativeDevice !== undefined && nativeDevice.applicable)
   const routingStrategy = settings.routingStrategy
   const routingStoredOrder = settings.routingOrder
   const routingNameOf = (id: string): string => {
@@ -2893,6 +3016,65 @@ export function QoderPluginCard(props: QoderPluginCardProps) {
                   )}
                   {deviceResetNotice === undefined ? null : (
                     <p className="qdp-caption" role="status">{deviceResetNotice}</p>
+                  )}
+                </>
+              )}
+              {/*
+                The native component. Shown only where it applies: the campaign
+                that needs it is the international one, so a China-only card
+                would be offering a download for something its campaign never
+                asks for. The button is gated separately on the scope method
+                (R10) — a host that serves no install route draws the state and
+                no action, because an inert button is worse than no button.
+              */}
+              {nativeDevice === undefined || !nativeDevice.applicable ? null : (
+                <>
+                  <h3 className="qdp-subHeading">{t('umidHeading')}</h3>
+                  <div className="qdp-row">
+                    <div className="qdp-rowText">
+                      <span className="qdp-rowDesc">{t('umidHint')}</span>
+                    </div>
+                    <div className="qdp-rowControl">
+                      {scope?.installUmid === undefined ? null : (
+                        <QdpButton
+                          size="sm"
+                          disabled={installingUmid || nativeDevice.installing}
+                          onClick={() => { void installNativeDevice() }}
+                        >
+                          {installingUmid || nativeDevice.installing ? t('umidInstalling') : t('umidInstallButton')}
+                        </QdpButton>
+                      )}
+                    </div>
+                  </div>
+                  {nativeDevice.installed ? (
+                    <p className="qdp-caption" role="status">
+                      {nativeDevice.version === undefined
+                        ? t('umidInstalled')
+                        : `${t('umidInstalled')} · v${nativeDevice.version}`}
+                    </p>
+                  ) : (
+                    <p className="qdp-note">{t('umidNotInstalled')} {t('umidOfflineHint')}</p>
+                  )}
+                  {nativeDevice.selfCheck === undefined || nativeDevice.selfCheck.ok ? null : (
+                    <p className="qdp-error" role="alert">
+                      {t('umidSelfCheckFailed', {
+                        message: nativeDevice.selfCheck.reason ?? t('requestFailed'),
+                      })}
+                    </p>
+                  )}
+                  {/* The last install's failure outlives the request that caused
+                      it: it is read from the document, so a reload still shows
+                      why the previous attempt did not take. */}
+                  {nativeDevice.lastError === undefined ? null : (
+                    <p className="qdp-error" role="alert">
+                      {t('umidInstallFailed', { message: nativeDevice.lastError })}
+                    </p>
+                  )}
+                  {umidError === undefined ? null : (
+                    <p className="qdp-error" role="alert">{umidError}</p>
+                  )}
+                  {umidNotice === undefined ? null : (
+                    <p className="qdp-caption" role="status">{umidNotice}</p>
                   )}
                 </>
               )}

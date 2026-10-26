@@ -27,6 +27,7 @@
     "tests/models-pane.spec.ts",
     "tests/composer-quota.spec.ts",
     "tests/client-quota-accounts.spec.ts",
-    "tests/client-settings-editing.spec.ts"
+    "tests/client-settings-editing.spec.ts",
+    "tests/umid-install-route.spec.ts"
   ]
 }

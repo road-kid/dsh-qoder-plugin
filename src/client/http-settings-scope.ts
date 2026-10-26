@@ -19,6 +19,7 @@ import type {
   QuotaSection,
   QuotaSettingsScope,
   QuotaSettingsSnapshot,
+  QuotaUmidInstallResult,
 } from './QuotaSettingsCard.tsx'
 
 /** Base path of the host half's settings face. */
@@ -331,6 +332,86 @@ export class OwnQuotaSettingsScope implements QuotaSettingsScope<QuotaSection> {
       // names the key: `request-not-trusted` (a cross-site or non-loopback
       // caller) will not be fixed by re-reading, and retrying it would spend a
       // round trip to learn the same thing.
+      const stale = response.status === 401
+        || response.status === 404
+        || response.status === 405
+        || (response.status === 403 && message === 'invalid-settings-key')
+      return { result: { ok: false, error: message }, stale }
+    } catch (error) {
+      return { result: { ok: false, error: describeFailure(error) }, stale: false }
+    }
+  }
+
+  /**
+   * Install the official native device-identity component.
+   *
+   * Same shape as {@link resetDeviceCodes}, and for the same reasons: this is
+   * not a settings write, so it goes to its own route with the same key, and a
+   * rotated write key (the host plugin reloaded, which re-mints the key) is
+   * healed by re-reading and retrying once. Without that the button would look
+   * broken until the page reloaded.
+   *
+   * The answer is a JOB, not an install. The host downloads, extracts, and
+   * self-checks in the background because the request cannot wait for that, so
+   * `ok` here means "a job is running" — the progress and the outcome are read
+   * from the status document, which the card already polls. `alreadyRunning` is
+   * a SUCCESS carrying the running job's id: the user pressed twice, or two
+   * cards asked, and the card then watches the job it did not start.
+   *
+   * @returns the host's verdict, or a failure carrying a message to show.
+   */
+  async installUmid(): Promise<QuotaUmidInstallResult> {
+    const sent = await this.sendInstall()
+    if (!sent.stale) return sent.result
+    const refreshed = await this.tryRead()
+    if (refreshed === undefined) return sent.result
+    return (await this.sendInstall()).result
+  }
+
+  /** @returns the host's verdict plus whether the key needs a re-read. */
+  private async sendInstall(): Promise<{ result: QuotaUmidInstallResult; stale: boolean }> {
+    // The same race the reset has: the button can be pressed before anything
+    // else on the card has read the settings face (a signed-out account never
+    // polls it). Read once here rather than answering "not loaded yet" to a
+    // user who cannot act on that.
+    if (this.document === undefined) await this.tryRead()
+    const key = this.document?.key
+    if (key === undefined) {
+      return { result: { ok: false, error: 'the settings service has not loaded yet' }, stale: false }
+    }
+    try {
+      const response = await fetch(`${ROUTE_BASE}/umid-install`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-Qoder-Settings-Key': key },
+        /*
+         * `force: false` on purpose. A press means "make sure the component is
+         * installed", not "replace the copy that is working": a reinstall
+         * spends a download and a self-check to reach the state the host is
+         * already in, and a user who wants that can delete the directory. The
+         * flag exists on the route so a future explicit action can set it.
+         */
+        body: JSON.stringify({ force: false }),
+      })
+      const value: unknown = await response.json().catch(() => undefined)
+      const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+      if (record !== undefined && record['ok'] === true) {
+        const jobId = typeof record['jobId'] === 'string' ? record['jobId'] : undefined
+        return {
+          result: {
+            ok: true,
+            started: record['started'] === true,
+            alreadyRunning: record['alreadyRunning'] === true,
+            ...jobId === undefined ? {} : { jobId },
+          },
+          stale: false,
+        }
+      }
+      const message = typeof record?.['error'] === 'string' ? record['error'] : `HTTP ${response.status}`
+      // Same rule as the reset: a 403 is only "re-keyed" when the host names
+      // the key. `request-not-trusted` (a cross-site or non-loopback caller)
+      // will not be fixed by re-reading, and retrying it would spend a round
+      // trip to learn the same thing.
       const stale = response.status === 401
         || response.status === 404
         || response.status === 405

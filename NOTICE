@@ -17,5 +17,12 @@ projects. Thanks to their authors. / 本项目的实现参考了以下开源项�
 3. dsh-provider-qoder (MIT) — Qoder transport protocol details.
    https://github.com/mo-n/dsh-provider-qoder
 
+4. qoder2api-hub (MIT) — the reference implementation of Qoder's native
+   device-identity protocol: how the `runtime-info` component is asked for the
+   signed machine identity, the shape of the campaign machine-header set, and the
+   desktop vocabulary (`win32`) that the campaign endpoint expects for
+   `cosy-machineos`. The behaviour this plugin reproduces was observed there; the
+   code is this project's own. Cited in docs/spec-native-device-identity.md §1.
+
 This project is released under the MIT License; see LICENSE.
 本项目按 MIT 许可发布，详见 LICENSE。

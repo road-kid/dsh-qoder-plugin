@@ -68,6 +68,34 @@ export interface QuotaSettingsScope<T> {
    * and is shown as such; only a thrown error means the card could not ask.
    */
   resetDeviceCodes?: (() => Promise<QuotaDeviceResetResult>) | undefined
+  /**
+   * Install the official native device-identity component, then report what
+   * happened.
+   *
+   * Optional for the same reason as {@link QuotaSettingsScope.resetDeviceCodes}:
+   * the install is a host write behind its own route, and a host that serves no
+   * such route must leave the card without a button rather than with one that
+   * cannot work. Its absence is also how the China card stays quiet — that
+   * variant's campaign is not identity-gated, so it has nothing to install for.
+   *
+   * A resolved `alreadyRunning` is an ANSWER, not a failure: the card then polls
+   * the status document for the job it was told about instead of reporting an
+   * error for the state the user asked for.
+   */
+  installUmid?: (() => Promise<QuotaUmidInstallResult>) | undefined
+}
+
+/** What one native-component install did, as the card reports it. */
+export interface QuotaUmidInstallResult {
+  ok: boolean
+  /** Whether this call started the job. */
+  started?: boolean
+  /** Whether a job was already running and this call merely observed it. */
+  alreadyRunning?: boolean
+  /** Identifier of the job, whether started here or already running. */
+  jobId?: string
+  /** Why the install could not be started, as a message for the user. */
+  error?: string
 }
 
 /** What one device-code reset did, as the card reports it. */

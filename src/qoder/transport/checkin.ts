@@ -10,8 +10,10 @@ import {
 import { isQoderAuthRejection, QoderLlmError } from '../errors.ts'
 import type { QoderLogger } from './logging.ts'
 import { openApiJsonRequest } from './request.ts'
-import { qoderDesktopClientType } from './wire/cosy.ts'
-import { resolveRiskIdentity, type QoderRiskIdentity } from './risk-identity.ts'
+import { qoderDesktopClientType, campaignMachineOs } from './wire/cosy.ts'
+import { campaignHostname, resolveRiskIdentity, type QoderRiskIdentity } from './risk-identity.ts'
+import { deriveMachineHostname, deriveMachineId } from './device-identity.ts'
+import { readDeviceSeed } from './device-seed.ts'
 import { getClaimWindowDateString, DEFAULT_CLAIM_WINDOW_MINUTE } from '../../claim-window.ts'
 
 export interface QoderCampaignBenefit {
@@ -97,6 +99,18 @@ export interface QoderCheckInServiceOptions {
    */
   riskIdentity?: ((region: QoderRegion, uid: string) => Promise<QoderRiskIdentity | undefined>) | undefined
   /**
+   * The host-level seed the per-account derived headers are built from.
+   *
+   * The same seed the inference path uses (`device-seed.ts`), read here rather
+   * than injected from the transport so the campaign path cannot drift from it:
+   * the reset control's whole promise is that every account gets a fresh
+   * fingerprint, and a campaign `machineid` derived from the OLD seed after a
+   * reset would keep presenting the identity the user just retired. Injectable
+   * only so tests stay hermetic — the real value is a file under the user's
+   * home directory.
+   */
+  resolveDeviceSeed?: (() => string | undefined) | undefined
+  /**
    * When the daily claim window opens, in minutes past midnight UTC+8.
    *
    * The window runs from this moment until the same moment the next day, so it
@@ -109,19 +123,104 @@ export interface QoderCheckInServiceOptions {
 const defaultCheckInTimeoutMs = 15_000
 
 /**
+ * Which machine-header set the campaign family sends (SPEC-UMID-003 §3 R1).
+ *
+ * `three` (default) is the shape this plugin has been shipping: the three
+ * headers a real desktop client mints from its signed component. `six` is an
+ * EXPERIMENT — the mixed shape a reference implementation uses (derived
+ * `machineid`, real `machinehostname`, desktop-vocabulary `machineos`, plus the
+ * same three native values) — and it is off unless this environment variable
+ * says otherwise.
+ *
+ * Why a switch and not the default: the only measurements available cover one,
+ * five and six headers, and they get safer as headers are removed — three was
+ * never measured. Turning the extra headers on by default would therefore be an
+ * unverified change to every international user's device fingerprint, while the
+ * failure it risks is silent (the list comes back empty with HTTP 200, so the
+ * user sees "no campaign today" and never an error). Flipping one variable is
+ * also the whole rollback.
+ */
+export const CAMPAIGN_MACHINE_HEADERS_ENV = 'QODER_CAMPAIGN_MACHINE_HEADERS'
+
+/**
+ * Privacy switch that replaces the real hostname with a derived one (§3 R4).
+ *
+ * The only verified working six-header shape carries the machine's REAL
+ * hostname, so that is the default. Users who consider the hostname identifying
+ * can opt into the derived form, but it has never been observed working against
+ * the upstream — the README says so, and this variable is why the alternative
+ * exists at all.
+ */
+export const CAMPAIGN_DERIVED_HOSTNAME_ENV = 'QODER_CAMPAIGN_DERIVED_HOSTNAME'
+
+type CampaignMachineHeaderMode = 'three' | 'six'
+
+/**
+ * The header mode for the next request.
+ *
+ * Read per request rather than once at module load: it decides how many headers
+ * to send, not what the device is, so a long-running host may pick the switch up
+ * without a re-import and tests can flip it. Anything other than `six` — unset,
+ * empty, misspelled, `three` — means the shipped default, because a typo must
+ * degrade to the measured shape and never to the experimental one.
+ */
+function campaignMachineHeaderMode(env: NodeJS.ProcessEnv = process.env): CampaignMachineHeaderMode {
+  return env[CAMPAIGN_MACHINE_HEADERS_ENV]?.trim().toLowerCase() === 'six' ? 'six' : 'three'
+}
+
+function campaignDerivedHostnameEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env[CAMPAIGN_DERIVED_HOSTNAME_ENV]?.trim().toLowerCase()
+  return value === '1' || value === 'true'
+}
+
+/**
  * The identity headers a real desktop client sends, or an empty set.
  *
  * An absent identity is NOT silently equivalent to a present one: the
  * international upstream withholds the daily campaign from a request without
  * it, so the caller distinguishes the two and reports the absence rather than
  * letting it look like "there is no campaign today".
+ *
+ * `three` mode sends exactly the three component-minted headers. `six` mode
+ * appends the mixed pair a reference implementation was observed using
+ * (§6.7) — derived `machineid`, real hostname, desktop-vocabulary `machineos` —
+ * and it must stay that exact combination: the point of the experiment is to
+ * test a shape that is known to work somewhere, not to invent a "3 native +
+ * 3 derived" hybrid nobody has ever sent.
+ *
+ * Without the account id the derived pair cannot be minted at all, so `six`
+ * degrades to `three` instead of sending a half-filled set: a request carrying
+ * `machineid` but not `machinehostname` is a combination with no evidence
+ * behind it, which is precisely what R1 forbids.
+ *
+ * `seed` is the host-level reset seed. It only perturbs the two derived values,
+ * so the three native headers keep the identity the signed component minted —
+ * and a reset retires the campaign fingerprint at the same moment it retires
+ * the inference one, instead of leaving the campaign path presenting the id the
+ * user just rotated away from.
  */
-function riskHeaders(identity: QoderRiskIdentity | undefined): Record<string, string> {
+function riskHeaders(
+  identity: QoderRiskIdentity | undefined,
+  uid: string | undefined,
+  resolveSeed: () => string | undefined,
+): Record<string, string> {
   if (identity === undefined) return {}
-  return {
+  const native: Record<string, string> = {
     'cosy-machinetoken': identity.machineToken,
     'cosy-machinecode': identity.machineCode,
     'cosy-machinetype': identity.machineType,
+  }
+  if (uid === undefined || campaignMachineHeaderMode() !== 'six') return native
+  // Read only here: `three` mode never derives anything, and a request that
+  // cannot use the seed must not pay for the file read on every check-in.
+  const seed = resolveSeed()
+  return {
+    ...native,
+    'cosy-machineid': deriveMachineId(uid, undefined, seed),
+    'cosy-machineos': campaignMachineOs,
+    'cosy-machinehostname': campaignDerivedHostnameEnabled()
+      ? deriveMachineHostname(uid, seed)
+      : campaignHostname(),
   }
 }
 
@@ -178,6 +277,7 @@ export class QoderCheckInService {
   private readonly logger: QoderLogger | undefined
   private readonly timeoutMs: number
   private readonly riskIdentity: (region: QoderRegion, uid: string) => Promise<QoderRiskIdentity | undefined>
+  private readonly resolveDeviceSeed: () => string | undefined
   private readonly windowMinute: number
 
   constructor(options: QoderCheckInServiceOptions) {
@@ -188,17 +288,30 @@ export class QoderCheckInService {
     this.logger = options.logger
     this.timeoutMs = options.timeoutMs ?? defaultCheckInTimeoutMs
     this.riskIdentity = options.riskIdentity ?? resolveRiskIdentity
+    this.resolveDeviceSeed = options.resolveDeviceSeed ?? readDeviceSeed
     this.windowMinute = options.windowMinute ?? DEFAULT_CLAIM_WINDOW_MINUTE
   }
 
-  async fetchCampaigns(token: string, signal?: AbortSignal, identity?: QoderRiskIdentity): Promise<QoderCampaign[]> {
+  /**
+   * @param identity the component-minted identity, or undefined when this machine has none
+   * @param uid the signed-in account id; `six` mode needs it to derive `machineid`
+   */
+  async fetchCampaigns(
+    token: string,
+    signal?: AbortSignal,
+    identity?: QoderRiskIdentity,
+    uid?: string,
+  ): Promise<QoderCampaign[]> {
     const url = getQoderCampaignsUrl(this.region)
     const data = await openApiJsonRequest<QoderCampaignsResponse>(this.fetchImpl, {
       url,
       token,
       // The campaign family gates on the desktop identifier; the generic one
       // answers 200 with an empty list (see `qoderDesktopClientType`).
-      headers: { 'cosy-clienttype': qoderDesktopClientType, ...riskHeaders(identity) },
+      headers: {
+        'cosy-clienttype': qoderDesktopClientType,
+        ...riskHeaders(identity, uid, this.resolveDeviceSeed),
+      },
       // Byte-identical 1.0.0 fingerprint: this family is risk-gated, so it must
       // not follow the inference build's version pair.
       fingerprint: 'campaign',
@@ -211,14 +324,25 @@ export class QoderCheckInService {
     return Array.isArray(data?.campaigns) ? data.campaigns : []
   }
 
-  async claimCampaign(token: string, campaignId: string, signal?: AbortSignal, identity?: QoderRiskIdentity): Promise<QoderClaimResponse> {
+  /** @param uid the signed-in account id; `six` mode needs it to derive `machineid` */
+  async claimCampaign(
+    token: string,
+    campaignId: string,
+    signal?: AbortSignal,
+    identity?: QoderRiskIdentity,
+    uid?: string,
+  ): Promise<QoderClaimResponse> {
     const url = getQoderClaimCampaignUrl(this.region, campaignId)
     const { openApiUrl } = resolveQoderEndpoints(this.region)
     return openApiJsonRequest<QoderClaimResponse>(this.fetchImpl, {
       url,
       method: 'POST',
       token,
-      headers: { origin: openApiUrl, 'cosy-clienttype': qoderDesktopClientType, ...riskHeaders(identity) },
+      headers: {
+        origin: openApiUrl,
+        'cosy-clienttype': qoderDesktopClientType,
+        ...riskHeaders(identity, uid, this.resolveDeviceSeed),
+      },
       fingerprint: 'campaign',
       signal,
       timeoutMs: this.timeoutMs,
@@ -281,7 +405,7 @@ export class QoderCheckInService {
           message: 'No Qoder desktop client found on this machine, so the daily campaign cannot be requested. Install Qoder (international) and retry.',
         }
       }
-      const campaigns = await this.fetchCampaigns(authToken, signal, identity)
+      const campaigns = await this.fetchCampaigns(authToken, signal, identity, uid)
       // Look for daily benefit campaign (actionType === 'CLAIM_BENEFIT')
       const benefitCampaign = campaigns.find(c => c.actionType === 'CLAIM_BENEFIT')
       if (!benefitCampaign) {
@@ -312,7 +436,7 @@ export class QoderCheckInService {
       // failure, and only the campaign list can say what it meant.
       let claimResult: QoderClaimResponse
       try {
-        claimResult = await this.claimCampaign(authToken, benefitCampaign.campaignId, signal, identity)
+        claimResult = await this.claimCampaign(authToken, benefitCampaign.campaignId, signal, identity, uid)
       } catch (claimError) {
         if (!isClaimConflict(claimError)) throw claimError
         // The upstream refused the write as a conflict. Re-read the campaign
@@ -326,7 +450,7 @@ export class QoderCheckInService {
         let settled: QoderCampaign | undefined
         let settledListRead = false
         try {
-          const refreshed = await this.fetchCampaigns(authToken, signal, identity)
+          const refreshed = await this.fetchCampaigns(authToken, signal, identity, uid)
           settled = refreshed.find(c => c.actionType === 'CLAIM_BENEFIT')
           settledListRead = true
         } catch (readError) {

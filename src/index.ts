@@ -30,13 +30,15 @@ import { createQoderTransport, type QoderCheckInResult, type QoderPooledAccount,
 import type { QoderRegion } from './qoder/region.ts'
 import { getMachineId } from './qoder/transport/machine-id.ts'
 import { readDeviceSeed, rotateDeviceSeed } from './qoder/transport/device-seed.ts'
-import { registerQoderDeviceResetRoute, type QoderDeviceResetOutcome } from './device-reset-route.ts'
+import { createQoderUmidInstallRunner, registerQoderDeviceResetRoute, registerQoderUmidInstallRoute, type QoderDeviceResetOutcome, type QoderUmidInstallOutcome } from './device-reset-route.ts'
+import { installUmid, readUmidManifest, umidDir, umidInstalled } from './qoder/transport/umid-extract.ts'
+import { identityCacheStatus } from './qoder/transport/risk-identity-cache.ts'
 import { registerQoderStatusRoute, webPlan } from './web-status.ts'
 import { createProbeKey, registerQoderProbeRoute } from './probe-route.ts'
 import { CheckInScheduler, DEFAULT_CHECK_IN_MINUTE, JsonFileCheckInStore, normalizeCheckInMinute } from './checkin-scheduler.ts'
 import { getClaimWindowDateString } from './claim-window.ts'
 import type { QoderModelInfo } from './catalog.ts'
-import type { QoderAccountHealth, QoderWebCatalog, QoderWebProbeSection, QoderWebUpstreamNotice } from './status-paths.ts'
+import type { QoderAccountHealth, QoderNativeDeviceStatus, QoderWebCatalog, QoderWebProbeSection, QoderWebUpstreamNotice } from './status-paths.ts'
 import { QODER_SETTINGS_FACE_PATH } from './status-paths.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 import { emitJobTokenHint, emitJobTokenRefreshFailedHint, emitUpstreamNotice, installJobTokenHint } from './job-token-hint.ts'
@@ -2207,6 +2209,79 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   ctx.inject(['webServer'], webCtx => {
+    /*
+     * The native device-identity component, as one process-wide install job.
+     *
+     * One runner, not one per variant, because there is ONE component directory
+     * and one download: two variants installing at the same time would race on
+     * the same staging directory, and the card of whichever variant lost would
+     * report a failure that has nothing to do with what the user asked for.
+     *
+     * The install is `installUmid`'s job to get right; this only turns its
+     * verdict into the shape the runner records, and it never throws on a
+     * failure — an asynchronous rejection could only be observed through the
+     * status document, and an `ok: false` result reaches the same place with a
+     * better message.
+     */
+    const umidRunner = createQoderUmidInstallRunner(async (force): Promise<QoderUmidInstallOutcome> => {
+      const result = await installUmid({ force })
+      return result.ok
+        ? { ok: true }
+        : { ok: false, ...result.error === undefined ? {} : { error: result.error } }
+    })
+    /**
+     * Project the component's state for one variant's status document.
+     *
+     * A callback, not a value: an install finishes between two polls, and the
+     * card learns that from the document it already reads rather than from a
+     * second route. The reads are local and small (a stat plus one JSON file),
+     * so paying them per poll is cheaper than caching state that could then
+     * disagree with the disk the install actually wrote.
+     *
+     * `applicable` is per variant: only the international service gates its
+     * campaign on the identity this component mints, so a China-only card must
+     * not grow an install section for something its campaign never asks for.
+     *
+     * `identity` describes the on-disk cache only, never the in-process one: a
+     * status document whose answer depended on which process asked would be
+     * untrustworthy, and the interesting case — component deleted by antivirus
+     * while a sampled identity still serves check-in — is exactly the one the
+     * disk records. Absent when this realm has no cache at all, which reads as
+     * "no identity yet" and is the normal state before the first check-in.
+     */
+    const nativeDeviceOf = (runtime: VariantRuntime): (() => QoderNativeDeviceStatus) => () => {
+      const dir = umidDir()
+      const manifest = readUmidManifest(dir)
+      const job = umidRunner.state()
+      const identity = identityCacheStatus(runtime.variant.region)
+      return {
+        applicable: runtime.variant.id !== CHINA_VARIANT.id,
+        installed: umidInstalled(dir),
+        dir,
+        ...manifest === undefined ? {} : { version: manifest.source.version },
+        ...manifest === undefined
+          ? {}
+          : {
+              selfCheck: {
+                ok: manifest.selfCheck.ok,
+                ...manifest.selfCheck.at === undefined ? {} : { at: manifest.selfCheck.at },
+                ...manifest.selfCheck.reason === undefined ? {} : { reason: manifest.selfCheck.reason },
+              },
+            },
+        installing: job.installing,
+        ...job.jobId === undefined ? {} : { jobId: job.jobId },
+        ...job.lastError === undefined ? {} : { lastError: job.lastError },
+        ...identity === undefined
+          ? {}
+          : {
+              identity: {
+                cachedAt: identity.cachedAt,
+                stale: identity.stale,
+                source: identity.stale ? 'cache-stale' : 'cache',
+              },
+            },
+      }
+    }
     for (const runtime of runtimes) {
       registerQoderStatusRoute(webCtx, {
         path: runtime.variant.statusPath,
@@ -2229,6 +2304,7 @@ export function apply(ctx: Context, config: Config): void {
             disabledModels: () => current().disabledModels ?? [],
           }),
         jobTokenRefreshedAt: runtime.jobTokenRefreshedAt,
+        nativeDevice: nativeDeviceOf(runtime),
         accounts: async () => {
           const [summaries, stored] = await Promise.all([
             runtime.store.accounts(),
@@ -2520,10 +2596,30 @@ export function apply(ctx: Context, config: Config): void {
               void runtime.client.fetchCredits().catch(() => undefined)
             }
           }
+          /*
+           * R12: `no-client` is the transport's one "cannot mint an identity"
+           * verdict, but it covers two situations the card must answer
+           * differently. On this machine the component COULD be installed and
+           * simply is not, so the honest reason is `no-native-component` — the
+           * card then points at the install button, which fixes it. A machine
+           * that can never have it (the China variant, whose campaign is not
+           * identity-gated, or an unsupported platform) keeps `no-client`, whose
+           * hint says so instead of pointing at a button that would not help.
+           *
+           * Decided here, host-side, because only the host can see the disk: the
+           * card cannot tell "installable but missing" from "not installable"
+           * without being told.
+           */
+          const nativeDevice = nativeDeviceOf(runtime)()
+          const reasonCode = result.reasonCode === 'no-client'
+              && nativeDevice.applicable
+              && !nativeDevice.installed
+            ? 'no-native-component'
+            : result.reasonCode
           return {
             state: result.status,
             ...result.amount === undefined ? {} : { amount: result.amount },
-            ...result.reasonCode === undefined ? {} : { reasonCode: result.reasonCode },
+            ...reasonCode === undefined ? {} : { reasonCode },
             ...result.message === undefined ? {} : { reason: result.message },
           }
         },
@@ -2605,6 +2701,11 @@ export function apply(ctx: Context, config: Config): void {
     // Same key as the settings face: both are control writes the browser card
     // performs, and the card already holds that key from its settings document.
     registerQoderDeviceResetRoute(webCtx, { reset: resetDeviceCodes }, controlKeys().probe)
+    // The same key and the same guard, because an install is the other control
+    // write this card performs. It answers with a job id and returns at once:
+    // the download, extraction, and self-check run in the background and are
+    // observed through the status document, which the card already polls.
+    registerQoderUmidInstallRoute(webCtx, { runner: umidRunner }, controlKeys().probe)
   })
 
   // Each settings section is what makes its namespace "served" — which is how

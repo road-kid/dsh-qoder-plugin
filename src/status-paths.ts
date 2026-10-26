@@ -63,6 +63,18 @@ export const QODER_GLOBAL_AUTH_PATH = '/plugins/dsh-qoder-plugin/global/auth'
 export const QODER_DEVICE_RESET_PATH = '/plugins/dsh-qoder-plugin/device-reset'
 
 /**
+ * Plugin-owned native-component (UMID) install endpoint.
+ *
+ * One POST starts a background job that installs the official `runtime-info`
+ * component into the host-level component directory, which is what lets the
+ * international daily campaign be requested on a machine with no Qoder desktop
+ * client. A write (it puts an executable on disk), so it carries the same
+ * loopback Host/Origin guard and the in-process settings key as the other
+ * control routes.
+ */
+export const QODER_UMID_INSTALL_PATH = '/plugins/dsh-qoder-plugin/umid-install'
+
+/**
  * One action the PAT route accepts.
  *
  * `save-pat` validates the pasted token against the variant's region and, only
@@ -424,6 +436,56 @@ export interface QoderWebUpstreamNotice {
   occurrences: number
 }
 
+/**
+ * State of the official native device-identity component.
+ *
+ * The international daily campaign is gated on machine-identity headers that
+ * only the official `runtime-info` component can produce, so whether that
+ * component is present on this host is the difference between "today's credits
+ * can be requested" and "they cannot, and here is the one action that fixes
+ * it". Carried on every status arm — a signed-out card and a failed card are
+ * exactly the two places a user needs the install entry point, and a field
+ * present only on the signed-in arm would hide it there.
+ */
+export interface QoderNativeDeviceStatus {
+  /**
+   * Whether this concept applies at all — i.e. the host serves the
+   * international variant, the only one whose campaign is identity-gated.
+   * A China-only install renders nothing rather than an empty section.
+   */
+  applicable: boolean
+  /** Whether a usable component is present in {@link dir}. */
+  installed: boolean
+  /** The host-level component directory, whether or not it is populated. */
+  dir: string
+  /** Package version the component was extracted from, when recorded. */
+  version?: string
+  /** The post-install self-check result, when one was recorded. */
+  selfCheck?: { ok: boolean; at?: string; reason?: string }
+  /** Whether an install job is running right now. */
+  installing: boolean
+  /** Identifier of the running install job, when one is running. */
+  jobId?: string
+  /** The last install failure, redacted, for the card to show verbatim. */
+  lastError?: string
+  /**
+   * Where the machine identity in effect came from.
+   *
+   * `cache-stale` is the case worth surfacing: the component is gone (deleted
+   * by antivirus, or `~/.dsh` cleaned) but a previously sampled identity is
+   * still usable, so check-in keeps working while a re-sample is retried in the
+   * background. Without this the card cannot distinguish that from a fresh
+   * read.
+   */
+  identity?: {
+    /** When the identity was sampled, epoch milliseconds. */
+    cachedAt: number
+    /** Whether it is past its configured TTL. */
+    stale: boolean
+    source: 'component' | 'cache' | 'cache-stale'
+  }
+}
+
 /** The JSON document the plugin card renders. */
 export type QoderWebStatus =
   | {
@@ -528,6 +590,8 @@ export type QoderWebStatus =
      * the document for the same reason `probeKey` does.
      */
     authKey?: string
+    /** Native device-identity component state; see {@link QoderNativeDeviceStatus}. */
+    nativeDevice?: QoderNativeDeviceStatus
   }
   | {
     /**
@@ -550,5 +614,19 @@ export type QoderWebStatus =
      * `probeKey` for why it travels with the document.
      */
     authKey?: string
+    /**
+     * Native device-identity component state.
+     *
+     * Carried on this arm too: a signed-out card is one of the two places the
+     * install entry point is most needed — the international campaign cannot be
+     * requested at all without the component, so the reason a newly signed-in
+     * user sees no credits would otherwise be invisible until after sign-in.
+     */
+    nativeDevice?: QoderNativeDeviceStatus
   }
-  | { status: 'error'; message: string }
+  | {
+    status: 'error'
+    message: string
+    /** Native device-identity component state; see the signed-in arm. */
+    nativeDevice?: QoderNativeDeviceStatus
+  }

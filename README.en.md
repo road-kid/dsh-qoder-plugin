@@ -119,7 +119,25 @@ The cards draw no chrome of their own: theme, colours and button shapes all come
 
 **A settings change does not stick** — controls only accept values inside the allowed range; out-of-range input is not written. Number fields commit on blur, and a refused commit falls back to the saved value.
 
-**Global check-in asks for the Qoder desktop app** — the Global service only offers that campaign to machines with the Qoder desktop client installed. Install it and retry; China has no such requirement.
+**Global check-in asks for the Qoder desktop app** — the Global service only offers that campaign to machines that can present a signed device identity. Install the desktop app, or install the plugin's native component (the button on the card, or `dsh-qoder-plugin umid install`); either works. China has no such requirement.
+
+## Known limitations
+
+This version's identity support comes from the native component inside the Qoder client, and its edges are worth stating up front:
+
+**The native component ships per platform** — only `win32-x64`, `darwin-x64`, `darwin-arm64`, `linux-x64` and `linux-arm64` are offered. Any other target (say `win32-arm64`) fails with an explicit "unsupported platform" instead of leaving half a file behind. The component lands in `~/.dsh/qoder/umid/`; `QODER_UMID_DIR` moves it.
+
+**Offline install** — `dsh-qoder-plugin umid install --from-tarball <path>` installs from a local tarball through the same verify, self-check and promote path as a networked install. A networked install fetches `@qoder-ai/qodercli` from npm.
+
+**Several accounts on one machine still claim once** — the upstream deduplicates by device and window, so the first account to claim in a window gets it and the rest do not. The plugin does not work around that.
+
+**Virtual machines get misreported** — VMs, cloned images and template-spawned hosts often share one set of hardware fingerprints, which the upstream may read as one device, or answer by not offering the campaign at all.
+
+**The experimental six-header mode is unverified in production** — the default sends the three native headers, which is the shape that works on the live service. `QODER_CAMPAIGN_MACHINE_HEADERS=six` adds three derived headers; that exact combination has only been observed in a reference implementation and has no production data behind it here. It is off by default, and one variable rolls it back.
+
+**The derived hostname shape is unverified** — six-header mode sends the real hostname by default, the only shape ever observed working. `QODER_CAMPAIGN_DERIVED_HOSTNAME=1` swaps in an account-derived hostname: better privacy, never verified against the upstream.
+
+**The identity cache's TTL means something different here** — `QODER_UMID_IDENTITY_TTL` is in **milliseconds** (default `0`, never expires). Expiry only re-samples the identity; it does **not** clear the device seed. The reference implementation treats expiry as "this is a different device now"; this plugin deliberately does not, because check-in is a daily action and rotating identities on a timer would drift an account's fingerprint for no reason. There is exactly one way to change identity: `dsh-qoder-plugin umid reset-native`, which clears both the seed and the cached identity.
 
 ## Development
 

@@ -1,21 +1,30 @@
 #!/usr/bin/env node
 /** Standalone status/diagnostics/PAT CLI for the dsh-qoder-plugin bundle. */
 
-import { realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { QoderCredentialStore, qoderCredentialIdentity } from './auth.ts'
 import { QoderUpstreamClient, validateApiKey } from './upstream.ts'
 import { createQoderTransport } from './qoder/transport/index.ts'
+import { installUmid, readUmidManifest, umidBinaryPath, umidDir, umidInstalled } from './qoder/transport/umid-extract.ts'
+import type { UmidManifest, UmidSelfCheck } from './qoder/transport/umid-extract.ts'
+import { defaultDeviceSeedPath } from './qoder/transport/device-seed.ts'
+import { clearMachineIdentityCache, identityCachePath, identityTtlMs } from './qoder/transport/risk-identity-cache.ts'
+import { clearIdentityMemoryCache } from './qoder/transport/risk-identity.ts'
+import type { QoderRegion } from './qoder/region.ts'
 import { FALLBACK_QODER_MODELS } from './catalog.ts'
 import { QoderCatalogStore, qoderCatalogPath } from './catalog-store.ts'
 import { QODER_CONNECT_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, qoderHostHeartbeatPath, readHostHeartbeat } from './host-heartbeat.ts'
 import { CHINA_VARIANT, QODER_VARIANTS, variantFor, type QoderVariant } from './variants.ts'
 
-type Action = 'doctor' | 'status' | 'pat' | 'logout' | 'catalog'
+type Action = 'doctor' | 'status' | 'pat' | 'logout' | 'catalog' | 'umid'
 type PatCommand = 'set' | 'clear'
 type CatalogCommand = 'refresh'
+type UmidCommand = 'install' | 'status' | 'reset-native'
 
 const JSON_SCHEMA_VERSION = 1
 
@@ -29,7 +38,7 @@ function safeMessage(error: unknown): string {
 
 function printHelp(): void {
   process.stdout.write([
-    'Usage: dsh-qoder-plugin <doctor|status|pat|logout|catalog> [--provider <id>] [--json] [--file <path>]',
+    'Usage: dsh-qoder-plugin <doctor|status|pat|logout|catalog|umid> [--provider <id>] [--json] [--file <path>]',
     '',
     '  doctor         secret-free environment diagnostics',
     '  status         credential state and remaining Qoder credit',
@@ -38,10 +47,21 @@ function printHelp(): void {
     '  logout         alias for `pat clear`',
     '  catalog refresh   re-fetch the model list and save it for this account',
     '',
+    '  umid install      fetch and install the native device-identity component',
+    '  umid status       show the component, its manifest and the identity cache',
+    '  umid reset-native remove the identity seed so the next run mints a new one',
+    '',
     '  --provider  which product to act on; defaults to qoder',
     `              one of: ${QODER_VARIANTS.map(variant => variant.id).join(', ')}`,
-    '  --json      emit one secret-free JSON document (doctor/status only)',
+    '  --json      emit one secret-free JSON document (doctor/status/umid only)',
     '  --file      file to read the token from with `pat set`; "-" reads standard input',
+    '',
+    '  umid install flags:',
+    '    --from-tarball <path>  install from a local tarball instead of the registry',
+    '    --version <version>    pin a published version (default: dist-tags.latest)',
+    '    --force                reinstall even when the component is already present',
+    '  umid reset-native flags:',
+    '    --yes                  actually delete; without it the command only lists the targets',
     '',
     '  A token can also arrive as the positional argument after `pat set`.',
     '  Environment fallback: QODER_CN_PERSONAL_ACCESS_TOKEN (qoder) or',
@@ -78,6 +98,8 @@ async function doctor(jsonOutput: boolean, variant: QoderVariant): Promise<numbe
   const status = await store.status()
   const heartbeat = await readHostHeartbeat()
   const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
+  const component = readUmidComponentReport()
+  const identityCache = readIdentityCacheReport(variant.region)
   const report = {
     schemaVersion: JSON_SCHEMA_VERSION,
     package: 'dsh-qoder-plugin',
@@ -97,6 +119,15 @@ async function doctor(jsonOutput: boolean, variant: QoderVariant): Promise<numbe
     ...status.pat === undefined ? {} : { pat: status.pat },
     ...status.reason === undefined ? {} : { reason: status.reason },
     fallbackModels: FALLBACK_QODER_MODELS.length,
+    // Diagnostics only: an absent component is the normal state before the
+    // first install, so it never changes this command's exit code.
+    nativeDevice: {
+      componentDir: component.componentDir,
+      binary: component.binary,
+      installed: component.installed,
+      ...component.manifest === undefined ? {} : { manifest: component.manifest },
+      identityCache,
+    },
     hints: [
       ...status.state === 'configured'
         ? []
@@ -115,6 +146,9 @@ async function doctor(jsonOutput: boolean, variant: QoderVariant): Promise<numbe
       `Credential: ${status.state === 'configured' ? `configured (${status.pat?.source ?? 'file'}${status.pat?.patTail === undefined ? '' : `, tail …${status.pat.patTail}`})` : 'missing'}`,
       ...status.reason === undefined ? [] : [`Note: ${status.reason}`],
       `Static fallback models: ${report.fallbackModels}`,
+      `Native device: ${component.installed ? `component installed at ${component.componentDir}` : `component not installed (would live at ${component.componentDir})`}`,
+      ...component.manifest === undefined ? [] : [`  ${describeUmidManifest(component.manifest)}`],
+      `Identity cache: ${describeIdentityCache(identityCache)}`,
       ...report.hints.map(hint => `Hint: ${hint}`),
       '',
     ].join('\n'))
@@ -254,6 +288,267 @@ async function catalogRefresh(variant: QoderVariant): Promise<number> {
   return 0
 }
 
+/**
+ * The seed the Qoder client itself fingerprints (SPEC-UMID-003 §5.10, R8).
+ *
+ * Not this plugin's file: it belongs to the user's real client, which is why
+ * only `umid reset-native --yes` may delete it, and why nothing here recreates
+ * it — the client writes it on its next run, from the machine it is on.
+ */
+function nativeSeedPath(home: string = homedir()): string {
+  return join(home, '.config', '.locale_cfg')
+}
+
+/** What `doctor` and `umid status` report about the identity cache. */
+interface UmidIdentityCacheReport {
+  path: string
+  present: boolean
+  /** When the sample was taken, epoch milliseconds. */
+  cachedAt?: number
+  /** Age of the sample at the time of the read, milliseconds. */
+  ageMs?: number
+  /** True only when a TTL is set and the sample is older than it. */
+  stale: boolean
+  /** The TTL in force, milliseconds; `0` means never. */
+  ttlMs: number
+}
+
+/**
+ * Read the identity cache without changing it.
+ *
+ * Deliberately not {@link readCachedIdentity}: that function deletes a document
+ * it cannot migrate, which is right for the transport (it would fail on every
+ * check-in otherwise) but wrong for a diagnostics command — `doctor` must be
+ * safe to run on a machine whose state is already broken. A malformed document
+ * is therefore reported as absent rather than quietly repaired.
+ */
+function readIdentityCacheReport(region: QoderRegion, options: { home?: string; env?: NodeJS.ProcessEnv; now?: number } = {}): UmidIdentityCacheReport {
+  const path = identityCachePath(options.home ?? homedir())
+  const ttlMs = identityTtlMs(options.env ?? process.env)
+  const now = options.now ?? Date.now()
+  const absent: UmidIdentityCacheReport = { path, present: false, stale: false, ttlMs }
+  let document: unknown
+  try {
+    document = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    // Missing is the normal state before the first check-in; unreadable is not
+    // worth a failure in a diagnostics command, and the next check-in rewrites it.
+    return absent
+  }
+  if (typeof document !== 'object' || document === null) return absent
+  const realm = (document as { realm?: unknown }).realm
+  if (typeof realm !== 'object' || realm === null) return absent
+  const entry = (realm as Record<string, unknown>)[region]
+  if (typeof entry !== 'object' || entry === null) return absent
+  const cachedAt = (entry as { cachedAt?: unknown }).cachedAt
+  if (typeof cachedAt !== 'number' || !Number.isFinite(cachedAt)) return absent
+  const ageMs = now - cachedAt
+  return { path, present: true, cachedAt, ageMs, stale: ttlMs > 0 && ageMs >= ttlMs, ttlMs }
+}
+
+/** One line describing the identity cache, shared by `doctor` and `umid status`. */
+function describeIdentityCache(report: UmidIdentityCacheReport): string {
+  if (!report.present) return `absent at ${report.path}`
+  const cachedAt = report.cachedAt === undefined ? 'unknown' : new Date(report.cachedAt).toISOString()
+  const freshness = report.ttlMs <= 0
+    ? 'TTL 0, never expires'
+    : report.stale ? `stale, TTL ${report.ttlMs} ms` : `fresh, TTL ${report.ttlMs} ms`
+  return `present at ${report.path} (cached ${cachedAt}, ${freshness})`
+}
+
+/** One line describing the self-check that gated an install. */
+function describeSelfCheck(check: UmidSelfCheck): string {
+  const prefix = check.machineTokenSha256Prefix
+  return `${check.ok ? 'passed' : 'failed'}${prefix === undefined ? '' : ` (machine token sha256 …${prefix})`}`
+}
+
+/** One line describing an installed manifest. */
+function describeUmidManifest(manifest: UmidManifest): string {
+  return [
+    `version ${manifest.source.version}`,
+    `installed ${manifest.installedAt}`,
+    `self-check ${describeSelfCheck(manifest.selfCheck)}`,
+  ].join(', ')
+}
+
+/** What `doctor` and `umid status` report about the native component. */
+interface UmidComponentReport {
+  componentDir: string
+  binary: string
+  installed: boolean
+  manifest?: UmidManifest
+}
+
+function readUmidComponentReport(): UmidComponentReport {
+  const componentDir = umidDir()
+  const manifest = readUmidManifest(componentDir)
+  return {
+    componentDir,
+    binary: umidBinaryPath(process.platform, componentDir),
+    installed: umidInstalled(componentDir),
+    ...manifest === undefined ? {} : { manifest },
+  }
+}
+
+/**
+ * `umid install`: fetch, verify, self-check and promote the native component.
+ *
+ * Progress is written to stderr so `--json` still emits exactly one document on
+ * stdout; both branches carry the same facts. A failure is exit 1, never 2 —
+ * 2 is reserved for a malformed command line, which the caller detects before
+ * reaching this function.
+ */
+async function umidInstall(options: { fromTarball?: string | undefined; version?: string | undefined; force: boolean; json: boolean }): Promise<number> {
+  const result = await installUmid({
+    force: options.force,
+    ...options.fromTarball === undefined ? {} : { tarballPath: options.fromTarball },
+    ...options.version === undefined ? {} : { version: options.version },
+    logger: {
+      info: (message: string) => process.stderr.write(`${message}\n`),
+      warn: (message: string) => process.stderr.write(`warning: ${message}\n`),
+    },
+  })
+  if (options.json) {
+    printJson({ schemaVersion: JSON_SCHEMA_VERSION, package: 'dsh-qoder-plugin', command: 'umid install', ...result })
+  } else if (result.ok) {
+    process.stdout.write([
+      `Native device component ${result.skipped ? 'already installed' : 'installed'}: ${result.version} in ${result.destDir}`,
+      ...result.files.map(file => `  ${file.name} (${file.bytes} bytes)`),
+      `Self-check: ${describeSelfCheck(result.selfCheck)}`,
+      '',
+    ].join('\n'))
+  } else {
+    process.stderr.write(`dsh-qoder-plugin: umid install failed: ${safeMessage(result.error ?? 'unknown error')}\n`)
+  }
+  return result.ok ? 0 : 1
+}
+
+/**
+ * `umid status`: report the component, its manifest and the identity cache.
+ *
+ * Exit 0 even when nothing is installed: the command succeeded at reporting,
+ * and "no component yet" is the normal state on a machine that has never run
+ * the plugin. Failing here would make a status probe look like a fault.
+ */
+function umidStatus(jsonOutput: boolean, variant: QoderVariant): number {
+  const component = readUmidComponentReport()
+  const identity = readIdentityCacheReport(variant.region)
+  const report = {
+    schemaVersion: JSON_SCHEMA_VERSION,
+    package: 'dsh-qoder-plugin',
+    command: 'umid status',
+    provider: variant.id,
+    region: variant.region,
+    componentDir: component.componentDir,
+    binary: component.binary,
+    installed: component.installed,
+    ...component.manifest === undefined ? {} : { manifest: component.manifest },
+    identityCache: identity,
+    identityTtlNote: 'QODER_UMID_IDENTITY_TTL only decides when the identity is re-sampled; it never clears the stored seed (R9).',
+  }
+  if (jsonOutput) {
+    printJson(report)
+  } else {
+    process.stdout.write([
+      `Native device component: ${component.installed ? `installed at ${component.componentDir}` : `not installed (would live at ${component.componentDir})`}`,
+      ...component.manifest === undefined ? [] : [`  ${describeUmidManifest(component.manifest)}`],
+      `Identity cache: ${describeIdentityCache(identity)}`,
+      `Note: ${report.identityTtlNote}`,
+      ...component.installed ? [] : ['Hint: run `dsh-qoder-plugin umid install` to fetch the component.'],
+      '',
+    ].join('\n'))
+  }
+  return 0
+}
+
+/**
+ * `umid reset-native`: forget this machine's device seed and cached identity.
+ *
+ * Without `--yes` this is a dry run that only prints what would happen, because
+ * the seed is what the upstream has been told about this machine and its loss
+ * is irreversible.
+ *
+ * The order inside `--yes` is load-bearing: the seed is deleted first, then the
+ * disk cache, then the in-process cache. Deleting the cache first would leave a
+ * window in which a concurrent check-in still finds the seed, re-samples the
+ * identity the seed no longer backs, and writes it straight back — the reset
+ * would silently undo itself. The identity cache also has a default TTL of 0
+ * (never expires), so clearing it is not optional: without this step a reset
+ * keeps returning the old identity forever.
+ *
+ * `~/.config/.locale_cfg` — the official Qoder client's own seed — is never
+ * touched. It is the user's file, and rotating it would change the identity of
+ * their real client, not of this plugin.
+ *
+ * Exit 1 only when the seed was present and is still there afterwards: that is
+ * the one failure that makes the reset a lie. A cache clear that reports `false`
+ * is reported in words but is not a failure — the cache may simply have been
+ * empty already.
+ */
+function umidResetNative(options: { yes: boolean; json: boolean }): number {
+  const home = homedir()
+  const seedPath = defaultDeviceSeedPath()
+  const cachePath = identityCachePath(home)
+  const officialSeedPath = nativeSeedPath(home)
+  const seedPresent = existsSync(seedPath)
+  const cachePresent = existsSync(cachePath)
+
+  let cacheCleared = false
+  if (options.yes) {
+    if (seedPresent) {
+      try {
+        rmSync(seedPath, { force: true })
+      } catch {
+        // Reported below from the file system rather than from this catch: the
+        // fact that matters is whether the seed is gone, not whether rm threw.
+      }
+    }
+    try {
+      cacheCleared = clearMachineIdentityCache({ home })
+    } catch {
+      cacheCleared = false
+    }
+    clearIdentityMemoryCache()
+  }
+
+  const seedGone = !existsSync(seedPath)
+  const impact = 'The next check-in mints a fresh device seed and samples a fresh identity; the previous identity cannot be recovered.'
+  const officialNote = `Official client identity ${officialSeedPath} is untouched: only the Qoder client writes and rotates it.`
+  const seedLine = options.yes
+    ? seedPresent ? (seedGone ? `Removed device seed: ${seedPath}` : `Failed to remove device seed: ${seedPath}`) : `Device seed already absent: ${seedPath}`
+    : seedPresent ? `Would delete device seed: ${seedPath}` : `Device seed already absent: ${seedPath}`
+  const cacheLine = options.yes
+    ? cacheCleared
+      ? `Cleared identity cache: ${cachePath}`
+      : cachePresent ? `Failed to clear identity cache: ${cachePath}` : `Identity cache already absent: ${cachePath}`
+    : cachePresent ? `Would clear identity cache: ${cachePath}` : `Identity cache already absent: ${cachePath}`
+
+  if (options.json) {
+    printJson({
+      schemaVersion: JSON_SCHEMA_VERSION,
+      package: 'dsh-qoder-plugin',
+      command: 'umid reset-native',
+      dryRun: !options.yes,
+      seed: { path: seedPath, present: seedPresent, removed: options.yes && seedGone },
+      identityCache: { path: cachePath, present: cachePresent, cleared: cacheCleared },
+      memoryCacheCleared: options.yes,
+      officialClientSeed: { path: officialSeedPath, touched: false },
+      impact,
+    })
+  } else {
+    process.stdout.write([
+      seedLine,
+      cacheLine,
+      options.yes ? 'Cleared the in-process identity memory cache' : 'Would clear the in-process identity memory cache',
+      officialNote,
+      `Impact: ${impact}`,
+      ...options.yes ? [] : ['Re-run with --yes to perform this reset.'],
+      '',
+    ].join('\n'))
+  }
+  return !options.yes || seedGone ? 0 : 1
+}
+
 /** Execute one boot-free command. */
 export async function run(argv: readonly string[]): Promise<number> {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
@@ -261,9 +556,9 @@ export async function run(argv: readonly string[]): Promise<number> {
     return 0
   }
   const [rawAction, ...flags] = argv
-  const actions: readonly Action[] = ['doctor', 'status', 'pat', 'logout', 'catalog']
+  const actions: readonly Action[] = ['doctor', 'status', 'pat', 'logout', 'catalog', 'umid']
   if (!actions.includes(rawAction as Action)) {
-    process.stderr.write(`dsh-qoder-plugin: expected doctor, status, pat, logout, or catalog; got ${JSON.stringify(rawAction)}\n`)
+    process.stderr.write(`dsh-qoder-plugin: expected doctor, status, pat, logout, catalog, or umid; got ${JSON.stringify(rawAction)}\n`)
     return 1
   }
   const action = rawAction as Action
@@ -274,6 +569,10 @@ export async function run(argv: readonly string[]): Promise<number> {
   // names the file `pat set` reads the token from.
   let providerId: string | undefined
   let file: string | undefined
+  let fromTarball: string | undefined
+  let pinnedVersion: string | undefined
+  let force = false
+  let yes = false
   const rest: string[] = []
   for (let index = 0; index < flags.length; index += 1) {
     const flag = flags[index]!
@@ -295,6 +594,36 @@ export async function run(argv: readonly string[]): Promise<number> {
       file = flag.slice('--file='.length)
       continue
     }
+    // The umid flags are consumed here rather than left in `rest`: the hygiene
+    // check below only inspects non-`--` arguments, so a stray `--force` would
+    // otherwise pass silently for every other action.
+    if (flag === '--from-tarball' || flag === '--version') {
+      const value = flags[index + 1]
+      if (value === undefined || value.startsWith('--')) {
+        process.stderr.write(`dsh-qoder-plugin: ${flag} needs a value\n`)
+        return 2
+      }
+      if (flag === '--from-tarball') fromTarball = value
+      else pinnedVersion = value
+      index += 1
+      continue
+    }
+    if (flag.startsWith('--from-tarball=')) {
+      fromTarball = flag.slice('--from-tarball='.length)
+      continue
+    }
+    if (flag.startsWith('--version=')) {
+      pinnedVersion = flag.slice('--version='.length)
+      continue
+    }
+    if (flag === '--force') {
+      force = true
+      continue
+    }
+    if (flag === '--yes') {
+      yes = true
+      continue
+    }
     rest.push(flag)
   }
   const variant = providerId === undefined ? CHINA_VARIANT : variantFor(providerId)
@@ -308,6 +637,7 @@ export async function run(argv: readonly string[]): Promise<number> {
   // flag hygiene below can mistake it for an unknown option.
   let patCommand: PatCommand | undefined
   let catalogCommand: CatalogCommand | undefined
+  let umidCommand: UmidCommand | undefined
   if (action === 'pat') {
     const sub = rest.shift()
     patCommand = sub === 'set' || sub === 'clear' ? sub : undefined
@@ -324,14 +654,36 @@ export async function run(argv: readonly string[]): Promise<number> {
       return 1
     }
   }
+  if (action === 'umid') {
+    const sub = rest.shift()
+    umidCommand = sub === 'install' || sub === 'status' || sub === 'reset-native' ? sub : undefined
+    if (umidCommand === undefined) {
+      process.stderr.write(`dsh-qoder-plugin: umid needs install, status, or reset-native; got ${JSON.stringify(sub ?? '')}\n`)
+      return 2
+    }
+  }
   const unknown = rest.filter(flag => flag !== '--json' && !flag.startsWith('--'))
-  if (unknown.length > 0 || (jsonOutput && action !== 'doctor' && action !== 'status')) {
+  if (unknown.length > 0 || (jsonOutput && action !== 'doctor' && action !== 'status' && action !== 'umid')) {
     process.stderr.write(`dsh-qoder-plugin: invalid options for ${action}: ${flags.join(' ')}\n`)
     return 1
   }
   if (action !== 'pat' && file !== undefined) {
     process.stderr.write(`dsh-qoder-plugin: --file applies to pat set, not ${action}\n`)
     return 1
+  }
+  const umidOnlyFlags = [
+    ...fromTarball === undefined ? [] : ['--from-tarball'],
+    ...pinnedVersion === undefined ? [] : ['--version'],
+    ...force ? ['--force'] : [],
+  ]
+  if (umidOnlyFlags.length > 0 && !(action === 'umid' && umidCommand === 'install')) {
+    const verb = umidOnlyFlags.length === 1 ? 'applies' : 'apply'
+    process.stderr.write(`dsh-qoder-plugin: ${umidOnlyFlags.join(', ')} ${verb} to \`umid install\` only\n`)
+    return 2
+  }
+  if (yes && !(action === 'umid' && umidCommand === 'reset-native')) {
+    process.stderr.write('dsh-qoder-plugin: --yes applies to `umid reset-native` only\n')
+    return 2
   }
   try {
     switch (action) {
@@ -347,6 +699,10 @@ export async function run(argv: readonly string[]): Promise<number> {
         return await patClear(variant)
       case 'catalog':
         return await catalogRefresh(variant)
+      case 'umid':
+        if (umidCommand === 'install') return await umidInstall({ fromTarball, version: pinnedVersion, force, json: jsonOutput })
+        if (umidCommand === 'status') return umidStatus(jsonOutput, variant)
+        return umidResetNative({ yes, json: jsonOutput })
     }
   } catch (error: unknown) {
     process.stderr.write(`dsh-qoder-plugin: ${action} failed: ${safeMessage(error)}\n`)

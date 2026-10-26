@@ -1,5 +1,10 @@
-import { describe, expect, it, vi } from 'vitest'
-import { QoderCheckInService, type QoderCheckInResult } from '../src/qoder/transport/checkin.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  CAMPAIGN_DERIVED_HOSTNAME_ENV,
+  CAMPAIGN_MACHINE_HEADERS_ENV,
+  QoderCheckInService,
+  type QoderCheckInResult,
+} from '../src/qoder/transport/checkin.ts'
 import type { QoderAuthService } from '../src/qoder/transport/auth.ts'
 import {
   CheckInScheduler,
@@ -11,7 +16,15 @@ import {
   type CheckInRecord,
 } from '../src/checkin-scheduler.ts'
 import { QoderLlmError } from '../src/qoder/errors.ts'
-import { campaignCosyVersion, campaignUserAgent } from '../src/qoder/transport/wire/version.ts'
+import { campaignCosyVersion, campaignUserAgent, metadataCosyVersion } from '../src/qoder/transport/wire/version.ts'
+import {
+  buildAuthHeaders,
+  campaignMachineOs,
+  qoderDesktopClientType,
+  QODER_COSY_MACHINE_OS_ENV,
+} from '../src/qoder/transport/wire/cosy.ts'
+import { campaignHostname } from '../src/qoder/transport/risk-identity.ts'
+import { deriveMachineHostname, deriveMachineId } from '../src/qoder/transport/device-identity.ts'
 
 describe('QoderCheckInService', () => {
   function createMockAuth(token = 'mock-job-token'): QoderAuthService {
@@ -639,13 +652,82 @@ describe('QoderCheckInService risk identity', () => {
   }
 
   /**
+   * The `cosy-machine*` names a request actually carries, lowercased and sorted.
+   *
+   * A SET comparison is what the invariants are stated in (exactly three, or
+   * exactly six), and it is the only form that catches a header added by
+   * accident as well as one dropped.
+   */
+  function machineHeaderNames(headers: Record<string, string> | undefined): string[] {
+    return Object.keys(headers ?? {})
+      .map(name => name.toLowerCase())
+      .filter(name => name.startsWith('cosy-machine'))
+      .sort()
+  }
+
+  /** The component-minted identity every campaign test starts from. */
+  const nativeIdentity = {
+    machineToken: 'native-token',
+    machineCode: 'native-code',
+    machineType: 'native-type',
+  }
+
+  /** A campaign list with one claimable benefit, the shape the claim path needs. */
+  const claimableCampaign = {
+    campaignId: 'camp-1',
+    campaignKey: 'daily-100',
+    actionType: 'CLAIM_BENEFIT',
+    claimStatus: 'CLAIMABLE',
+    benefit: { amount: 100 },
+  }
+
+  /** A fetch that answers the campaign list and the claim, recording every header set. */
+  function captureRequests(
+    campaigns: unknown = { campaigns: [] },
+    claim: unknown = { status: 'CLAIMED', benefit: { amount: 100 } },
+  ): { fetchImpl: typeof fetch; seen: (Record<string, string> | undefined)[] } {
+    const seen: (Record<string, string> | undefined)[] = []
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      seen.push(init?.headers as Record<string, string> | undefined)
+      const body = String(url).includes('/claim') ? claim : campaigns
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    return { fetchImpl, seen }
+  }
+
+  /** The platform word the campaign family is expected to use (§6.7, R3). */
+  function expectedCampaignMachineOs(platform = process.platform, arch = process.arch): string {
+    const archWord = arch === 'arm64' ? 'aarch64' : 'x86_64'
+    const platformWord = platform === 'win32' ? 'win32' : platform === 'darwin' ? 'darwin' : 'linux'
+    return `${archWord}_${platformWord}`
+  }
+
+  /** The value the INFERENCE path sends; must not move (I-11). */
+  function inferenceMachineOs(platform = process.platform, arch = process.arch): string {
+    const archWord = arch === 'arm64' ? 'aarch64' : 'x86_64'
+    const platformWord = platform === 'win32' ? 'windows' : 'linux'
+    return `${archWord}_${platformWord}`
+  }
+
+  afterEach(() => {
+    // The mode switch and the machine-os override are process-wide: a leaked
+    // stub would silently turn the six-header experiment on for every later
+    // test in this file.
+    vi.unstubAllEnvs()
+    vi.resetModules()
+  })
+
+  /**
    * The identity headers are what make an international check-in possible at
    * all: the upstream withholds the daily campaign from a request that does
    * not carry a client-minted machine identity. These tests pin the request
    * SHAPE, so a future refactor of the header merge cannot silently drop them
    * again — the failure mode is invisible (HTTP 200, no error, no campaign).
    */
-  it('sends the client machine identity with the campaign request', async () => {
+  it('T-M4-4 sends the client machine identity with the campaign request (three mode)', async () => {
     const auth = createMockAuth()
     const seen: (Record<string, string> | undefined)[] = []
     const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -690,7 +772,19 @@ describe('QoderCheckInService risk identity', () => {
     // object literal, not a `Headers` instance): the previous check named
     // 'Cosy-Machineid'/'Cosy-Machinehostname', which this code path can never
     // produce, so it passed no matter what was merged in.
+    //
+    // These three assertions are NOT relaxed by the six-header experiment — the
+    // default is still the three native headers, and `six` is a branch that is
+    // off unless `QODER_CAMPAIGN_MACHINE_HEADERS=six`. What changed is that the
+    // branch is now reachable, so the absence is pinned as a set below instead
+    // of one property at a time.
+    expect(machineHeaderNames(headers)).toEqual([
+      'cosy-machinecode',
+      'cosy-machinetoken',
+      'cosy-machinetype',
+    ])
     expect(headers).not.toHaveProperty('cosy-machineid')
+    expect(headers).not.toHaveProperty('cosy-machineos')
     expect(headers).not.toHaveProperty('cosy-machinehostname')
     // And still refuse the inference path's capitalised spelling, which is how
     // a derived identity would arrive if those wire headers were spread in.
@@ -743,5 +837,329 @@ describe('QoderCheckInService risk identity', () => {
     // must not start failing on a machine without a client installed.
     expect(result.status).toBe('error')
     expect(result.message).toContain('Claim returned status')
+  })
+
+  /**
+   * T-M4-1: the default set is EXACTLY the three native headers (I-01).
+   *
+   * Pinned as a set, on both requests of a check-in, because the invariant is
+   * about what the upstream receives: one extra machine header changes the
+   * device fingerprint, and the failure mode of a wrong fingerprint is a silent
+   * empty list rather than an error.
+   */
+  it('T-M4-1 sends exactly the three native machine headers by default (I-01)', async () => {
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, '')
+    const { fetchImpl, seen } = captureRequests({ campaigns: [claimableCampaign] })
+    const service = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+    })
+    const result = await service.checkIn('pt-test')
+
+    expect(result.status).toBe('claimed')
+    // The list and the claim must present the same identity.
+    expect(seen).toHaveLength(2)
+    for (const headers of seen) {
+      expect(machineHeaderNames(headers)).toEqual([
+        'cosy-machinecode',
+        'cosy-machinetoken',
+        'cosy-machinetype',
+      ])
+      expect(headers?.['cosy-machinetoken']).toBe('native-token')
+      expect(headers?.['cosy-machinecode']).toBe('native-code')
+      expect(headers?.['cosy-machinetype']).toBe('native-type')
+    }
+
+    // An unrecognised value must fall back to the measured shape. A typo
+    // (`six-headers`, `SIX!`) silently enabling the experiment would be the
+    // worst of both worlds: unverified headers and nobody knowing why.
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, 'six-headers')
+    const second = captureRequests({ campaigns: [claimableCampaign] })
+    const typoService = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: second.fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+    })
+    await typoService.checkIn('pt-test')
+    expect(machineHeaderNames(second.seen[0])).toEqual([
+      'cosy-machinecode',
+      'cosy-machinetoken',
+      'cosy-machinetype',
+    ])
+  })
+
+  /**
+   * T-M4-2: `six` mode sends the mixed six-header shape, off by default (I-03).
+   *
+   * The derived pair is checked against the same derivation the inference path
+   * uses, so the two cannot drift apart silently, and the native three are
+   * checked to be UNCHANGED: the experiment adds headers, it does not replace
+   * the identity that is known to work.
+   */
+  it('T-M4-2 sends the six-header shape in the experimental mode, id derived from the account (I-03)', async () => {
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, 'six')
+    const { fetchImpl, seen } = captureRequests({ campaigns: [claimableCampaign] })
+    const service = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+      // A real seed file must never decide what a test sends.
+      resolveDeviceSeed: () => undefined,
+    })
+    const result = await service.checkIn('pt-test')
+
+    expect(result.status).toBe('claimed')
+    expect(seen).toHaveLength(2)
+    for (const headers of seen) {
+      expect(machineHeaderNames(headers)).toEqual([
+        'cosy-machinecode',
+        'cosy-machinehostname',
+        'cosy-machineid',
+        'cosy-machineos',
+        'cosy-machinetoken',
+        'cosy-machinetype',
+      ])
+      // Derived from the ACCOUNT, exactly as the inference path derives it.
+      expect(headers?.['cosy-machineid']).toBe(deriveMachineId('u1'))
+      // The desktop vocabulary, never the CLI's `windows` spelling.
+      expect(headers?.['cosy-machineos']).toBe(campaignMachineOs)
+      // Real hostname by default (R4); the derived form is opt-in.
+      expect(headers?.['cosy-machinehostname']).toBe(campaignHostname())
+      // The native three are untouched by the experiment.
+      expect(headers?.['cosy-machinetoken']).toBe('native-token')
+      expect(headers?.['cosy-machinecode']).toBe('native-code')
+      expect(headers?.['cosy-machinetype']).toBe('native-type')
+    }
+  })
+
+  /**
+   * T-M4-2b: the privacy switch swaps the real hostname for a derived one (R4).
+   *
+   * The default carries the machine's real hostname because that is the only
+   * shape observed working; users who object can opt into the derived value,
+   * which the README documents as unverified rather than as equivalent.
+   */
+  it('T-M4-2b derives the hostname instead when the privacy switch is on (R4)', async () => {
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, 'six')
+    vi.stubEnv(CAMPAIGN_DERIVED_HOSTNAME_ENV, '1')
+    const { fetchImpl, seen } = captureRequests({ campaigns: [claimableCampaign] })
+    const service = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+      // A real seed file must never decide what a test sends.
+      resolveDeviceSeed: () => undefined,
+    })
+    await service.checkIn('pt-test')
+
+    const headers = seen[0]
+    expect(headers?.['cosy-machinehostname']).toBe(deriveMachineHostname('u1'))
+    expect(headers?.['cosy-machinehostname']).toMatch(/^DESKTOP-[0-9A-F]{7}$/u)
+    // Only the hostname moves; the other five stay put.
+    expect(headers?.['cosy-machineid']).toBe(deriveMachineId('u1'))
+    expect(headers?.['cosy-machineos']).toBe(campaignMachineOs)
+  })
+
+  /**
+   * T-M4-8: the reset seed retires the campaign fingerprint too (R12).
+   *
+   * `umid reset-native` rotates a host-level seed so that every account gets a
+   * fresh derived fingerprint. The campaign path derives its own `machineid` and
+   * hostname from that same seed, so a rotated seed must move them — otherwise
+   * the reset would leave the campaign request presenting exactly the identity
+   * the user just retired, which is the one thing the reset exists to prevent.
+   * The three native headers are NOT seeded: they are what the signed component
+   * minted, and a reset does not re-mint them.
+   */
+  it('T-M4-8 derives the campaign fingerprint from the reset seed (R12)', async () => {
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, 'six')
+    const unseeded = captureRequests({ campaigns: [] })
+    const before = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: unseeded.fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+      resolveDeviceSeed: () => undefined,
+    })
+    await before.checkIn('pt-test')
+
+    const seededRun = captureRequests({ campaigns: [] })
+    const after = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: seededRun.fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+      resolveDeviceSeed: () => 'a-rotated-seed',
+    })
+    await after.checkIn('pt-test')
+
+    const seeded = seededRun.seen[0]
+    expect(seeded?.['cosy-machineid']).toBe(deriveMachineId('u1', undefined, 'a-rotated-seed'))
+    expect(seeded?.['cosy-machineid']).not.toBe(unseeded.seen[0]?.['cosy-machineid'])
+    expect(seeded?.['cosy-machinetoken']).toBe('native-token')
+    expect(seeded?.['cosy-machinecode']).toBe('native-code')
+  })
+
+  /**
+   * T-M4-3: no identity means no machine headers at all (I-02).
+   *
+   * Two halves, because they are two different guarantees: the international
+   * region must not send the request (its answer would be indistinguishable
+   * from "no campaign today"), while the China region sends it without any
+   * machine header — and must keep doing so with the experiment switched on.
+   */
+  it('T-M4-3 sends no machine headers when this machine has no identity (I-02)', async () => {
+    const unreachable = vi.fn(async () => {
+      throw new Error('the campaign endpoint must not be reached without an identity')
+    }) as unknown as typeof fetch
+    const globalService = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: unreachable,
+      riskIdentity: async () => undefined,
+    })
+    const globalResult = await globalService.checkIn('pt-test')
+    expect(globalResult.status).toBe('error')
+    expect(globalResult.reasonCode).toBe('no-client')
+    expect(unreachable).not.toHaveBeenCalled()
+
+    // China does not gate on the identity, so it still asks — with zero machine
+    // headers, even in `six` mode: the mode decides WHICH headers accompany a
+    // real identity, never whether a missing one can be invented.
+    vi.stubEnv(CAMPAIGN_MACHINE_HEADERS_ENV, 'six')
+    const { fetchImpl, seen } = captureRequests({ campaigns: [] })
+    const chinaService = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder',
+      region: 'china',
+      fetch: fetchImpl,
+      riskIdentity: async () => undefined,
+    })
+    const chinaResult = await chinaService.checkIn('pt-test')
+    expect(chinaResult.status).toBe('no-campaign')
+    expect(seen).toHaveLength(1)
+    expect(machineHeaderNames(seen[0])).toEqual([])
+  })
+
+  /**
+   * T-M4-5: the risk-gated fingerprint is byte-identical to 1.0.0 (I-09).
+   *
+   * These four values are what the upstream's risk check looks at. They are
+   * asserted as literals rather than as the constants that feed them, because a
+   * refactor that changes both the constant and the assertion would otherwise
+   * pass while the wire format moved.
+   */
+  it('T-M4-5 keeps the frozen campaign wire constants byte-identical (I-09)', async () => {
+    expect(qoderDesktopClientType).toBe('10')
+    expect(campaignUserAgent).toBe('qoder/1.1.47')
+    expect(campaignCosyVersion).toBe('1.0.1')
+
+    const { fetchImpl, seen } = captureRequests({ campaigns: [] })
+    const service = new QoderCheckInService({
+      authService: createMockAuth(),
+      variantId: 'qoder-global',
+      region: 'global',
+      fetch: fetchImpl,
+      riskIdentity: async () => nativeIdentity,
+    })
+    await service.checkIn('pt-test')
+
+    const headers = seen[0]
+    expect(headers?.['cosy-clienttype']).toBe('10')
+    expect(headers?.['user-agent']).toBe('qoder/1.1.47')
+    expect(headers?.['cosy-version']).toBe('1.0.1')
+    // The metadata/inference build is a DIFFERENT pair; a shared constant here
+    // is the regression this asserts against.
+    expect(headers?.['cosy-version']).not.toBe(metadataCosyVersion)
+  })
+
+  /**
+   * T-M4-5b: the campaign platform word follows the desktop vocabulary (R3).
+   *
+   * On Windows the CLI spells the platform `windows` and the desktop app spells
+   * it `win32`. A request that claims to be the desktop client (`clienttype 10`
+   * + the desktop `cosy-version`) must use the desktop spelling; carrying the
+   * CLI's is the cross-field inconsistency a fingerprint check exists to find.
+   */
+  it('T-M4-5b spells the campaign platform in the desktop vocabulary, with an override (R3)', async () => {
+    expect(campaignMachineOs).toBe(expectedCampaignMachineOs())
+    if (process.platform === 'win32') {
+      expect(campaignMachineOs.endsWith('_win32')).toBe(true)
+      expect(campaignMachineOs).not.toContain('windows')
+    }
+
+    // `QODER_COSY_MACHINE_OS` replaces the whole value, for a machine whose
+    // platform we detect wrongly.
+    vi.stubEnv(QODER_COSY_MACHINE_OS_ENV, 'aarch64_darwin')
+    vi.resetModules()
+    const overridden = await import('../src/qoder/transport/wire/cosy.ts')
+    expect(overridden.campaignMachineOs).toBe('aarch64_darwin')
+
+    // `auto` (and an empty value) means detect.
+    vi.stubEnv(QODER_COSY_MACHINE_OS_ENV, 'auto')
+    vi.resetModules()
+    const detected = await import('../src/qoder/transport/wire/cosy.ts')
+    expect(detected.campaignMachineOs).toBe(expectedCampaignMachineOs())
+  })
+
+  /**
+   * T-M4-6: nothing on the inference path moves (I-11).
+   *
+   * Installing a component, or flipping the campaign vocabulary, must not
+   * change one inference header — those are live fingerprints on every existing
+   * account. The check is behavioural: build the inference headers twice, once
+   * with the campaign override in the environment, and compare.
+   */
+  it('T-M4-6 leaves the inference headers byte-identical when the campaign vocabulary moves (I-11)', async () => {
+    const creds = {
+      userID: 'u1',
+      authToken: 'token',
+      name: 'User',
+      email: 'user@example.invalid',
+      derivedMachineID: 'derived-id',
+      machineHostname: 'DESKTOP-ABC1234',
+    }
+    const url = 'https://api.example.invalid/algo/v1/chat'
+    const before = buildAuthHeaders('{}', url, creds, { includeMachineHostname: true })
+
+    expect(before['Cosy-Machineos']).toBe(inferenceMachineOs())
+    expect(before['Cosy-Clienttype']).toBe('5')
+    expect(before['Cosy-Machineid']).toBe('derived-id')
+    expect(before['Cosy-Machinehostname']).toBe('DESKTOP-ABC1234')
+
+    vi.stubEnv(QODER_COSY_MACHINE_OS_ENV, 'aarch64_darwin')
+    vi.resetModules()
+    const fresh = await import('../src/qoder/transport/wire/cosy.ts')
+    // The campaign constant DID move...
+    expect(fresh.campaignMachineOs).toBe('aarch64_darwin')
+    // ...and not one inference header did.
+    const after = fresh.buildAuthHeaders('{}', url, creds, { includeMachineHostname: true })
+    for (const name of [
+      'Cosy-Machineos',
+      'Cosy-Clienttype',
+      'Cosy-Machineid',
+      'Cosy-Machinetoken',
+      'Cosy-Machinetype',
+      'Cosy-Machinehostname',
+      'Cosy-Version',
+    ]) {
+      expect(after[name]).toBe(before[name])
+    }
+    // `qoderMachineOs` stays module-private on purpose: an export is the
+    // invitation for the campaign path to reuse the CLI's vocabulary, which is
+    // the exact mistake R3 exists to prevent.
+    expect(Object.keys(fresh)).not.toContain('qoderMachineOs')
   })
 })

@@ -19,7 +19,7 @@ import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { qoderInnerErrorSnapshot } from './qoder/transport/wire/inner-errors.ts'
 import { getClaimWindowDateString } from './claim-window.ts'
 import { QODER_STATUS_PATH } from './status-paths.ts'
-import type { QoderCatalogModelSnapshot, QoderPatSummary, QoderWebAccounts, QoderWebCatalog, QoderWebPlan, QoderWebProbeSection, QoderWebStatus, QoderWebUpstreamNotice } from './status-paths.ts'
+import type { QoderCatalogModelSnapshot, QoderNativeDeviceStatus, QoderPatSummary, QoderWebAccounts, QoderWebCatalog, QoderWebPlan, QoderWebProbeSection, QoderWebStatus, QoderWebUpstreamNotice } from './status-paths.ts'
 
 export { QODER_STATUS_PATH } from './status-paths.ts'
 export type { QoderWebStatus } from './status-paths.ts'
@@ -134,6 +134,26 @@ export interface QoderStatusRouteOptions {
    * only serve it keep their behaviour; the global variant passes its own.
    */
   path?: string
+  /**
+   * The native device-identity component, as its install job and on-disk
+   * manifest describe it.
+   *
+   * A callback, and optional, for two reasons. It is a callback because the
+   * answer changes under the document — an install finishes between two polls
+   * and the card must see that without a second route. It is optional because
+   * the host half that owns the transport layer injects it: this module must
+   * not depend on that layer (a status document is assembled from what the
+   * host hands it), and a host with no such component — the China variant,
+   * whose campaign is not identity-gated — simply omits it.
+   *
+   * When it is omitted the arms must be byte-identical to what they were
+   * before this field existed: not "equal after serialization" but the same
+   * object shape, so the field is spread in rather than assigned as
+   * `undefined`. Every arm carries it, signed-out included: an account that
+   * cannot sign in yet is exactly the one that needs to be told the component
+   * is missing.
+   */
+  nativeDevice?: () => QoderNativeDeviceStatus | undefined
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -202,6 +222,10 @@ function modelSnapshot(model: QoderModelInfo): QoderCatalogModelSnapshot {
  * than failing the whole document.
  */
 export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<QoderWebStatus> {
+  // Read once per document: the install job's state can change between two
+  // polls, and reading it twice in one assembly could describe a job that
+  // finished halfway through (installing on one arm, done on the other).
+  const nativeDevice = deps.nativeDevice?.()
   const authStatus = await deps.store.status()
   if (authStatus.state !== 'configured') {
     // A diagnosable sign-out (a stale WorkBuddy-era file, say) keeps its
@@ -212,6 +236,7 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
       status: 'signed-out',
       ...authStatus.reason === undefined ? {} : { reason: authStatus.reason },
       ...deps.authKey === undefined ? {} : { authKey: deps.authKey },
+      ...nativeDevice === undefined ? {} : { nativeDevice },
     }
   }
   const accountName = deps.accountName?.()
@@ -239,6 +264,7 @@ export async function qoderWebStatus(deps: QoderStatusRouteOptions): Promise<Qod
     // Both arms carry the key: a signed-in card needs it to clear the token,
     // and omitting it here made that action unreachable.
     ...deps.authKey === undefined ? {} : { authKey: deps.authKey },
+    ...nativeDevice === undefined ? {} : { nativeDevice },
   }
   // Model facts ride the signed-in document so the card can show rates,
   // efforts, and context capacity without touching the Models picker. They are

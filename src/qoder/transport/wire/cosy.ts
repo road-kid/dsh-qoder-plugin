@@ -42,6 +42,54 @@ const qoderMachineOs = process.platform === 'win32'
     : 'x86_64_linux'
 const qoderMachineTypeMagic = '5'
 
+/**
+ * Environment override for {@link campaignMachineOs}; `auto` means detect.
+ *
+ * Exported so tests and the docs name the same string instead of two copies.
+ */
+export const QODER_COSY_MACHINE_OS_ENV = 'QODER_COSY_MACHINE_OS'
+
+/**
+ * `cosy-machineos` for the campaign family: the DESKTOP vocabulary (SPEC-UMID-003 §3 R3).
+ *
+ * Deliberately a second constant rather than a reuse of {@link qoderMachineOs}.
+ * The two headers describe two different clients, not one machine: the
+ * inference path declares the CLI (`Cosy-Clienttype: 5` and the CLI user agent)
+ * and spells the platform `windows`, while the campaign path declares the
+ * desktop app (`cosy-clienttype: 10` + the desktop `cosy-version`) and the
+ * desktop app spells it `win32` (`x86_64_win32`). Reusing the CLI spelling here would make a
+ * request that claims to be the desktop client carry the CLI's vocabulary —
+ * which is exactly the cross-field inconsistency a fingerprint check looks for.
+ * "The same value on every endpoint" is not the same thing as "a
+ * self-consistent request", and one machine running both the CLI and the
+ * desktop app is normal.
+ *
+ * Keeping the pair separate is also what makes I-11 checkable: this constant can
+ * change without moving a single inference header, which is why
+ * {@link qoderMachineOs} stays module-private and unexported.
+ *
+ * `QODER_COSY_MACHINE_OS` replaces the whole value (default `auto` = detect), so
+ * an operator whose platform we mis-detect can correct the header without a
+ * rebuild. Resolved once at module load on purpose: this is a device
+ * fingerprint, and a value that changed mid-process would look like the machine
+ * moving. The failure mode of a wrong value is silent — the campaign list comes
+ * back empty with HTTP 200 — so the override is the only way to bisect it.
+ */
+export const campaignMachineOs: string = (() => {
+  const override = process.env[QODER_COSY_MACHINE_OS_ENV]?.trim()
+  if (override !== undefined && override !== '' && override.toLowerCase() !== 'auto') return override
+  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64'
+  // Unlike `qoderMachineOs` (which folds darwin into `linux`, a shape already
+  // live on the inference path and therefore frozen), this one names the three
+  // platforms the desktop client actually ships for.
+  const platform = process.platform === 'win32'
+    ? 'win32'
+    : process.platform === 'darwin'
+      ? 'darwin'
+      : 'linux'
+  return `${arch}_${platform}`
+})()
+
 export interface CosyCredentials {
   userID: string
   authToken: string
