@@ -65,6 +65,15 @@ for an account-derived one.
   inference path's spelling is untouched.
 - Updating in place needs no migration: an absent cache or seed reproduces the
   previous identity byte for byte.
+- Component coverage is `win32-x64`, `darwin-{x64,arm64}` and
+  `linux-{x64,arm64}`. `win32-arm64` reports `unsupported-platform` instead of
+  failing obscurely, because the upstream package ships no arm64 PE.
+- Several Global accounts on one machine still claim only once per window: the
+  upstream groups by person, so the extra accounts see no campaign rather than
+  a second one. This is a server-side rule, not something the plugin can lift.
+- A machine with no registry access can install from a tarball it fetched
+  elsewhere (`--from-tarball`, or `QODER_UMID_TARBALL`), which runs the same
+  verification and self-check as the network path.
 
 ## 1.0.5 — 2026-10-26
 
