@@ -13,6 +13,7 @@
  * @module dsh-qoder-plugin
  */
 
+import { dirname, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -666,6 +667,16 @@ function readConfig(config: Config | undefined): Config {
 interface VariantRuntime {
   variant: QoderVariant
   store: QoderCredentialStore
+  /**
+   * The data root this runtime's catalog bookkeeping is scoped to.
+   *
+   * The identity and live-fetch caches outlive a fiber on purpose — a settings
+   * write re-applies the plugin — but a module-level map keyed by variant id
+   * alone would let one installation answer for another (two profiles, or two
+   * temporary roots in one process). Normalized from the credential file's
+   * directory so a custom store path is isolated correctly too.
+   */
+  cacheScope: string
   client: QoderUpstreamClient
   transport: QoderTransport
   catalog: QoderCatalog
@@ -1127,11 +1138,16 @@ function createVariantRuntime(
   config: Config,
   variant: QoderVariant,
   current: () => Config,
-  identityOf: (variantId: string) => string | undefined,
+  identityOf: (variantId: string, cacheScope: string) => string | undefined,
   pool: () => readonly VariantRuntime[],
   health: QoderAccountHealthTracker,
 ): VariantRuntime {
   const store = new QoderCredentialStore({ variant, logger: ctx.logger })
+  // One normalization of "which installation this is", shared by every catalog
+  // cache key below: the directory holding this variant's credential file. Read
+  // from the store rather than the environment so a custom `ownPath` (a
+  // non-default profile root) is still isolated as its own scope.
+  const cacheScope = resolve(dirname(store.ownAuthPath()))
   // The self-heal's auto-refresh record, surfaced on the card. Per variant:
   // each region's transport reports its own refreshes.
   let jobTokenRefreshedAt: number | undefined
@@ -1509,11 +1525,12 @@ function createVariantRuntime(
     // Observations are per account: the service reads and writes its records
     // against this identity, so one token's detected levels never answer for
     // another's, and an in-flight sweep cannot store under a new token.
-    account: () => identityOf(variant.id),
+    account: () => identityOf(variant.id, cacheScope),
   })
   return {
     variant,
     store,
+    cacheScope,
     client,
     transport,
     catalog,
@@ -1982,6 +1999,27 @@ const lastIdentities = new Map<string, string>()
 const lastLiveFetchAt = new Map<string, number>()
 
 /**
+ * The cache key for one variant's catalog identity, scoped to a data root.
+ *
+ * Both maps above are module-level so they survive the settings write that
+ * re-applies the plugin — but "the plugin" is per data root, and one process can
+ * host more than one (two profiles, or two temporary roots in a test run).
+ * Keying by variant id alone let one root's last account and live-fetch time
+ * answer for another's: a second root with the same PAT then skipped its own
+ * catalog fetch, and an account switch in one root cleared another root's probe
+ * observations. The scope is the directory of the credential file (see
+ * `VariantRuntime.cacheScope`), so a custom store path stays isolated too.
+ */
+function identityCacheKey(cacheScope: string, variantId: string): string {
+  return `${cacheScope}\0${variantId}`
+}
+
+/** The same scoping rule for the live-fetch record, keyed by account. */
+function liveFetchCacheKey(cacheScope: string, identity: string): string {
+  return `${cacheScope}\0${identity}`
+}
+
+/**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their
  * credential-driven catalog lifecycles.
@@ -2036,7 +2074,7 @@ export function apply(ctx: Context, config: Config): void {
       config,
       variant,
       () => current(),
-      id => lastIdentities.get(id),
+      (variantId, cacheScope) => lastIdentities.get(identityCacheKey(cacheScope, variantId)),
       pool,
       health,
     ))
@@ -2131,8 +2169,8 @@ export function apply(ctx: Context, config: Config): void {
    * @param identity - the account now in effect, or `undefined` when signed out.
    */
   const adoptIdentity = (runtime: VariantRuntime, identity: string | undefined): void => {
-    const id = runtime.variant.id
-    const known = lastIdentities.get(id)
+    const key = identityCacheKey(runtime.cacheScope, runtime.variant.id)
+    const known = lastIdentities.get(key)
     // "Same identity" may only short-circuit when THIS runtime has already
     // adopted: a fresh catalog starts hidden (`createVariantRuntime` sets
     // `visible=false`), and DSH 0.1.7's configuration write hot-reloads the
@@ -2144,8 +2182,8 @@ export function apply(ctx: Context, config: Config): void {
     // succeeds, and the refresh button routes through this same function.
     if (known === identity && runtime.catalog.isVisible()) return
     const hadCredential = known !== undefined
-    if (identity === undefined) lastIdentities.delete(id)
-    else lastIdentities.set(id, identity)
+    if (identity === undefined) lastIdentities.delete(key)
+    else lastIdentities.set(key, identity)
     // Any change of identity invalidates in-flight work and recorded answers.
     runtime.catalogGeneration += 1
     runtime.inflightFetch?.controller.abort()
@@ -2910,7 +2948,7 @@ export function apply(ctx: Context, config: Config): void {
       runtime.lastFetchAtMs = Date.now()
       // Shared across fiber reloads: a 0.1.7 settings write re-applies this
       // plugin, and the new instance must not re-fetch what was just fetched.
-      lastLiveFetchAt.set(identity, runtime.lastFetchAtMs)
+      lastLiveFetchAt.set(liveFetchCacheKey(runtime.cacheScope, identity), runtime.lastFetchAtMs)
       runtime.catalog.set([...models])
       runtime.catalogSource = 'live'
       runtime.catalogFetchedAtMs = runtime.client.lastCatalog?.fetchedAtMs ?? Date.now()
@@ -2921,7 +2959,7 @@ export function apply(ctx: Context, config: Config): void {
       // swallowed: the live catalog is already serving, and `fetchCatalog`
       // promises its callers that it never rejects (an escaped rejection from a
       // background sweep would terminate the host).
-      if (lastIdentities.get(runtime.variant.id) === identity) {
+      if (lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id)) === identity) {
         try {
           runtime.savedCatalogs.set(identity, {
             source: runtime.client.lastCatalog?.source ?? 'unknown',
@@ -2973,7 +3011,7 @@ export function apply(ctx: Context, config: Config): void {
     }
 
     const identity = credentialIdentity(credential)
-    const known = lastIdentities.get(runtime.variant.id)
+    const known = lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id))
     if (known === identity && runtime.catalog.isVisible()) {
       // Same account, already showing something. One case still needs a fetch:
       // an earlier attempt failed, so the group is on the fallback roster and
@@ -2987,7 +3025,7 @@ export function apply(ctx: Context, config: Config): void {
       // `lastFetchAtMs` starts at 0 — without the shared record every write
       // would immediately re-fetch both variants from upstream.
       const stale = runtime.catalogSource !== 'live'
-      const fetchedAt = lastLiveFetchAt.get(identity) ?? 0
+      const fetchedAt = lastLiveFetchAt.get(liveFetchCacheKey(runtime.cacheScope, identity)) ?? 0
       const due = Date.now() - fetchedAt >= credentialPollMs() * CATALOG_RETRY_SWEEPS
       if (stale && due) await fetchCatalog(runtime, identity)
       return
@@ -3021,7 +3059,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (credential === undefined) return
     const identity = credentialIdentity(credential)
-    if (lastIdentities.get(runtime.variant.id) !== identity || !runtime.catalog.isVisible()) {
+    if (lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id)) !== identity || !runtime.catalog.isVisible()) {
       adoptIdentity(runtime, identity)
     }
   }))).then(() => {

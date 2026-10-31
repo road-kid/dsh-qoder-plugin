@@ -639,3 +639,77 @@ describe('identity changes during catalog loading', () => {
     expect(saved.entries[IDENTITY_B]).toBeDefined()
   }, 45_000)
 })
+
+/**
+ * Two data roots are two independent installations, even when one process (or
+ * one test run) hosts both. The catalog bookkeeping is module-level on purpose,
+ * because it has to survive the settings write that re-applies the plugin; but
+ * without a data-root key, one root's "last account / last live fetch" answers
+ * for the other root too, and an account switch in root 1 clears root 2's
+ * catalog and probe state.
+ */
+describe('data-root isolation', () => {
+  it('does not clear another data root catalog or probe state on an account switch', async () => {
+    // Root 1: account B signed in, its live catalog served.
+    const first = await useRoot()
+    await writeFile(first.cnPath, credentialDocument(PAT_B))
+    vi.stubGlobal('fetch', qoderFetch({
+      fail: () => false,
+      hangListFor: () => undefined,
+      rosterFor: user => user === USER_B
+        ? { id: 'account-b-model', name: 'B' }
+        : { id: 'account-a-model', name: 'A' },
+      noteList: () => {},
+    }))
+    const ctxB = await boot()
+    await vi.waitFor(async () => {
+      expect((await ctxB.llm.listModels('qoder')).map(model => model.id)).toEqual(['account-b-model'])
+    }, { timeout: 10_000 })
+    await ctxB.fiber.dispose()
+    context = undefined
+
+    // Root 2: account A, with an observation recorded under A before boot.
+    const second = await useRoot()
+    await writeFile(second.cnPath, credentialDocument(PAT_A))
+    const liveRowA = liveRowOf(catalogEnvelope('acct-a-model', 'acct-a-model'))
+    await mkdir(join(second.root, 'state'), { recursive: true })
+    await writeFile(join(second.root, 'state', Qoder.QODER_PROBE_FILENAME), JSON.stringify({
+      version: 1,
+      records: {
+        'acct-a-model': {
+          fingerprint: fingerprintModel(liveRowA),
+          validation: 'validating',
+          efforts: ['low'],
+          probedAtMs: Date.now(),
+          pluginVersion: 'test',
+          account: IDENTITY_A,
+        },
+      },
+    }, null, 2))
+
+    // A fresh router for the new root: the previous stub is dropped so this one
+    // captures the real fetch that loopback requests are forwarded to.
+    vi.unstubAllGlobals()
+    vi.stubGlobal('fetch', qoderFetch({
+      fail: () => false,
+      hangListFor: () => undefined,
+      rosterFor: () => ({ id: 'acct-a-model', name: 'acct-a-model' }),
+      noteList: () => {},
+    }))
+
+    const ctxA = await boot()
+    await vi.waitFor(async () => {
+      expect((await ctxA.llm.listModels('qoder')).map(model => model.id)).toEqual(['acct-a-model'])
+    }, { timeout: 10_000 })
+
+    // Account B was never in effect in this data root, so nothing about it
+    // justifies clearing root 2's observation: the caches are per data root.
+    const routes = FakeWebServer.current!.routes
+    const server = await serve(routes)
+    const status = JSON.parse((await (await fetch(
+      `http://127.0.0.1:${server.port}/plugins/dsh-qoder-plugin/status`,
+      { headers: { host: `127.0.0.1:${server.port}` } },
+    )).text()))
+    expect((status.probe.results as { id: string }[]).map(result => result.id)).toContain('acct-a-model')
+  }, 45_000)
+})
