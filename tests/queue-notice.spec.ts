@@ -101,7 +101,9 @@ describe('queue notice wording', () => {
     expect(formatQueueNotice(facts, { waited: false, occurrences: 1 })).not.toContain('已按上游建议等待')
     // The upstream's SUGGESTION still shows: it is their advice, not our claim.
     expect(formatQueueNotice(facts, { waited: false, occurrences: 1 })).toContain('上游建议 30 秒后重试')
-    expect(formatQueueNotice(facts, { waited: true, occurrences: 1 })).toContain('已按上游建议等待 30 秒仍不可服务')
+    const waited = formatQueueNotice(facts, { waited: true, occurrences: 1 })
+    expect(waited).toContain('已按上游建议等待后仍不可服务')
+    expect(waited).not.toContain('已按上游建议等待 30 秒仍不可服务')
   })
 
   it('mentions risk control only when the answer recurs', () => {

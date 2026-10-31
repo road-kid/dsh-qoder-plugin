@@ -1252,9 +1252,10 @@ describe('Qoder plugin card', () => {
   it('shows the queue retry bounds with the host defaults', async () => {
     const scope = fakeSettingsScope({ queueWaitEnabled: true })
     await mountWithSettings(scope)
-    // The host defaults: 5 attempts of 30 seconds each. The queue-notice
-    // fixtures opt out of this budget explicitly, so this is the one cheap
-    // place that pins the defaults the host actually ships.
+    // The render defaults: 5 attempts of 30 seconds each. This case only pins
+    // the DISPLAY values the card starts on; the host's schema defaults and the
+    // transport budget built from them belong to tests/settings-integration.spec.ts
+    // (and the fake-timer end-to-end case in tests/queue-notice-recovery.spec.ts).
     expect(inputFor(en.queueWaitAttemptsLabel).props.value).toBe('5')
     expect(inputFor(en.queueWaitSecondsLabel).props.value).toBe('30')
   })

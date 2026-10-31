@@ -322,10 +322,17 @@ describe('Qoder Host settings integration', () => {
     expect((document.body.key as string).length).toBeGreaterThan(0)
     // `base` is built by walking the plugin's declared configuration fields, so
     // it is the served field list — the thing the old `describe()` gave.
+    // The queue budget is part of that served default set, not only of the
+    // client's rendering: the card's initial values come from here, so a host
+    // default that drifted away from 5 × 30 s has to fail in this suite rather
+    // than only in the card snapshot that renders whatever it was handed.
     expect(document.body.base).toMatchObject({
       probeConsent: false,
       useMaximumContextWindow: true,
       quotaPollMs: Qoder.QUOTA_POLL_DEFAULT_MS,
+      queueWaitEnabled: true,
+      queueWaitAttempts: 5,
+      queueWaitSeconds: 30,
     })
 
     const models = await ctx.llm.listModels('qoder')
@@ -627,6 +634,30 @@ describe('Qoder Host settings integration', () => {
     expect(Qoder.Config({})).toMatchObject({ quotaPollMs: Qoder.QUOTA_POLL_DEFAULT_MS })
     expect(() => Qoder.Config({ quotaPollMs: 1_000 })).toThrow()
     expect(Qoder.Config({ quotaPollMs: Qoder.QUOTA_POLL_MIN_MS })).toMatchObject({ quotaPollMs: Qoder.QUOTA_POLL_MIN_MS })
+  })
+
+  /**
+   * The queue budget's schema contract: an empty document still waits 5 × 30 s.
+   *
+   * This is the HOST side of the default the card renders (tests/plugin-card.spec.ts
+   * only pins the display), and the values here are the ones the transport's
+   * `queueWait.attempts()`/`seconds()` read live, so drifting the schema default
+   * would silently change how long every request sits on a busy model. The
+   * bounds are pinned at both ends: 0 is a legal "report at once", 11 is not a
+   * retry count the transport may ever hold a caller for.
+   */
+  it('defaults the queue retry budget to five attempts of thirty seconds', () => {
+    expect(Qoder.Config({})).toMatchObject({
+      queueWaitEnabled: true,
+      queueWaitAttempts: 5,
+      queueWaitSeconds: 30,
+    })
+    expect(() => Qoder.Config({ queueWaitAttempts: 11 })).toThrow()
+    // Zero is a decision, not a typo: it must survive validation as-is.
+    expect(Qoder.Config({ queueWaitAttempts: 0 })).toMatchObject({ queueWaitAttempts: 0 })
+    // The same bound the settings face enforces when the card writes one.
+    expect(() => Qoder.Config({ queueWaitSeconds: 0 })).toThrow()
+    expect(Qoder.Config({ queueWaitSeconds: 1 })).toMatchObject({ queueWaitSeconds: 1 })
   })
 
   it('defaults its model rows to the live-catalog shape the stores fingerprint', async () => {
