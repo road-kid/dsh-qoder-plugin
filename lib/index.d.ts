@@ -2120,16 +2120,23 @@ interface Config {
    */
   stickinessEnabled?: boolean;
   /**
-   * Conversation stickiness: how many completed rounds one account serves
-   * before the session moves to the next account. 0 disables round counting.
+   * Conversation stickiness: how many completed turns one account serves
+   * before the session moves to the next account. A turn is one user message
+   * through its final answer, tool-call steps included, and rotation only
+   * happens between turns. 0 disables round counting.
    */
   stickinessRounds?: number;
   /**
    * Conversation stickiness: how many requests one account serves before the
-   * session moves to the next account. 0 disables request counting.
+   * session moves to the next account. Every model call counts; the bound is
+   * examined only between turns. 0 disables request counting.
    */
   stickinessRequests?: number;
-  /** Conversation stickiness: how many minutes one account serves. 0 disables. */
+  /**
+   * Conversation stickiness: how many minutes one account serves before the
+   * session moves to the next account, examined only between turns.
+   * 0 disables.
+   */
   stickinessMinutes?: number;
 }
 /**
