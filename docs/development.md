@@ -46,12 +46,12 @@ as the first step of a release.
   client components.
 - Transport tests live in `tests/qoder/*.test.ts` and are run by Node's own test
   runner rather than Vitest, because they exercise the wire layer directly.
-- A few **long-standing baseline failures** exist in `tests/adapter.spec.ts`,
-  `tests/catalog-lifecycle.spec.ts` and `tests/reasoning-merge.spec.ts`. They predate
-  the current work, and they are timing-sensitive: the failing cases hit the default
-  5 s timeout rather than asserting something wrong, so which of them fails depends
-  on the machine. Do not quote pass counts. The rule is simply: **your change must not
-  add to the list.** If you fix one, say so in the pull request.
+- Queue and account-routing behavior has deterministic offline coverage. Tests that
+  exercise a non-default fail-fast fixture must not be treated as evidence about the
+  shipped default budget; keep a separate schema/runtime contract test for defaults.
+- Transport lifecycle regressions should use gated asynchronous operations or fake
+  timers rather than real multi-minute sleeps. Do not weaken production defaults or
+  remove assertions to make a fixture finish quickly.
 
 ## Build output
 
@@ -75,7 +75,7 @@ commit. A pull request that changes source without the bundle is incomplete.
 5. Tag and push: `git tag -a v<version> -m "v<version>"` then
    `git push origin main --tags`.
 
-The current release line is **1.0.5**. `prepack` guarantees the published tarball is
+The current release line is **1.1.2**. `prepack` guarantees the published tarball is
 built from the tagged source.
 
 ## Contribution conventions
