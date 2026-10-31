@@ -2,6 +2,34 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.1.2 — 2026-11-01
+
+### Fixed — a dropped response is retried instead of ending the turn
+
+A request whose upstream connection died after the response headers arrived
+ended the conversation with "Qoder transport request failed." and no retry,
+even though the same drop before the first chunk was retried normally. The
+cause was classification, not the retry machinery: once the reply has started
+the shim can only deliver an in-band error frame, the HTTP status is gone, and
+the harness derives the retry code by matching text in the failure MESSAGE. The
+bare phrase matched nothing the classifier looks for and fell through to
+`PI_AI_ERROR`, which is outside the retryable set — so the first drop ended the
+turn, while the 37s case in the field showed exactly that.
+
+Both mid-stream failure messages now name the condition in a word the
+classifier maps to `TRANSPORT` ("Qoder connection failed while streaming the
+response." and "Qoder connection ended prematurely: the event stream closed
+without [DONE]."), so the configured retry policy gets to ride out a dropped
+link. The underlying `cause` stays on the error object and in the redacted log
+line rather than inside the message, deliberately: the classifier's arms are
+ordered, and arbitrary appended text could read as a non-retryable status
+before the transport token was ever reached.
+
+`tests/qoder/retry-classification.test.ts` pins the contract against the real
+decoder and chat stream, with a verbatim copy of the host classifier, so a
+future rewording that loses the token fails in CI instead of in a user's
+conversation.
+
 ## 1.1.1 — 2026-11-01
 
 ### Changed — queued requests now wait five times by default
