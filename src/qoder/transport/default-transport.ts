@@ -969,6 +969,15 @@ export class DefaultQoderTransport implements QoderTransport {
     // a statement about identity, not a promise about health.
     const pinned = await this.pinnedAccount(sessionId, newTurn)
     /*
+     * The pin object this request read, kept as an optimistic concurrency token.
+     *
+     * `pinnedAccount` answers with a COPY, so the copy's identity cannot be
+     * compared against the table. The table entry is what a newer request
+     * replaces, so capture THAT object here, before any following await can let
+     * a newer request rewrite the pin.
+     */
+    const pinAtDispatch = sessionId === undefined ? undefined : this.sessionPins.get(sessionId)
+    /*
      * Precedence, and why it is exactly this order — this is the answer to
      * "轮换逻辑打架": one chain, no feature overriding another by accident.
      *
@@ -1068,7 +1077,14 @@ export class DefaultQoderTransport implements QoderTransport {
      * different thing, owned by `adopted`/`switched`, and a busy skip must not
      * touch it.
      */
-    if (pinned === undefined || first.id !== pinned.id) this.pinSession(sessionId, first)
+    // The reroute lookup may yield to a newer request. Commit this request's
+    // choice only while the pin snapshot it read is still the current object.
+    if (
+      (sessionId === undefined || this.sessionPins.get(sessionId) === pinAtDispatch)
+      && (pinned === undefined || first.id !== pinned.id)
+    ) {
+      this.pinSession(sessionId, first)
+    }
     // Count the request against whichever account it actually starts on. This
     // is the request bound of stickiness; the ROUND bound is counted only when
     // an answer is consumed to the end, below.

@@ -936,6 +936,47 @@ describe('QoderTransport session stickiness', () => {
     await oldRequest
   })
 
+  it('does not let a delayed initial reroute reset a newer pin', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseReroute: () => void = () => {}
+    const rerouteGate = new Promise<void>((resolve) => { releaseReroute = resolve })
+    let nextCalls = 0
+    const circular = poolState.hooks.nextAccount
+    poolState.hooks.nextAccount = async (id) => {
+      nextCalls += 1
+      if (nextCalls === 2) await rerouteGate
+      return circular(id)
+    }
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 5, minutes: () => 0 },
+      chat: (pat, call) => {
+        if (pat === ALPHA.pat && call === 2) return rateLimited()
+        return accepted('ok')
+      },
+    })
+
+    // Establish the Alpha pin and spend one round.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 1, rounds: 1 }])
+
+    // A sessionless request cools Alpha and is served by Beta.
+    await drain(transport)
+
+    // R1 reads the Alpha pin, then blocks inside the cooling reroute lookup.
+    const r1 = drain(transport, SESSION)
+    await waitFor(() => nextCalls === 2, 'R1 to reach its reroute lookup')
+
+    // R2 serves the same session on Beta and owns the newer pin.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+
+    // Releasing R1 must not restore its stale snapshot or reset R2's counters.
+    releaseReroute()
+    await r1
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+  })
+
   it('does not adopt a newer pin as the baseline for an older failed attempt', async () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     let releaseOldFailure: () => void = () => {}
