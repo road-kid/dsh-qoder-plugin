@@ -54,6 +54,12 @@ type QoderRegion = 'global' | 'china';
  * whichever is larger), or — only when it advised nothing — the 排队等待秒数 the
  * user configured. Without this, a row reading "等待约 86 秒" beside a setting of
  * 30 looks like the setting was ignored, when the queue actually named 86.
+ *
+ * This is a description of the DECISION, not a measurement: `advisedSeconds` is
+ * the value the last wait was built on, and a request that completed several
+ * waits has several bases — only the last one is here. How long the request
+ * actually sat is `QoderQueueWaitSummary.totalWaitMs`, and a notice must take
+ * its duration from there.
  */
 interface QoderQueueWaitBasis {
   /** `'upstream'` when the queue's own advice won, else the configured fallback. */
@@ -71,8 +77,15 @@ interface QoderQueueWaitBasis {
  * clock (the previous wire) both over-claimed a wait nobody performed and
  * missed the configured fallback — the transport waited the configured window,
  * then reported "本次未按上游建议等待即返回此结果", telling the user the opposite
- * of what happened. `attempts` counts COMPLETED waits only: a wait the caller
- * aborted did not happen and must not be described.
+ * of what happened. The same clock-guessing has now been removed from the host
+ * too, so this summary is the only source of a wait's LENGTH: a notice that has
+ * none of it says a wait happened in general terms and names no seconds.
+ *
+ * `attempts` counts COMPLETED waits only: a wait the caller aborted did not
+ * happen and must not be described. `totalWaitMs` is cumulative — the number
+ * every renderer (conversation row and status card) must use for "how long the
+ * request sat" — while `lastBasis.advisedSeconds` only says which window the
+ * LAST wait was built on and is NOT a substitute for it.
  */
 interface QoderQueueWaitSummary {
   /** Waits this request completed before giving up, 0 when it never waited. */
