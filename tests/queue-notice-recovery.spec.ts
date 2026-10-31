@@ -184,7 +184,12 @@ async function bootSignedIn(state: UpstreamState): Promise<Context> {
   context = ctx
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(FakeWebServer)
-  await ctx.plugin(Qoder, {})
+  // These cases are about the notice lifecycle, not about the default retry
+  // budget: the empty config waits the host's 5 attempts (about 2.5 minutes of
+  // real time for a queued answer) and turns every case into a suite timeout.
+  // The default itself is pinned by tests/plugin-card.spec.ts and the full
+  // integration run; this fixture stays on the explicit fail-fast path.
+  await ctx.plugin(Qoder, { queueWaitAttempts: 0 })
   await vi.waitFor(async () => {
     expect((await ctx.llm.listModels('qoder')).map(model => model.id)).toEqual(['live-model'])
   }, { timeout: 15_000 })

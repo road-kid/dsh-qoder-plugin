@@ -1219,6 +1219,16 @@ describe('Qoder plugin card', () => {
     expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('240')
   })
 
+  it('shows the queue retry bounds with the host defaults', async () => {
+    const scope = fakeSettingsScope({ queueWaitEnabled: true })
+    await mountWithSettings(scope)
+    // The host defaults: 5 attempts of 30 seconds each. The queue-notice
+    // fixtures opt out of this budget explicitly, so this is the one cheap
+    // place that pins the defaults the host actually ships.
+    expect(inputFor(en.queueWaitAttemptsLabel).props.value).toBe('5')
+    expect(inputFor(en.queueWaitSecondsLabel).props.value).toBe('30')
+  })
+
   // ---- advanced card: master switches own their sub-menus --------------------
 
   /**
