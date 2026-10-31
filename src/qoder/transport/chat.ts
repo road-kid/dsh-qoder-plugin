@@ -30,6 +30,45 @@ function aborted(message: string): QoderLlmError {
   return new QoderLlmError(message, 'ABORTED')
 }
 
+/** Longest cause text carried into a user-facing failure message. */
+const maxCauseChars = 300
+
+/** How many links of a `cause` chain are rendered. */
+const maxCauseDepth = 4
+
+/**
+ * Render a thrown value's cause chain into one bounded, redacted line.
+ *
+ * The rendering exists for the harness's error classifier, not for the log:
+ * `dsh-llm-pi-ai`'s `classifyPiAiError` is a text matcher over the failure
+ * MESSAGE alone, and it recognizes a transport failure by words like `fetch`,
+ * `network`, `connection`, `terminated` or `ECONN*`. The undici `TypeError`
+ * that actually explains a mid-stream break lives on `error.cause`, so a
+ * message that names nothing ("Qoder transport request failed.") reached that
+ * matcher with no evidence at all and fell through to its `PI_AI_ERROR`
+ * fallback — a code outside every provider's default `retryableCodes` set.
+ * The turn then ended after the first drop instead of retrying, which is
+ * exactly the failure this helper prevents.
+ *
+ * The cause is redacted through the transport's own log policy first: a cause
+ * chain descends into `fetch` internals, and this text reaches the session log
+ * and the UI, where a credential must never appear.
+ */
+function describeCause(value: unknown): string {
+  const parts: string[] = []
+  let current: unknown = value
+  for (let depth = 0; depth < maxCauseDepth; depth += 1) {
+    if (current === undefined || current === null) break
+    const raw = current instanceof Error ? current.message : String(current)
+    const redacted = redactLogValue(raw)
+    const text = typeof redacted === 'string' ? redacted : ''
+    if (text !== '' && !parts.includes(text)) parts.push(text)
+    current = current instanceof Error ? current.cause : undefined
+  }
+  const joined = parts.join(': ')
+  return joined.length > maxCauseChars ? `${joined.slice(0, maxCauseChars)}…` : joined
+}
+
 export async function* streamQoderChat(
   options: GenerateOptions,
   model: QoderCatalogModel | undefined,
@@ -109,7 +148,12 @@ export async function* streamQoderChat(
       throw qoderHttpError(`Qoder upstream service returned HTTP ${response.status}.`, response, errorBody)
     }
     if (!response.body) {
-      throw new QoderLlmError('Qoder response contains no readable body stream.', 'EMPTY_RESPONSE')
+      // Same classifier constraint as the catch-all below: a bare noun phrase
+      // matches nothing in `classifyPiAiError` and would end the turn as
+      // `PI_AI_ERROR`. "connection" is the word that classifier maps to
+      // TRANSPORT, and it is accurate — a 200 with no body is a broken
+      // connection, not a bad request.
+      throw new QoderLlmError('Qoder connection returned no readable body stream.', 'EMPTY_RESPONSE')
     }
 
     let firstChunkDurationMs: number | undefined
@@ -185,7 +229,27 @@ export async function* streamQoderChat(
       })
       throw error
     }
-    const failure = new QoderLlmError('Qoder transport request failed.', 'TRANSPORT', { cause: error })
+    // `dsh-llm-pi-ai` classifies an adapter failure by matching TEXT in the
+    // failure MESSAGE, and `dsh-llm-retry` retries only the codes in the
+    // provider's `retryableCodes` set. The bare "Qoder transport request
+    // failed." this used to say matched no classifier token and fell through to
+    // `PI_AI_ERROR`, which is outside that set — so a mid-stream break (the
+    // observed 30-40s case: headers arrived, then the upstream socket died)
+    // ended the turn on the first drop with no retry.
+    //
+    // The LEAD phrase now carries "connection", a token the classifier maps to
+    // TRANSPORT, so retryability does not depend on what the cause chain
+    // happens to say. Enumerating socket spellings instead is a losing game:
+    // `write EPIPE` matches none of the classifier's transport tokens. The
+    // cause still rides along for diagnosis.
+    const cause = describeCause(error)
+    const failure = new QoderLlmError(
+      cause === ''
+        ? 'Qoder connection failed with no reported cause.'
+        : `Qoder connection failed: ${cause}`,
+      'TRANSPORT',
+      { cause: error },
+    )
     dependencies.logger?.error?.('[Qoder Stream] Request failed', redactLogValue(failure), {
       chunkCount,
       elapsedMs,

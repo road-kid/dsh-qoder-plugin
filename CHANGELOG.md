@@ -2,6 +2,33 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## Unreleased
+
+### Fixed — a dropped response now retries instead of ending the turn
+
+**A request whose upstream connection died after the headers arrived used to end
+the conversation with "Qoder transport request failed." and no retry**, which
+read as the plugin giving up on a failure the harness was built to ride out. The
+same drop before the first byte was retried normally, so the outcome depended on
+how far the request had got rather than on what went wrong.
+
+The cause was a classification gap, not a missing retry. DSH treats a failure as
+retryable only when its code is one of `EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`,
+`TIMEOUT` or `TRANSPORT`, and `dsh-llm-pi-ai` derives that code by matching text
+inside the failure **message**. A mid-stream break loses its HTTP status on the
+way out — the shim can only send an in-band SSE error frame once the 200 has gone
+— so the message was the bare phrase "Qoder transport request failed.", which
+matches nothing the classifier looks for and fell through to `PI_AI_ERROR`. A
+failure before the first chunk keeps its status, which is why only the late drops
+went unretried.
+
+Failures now name the condition in the phrase the classifier reads, and carry the
+underlying `cause` chain for diagnosis, redacted and bounded:
+`Qoder connection failed: fetch failed: other side closed`. The same treatment
+covers a bodyless 200 answer and a stream truncated before `[DONE]`. Each of
+these is now eligible for the configured `retryPolicy` backoff instead of ending
+the turn on the first drop.
+
 ## 1.1.0 — 2026-10-27
 
 The Global daily check-in no longer requires the Qoder desktop app. The identity

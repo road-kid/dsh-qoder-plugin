@@ -354,7 +354,12 @@ export async function* parseQoderSse(
     reader.releaseLock()
   }
 
-  if (!sawDone) throw new QoderLlmError('SSE stream ended prematurely without [DONE].', 'TRANSPORT')
+  // Phrased as "connection" rather than "SSE stream": `classifyPiAiError` in
+  // dsh-llm-pi-ai matches the failure MESSAGE, and this message reaches it
+  // verbatim on every path. A message it cannot classify lands on `PI_AI_ERROR`,
+  // which is outside the default `retryableCodes`, so a truncated stream would
+  // end the turn instead of retrying. "connection" maps to TRANSPORT.
+  if (!sawDone) throw new QoderLlmError('Qoder connection ended prematurely: the event stream closed without [DONE].', 'TRANSPORT')
 
   for (const segment of thinkingParser.finish()) {
     for (const chunk of appendSegment(segment)) yield chunk
