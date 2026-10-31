@@ -1123,30 +1123,103 @@ function versionFromCollected(entries: readonly UmidCollectedEntry[]): string | 
 // ---------------------------------------------------------------------------
 
 /**
+ * How long the self-check teardown waits for the child's `close` after a kill.
+ *
+ * `close` is the signal that the child's stdio pipes are gone, which is exactly
+ * when deleting the staging directory stops racing the process on Windows. A
+ * grandchild that inherited those pipes can keep `close` pending forever, so
+ * the wait is bounded; the staging removal retries instead of deleting early,
+ * so the fallback never turns into "remove while the child may still write".
+ */
+const umidSelfCheckCloseGraceMs = 2_000
+
+/**
  * Run the component once and collect its first JSON line.
  *
  * The child is given the staging directory as its working directory because a
  * component that resolves its companion library relative to the CWD would
  * otherwise fail here and succeed nowhere.
+ *
+ * `close`, not `exit`, is the completion signal: only `close` means the stdio
+ * pipes are drained. `finish` decides the outcome but keeps the promise pending
+ * until that event; the install therefore deletes the staging directory only
+ * after the child it killed is really gone.
+ *
+ * Exported, and with an injectable `spawn`, so the teardown ordering can be
+ * tested: the component itself only exists for the target platform, but the
+ * contract "the child closed before the runner settled" is host independent.
  */
-async function runSelfCheckProcess(request: UmidSelfCheckRequest): Promise<UmidSelfCheckOutcome> {
+export async function runSelfCheckProcess(
+  request: UmidSelfCheckRequest,
+  spawnImpl: typeof spawn = spawn,
+): Promise<UmidSelfCheckOutcome> {
   return await new Promise<UmidSelfCheckOutcome>(resolve => {
     let stdout = ''
     let stderr = ''
+    /** An outcome has been decided; the promise may still be waiting for close. */
     let settled = false
-    const child = spawn(request.binary, [...request.args], {
+    /** The child's stdio pipes are closed; the staging directory is safe to remove. */
+    let closed = false
+    /** The outcome to resolve with once the child closes. */
+    let decided: UmidSelfCheckOutcome | undefined
+    let resolved = false
+    /** Why the stop signal could not be delivered, when it could not. */
+    let killFailure: string | undefined
+    let deadline: NodeJS.Timeout | undefined
+    let closeFallback: NodeJS.Timeout | undefined
+
+    const child = spawnImpl(request.binary, [...request.args], {
       cwd: request.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
+
+    /** Resolve exactly once and drop the bounded fallback. */
+    const deliver = (outcome: UmidSelfCheckOutcome): void => {
+      if (resolved) return
+      resolved = true
+      if (closeFallback !== undefined) {
+        clearTimeout(closeFallback)
+        closeFallback = undefined
+      }
+      resolve(outcome)
+    }
+
+    /**
+     * Decide the outcome. The promise resolves only after `close`; if that has
+     * already happened, this is also the resolve.
+     */
     const finish = (outcome: UmidSelfCheckOutcome): void => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
-      if (child.exitCode === null) child.kill()
-      resolve(outcome)
+      if (deadline !== undefined) {
+        clearTimeout(deadline)
+        deadline = undefined
+      }
+      decided = outcome
+      if (closed) {
+        deliver(outcome)
+        return
+      }
+      // Only a child that is still running needs the signal. One that already
+      // exited still has pipes to drain, so it is awaited exactly like the rest.
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          if (!child.kill()) killFailure = 'the component did not accept the stop signal'
+        } catch (error: unknown) {
+          killFailure = `cannot stop the component: ${umidErrorMessage(error)}`
+        }
+      }
+      // Bounded, and paired with the staging-removal retry: a grandchild that
+      // inherited the pipes can keep close pending forever. Even then nothing
+      // is removed before this resolves, and the retry copes with a late close.
+      closeFallback = setTimeout(() => {
+        closeFallback = undefined
+        deliver(killFailure === undefined ? outcome : { ...outcome, spawnError: outcome.spawnError ?? killFailure })
+      }, umidSelfCheckCloseGraceMs)
     }
-    const timer = setTimeout(() => {
+
+    deadline = setTimeout(() => {
       finish({ code: null, stdout, spawnError: `the component did not answer within ${Math.round(request.timeoutMs / 1000)}s` })
     }, request.timeoutMs)
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -1159,6 +1232,11 @@ async function runSelfCheckProcess(request: UmidSelfCheckRequest): Promise<UmidS
     })
     child.once('error', (error: Error) => finish({ code: null, stdout, spawnError: `cannot run the component: ${error.message}` }))
     child.once('close', (code: number | null) => {
+      closed = true
+      if (decided !== undefined) {
+        deliver(decided)
+        return
+      }
       const detail = stderr.trim()
       finish({
         code,
@@ -1213,6 +1291,41 @@ function removeStagingLeftovers(destDir: string): void {
       rmSync(join(destDir, entry.name), { recursive: true, force: true })
     } catch {
       // A leftover we cannot remove must not fail the install that follows.
+    }
+  }
+}
+
+/** Attempts the install makes to delete its own staging directory. */
+const umidStagingRemovalAttempts = 5
+
+/** Base delay between staging-removal retries, ms; the attempt number scales it. */
+const umidStagingRemovalRetryMs = 50
+
+/** Windows reports a just-released file/directory as one of these while it settles. */
+function isBusyStagingError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'EBUSY' || code === 'EPERM' || code === 'ENOTEMPTY' || code === 'EACCES'
+}
+
+/**
+ * Remove one install's staging directory, retrying while Windows still holds it.
+ *
+ * The self-check child is awaited to its `close` before this runs, but Windows
+ * can keep reporting a directory whose handles were released a moment ago as
+ * busy (EBUSY/EPERM). A single `rmSync` would then abandon the staging
+ * directory and leave a stale copy of the component behind; retrying is what
+ * turns that race into a clean install. Best effort: the install's outcome has
+ * already been decided by the time this runs, and a directory that stays locked
+ * is picked up by the next install's {@link removeStagingLeftovers}.
+ */
+async function removeUmidStaging(dir: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return
+    } catch (error: unknown) {
+      if (attempt >= umidStagingRemovalAttempts || !isBusyStagingError(error)) return
+      await new Promise(resolve => setTimeout(resolve, umidStagingRemovalRetryMs * attempt))
     }
   }
 }
@@ -1466,10 +1579,9 @@ export async function installUmid(options: UmidInstallOptions = {}): Promise<Umi
     return failure(destDir, umidErrorMessage(error), { version, source: sourceWithBlobs })
   } finally {
     // Step 12, and the failure path too: staging never survives an attempt.
-    try {
-      rmSync(stagingDir, { recursive: true, force: true })
-    } catch {
-      // Nothing else can be done about a directory we cannot remove.
-    }
+    // `runSelfCheckProcess` has already awaited the child's `close`, so on the
+    // normal path this can no longer race the process it started; the helper's
+    // retry covers Windows still reporting the just-released directory as busy.
+    await removeUmidStaging(stagingDir)
   }
 }
