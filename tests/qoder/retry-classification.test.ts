@@ -1,11 +1,10 @@
 /**
  * The retry contract between this transport and the harness's error classifier.
  *
- * The harness never sees this plugin's structured error code: `dsh-llm-pi-ai`
- * derives the code by matching TEXT in the failure message, and `dsh-llm-retry`
- * retries only the codes in the provider's `retryableCodes` set. A message the
- * matcher cannot classify falls back to `PI_AI_ERROR`, which is outside that
- * set — so a dropped response would end the turn instead of being retried.
+ * Thrown transport errors cross `dsh-llm-pi-ai`, which derives their code by
+ * matching TEXT in the error message; `dsh-llm-retry` retries only codes in the
+ * provider's `retryableCodes` set. Finish chunks instead carry their structured
+ * `failure.code` directly to the retry policy and do not use the text classifier.
  *
  * These tests therefore assert the CONTRACT that was violated, against the REAL
  * code paths (the SSE decoder and the chat stream), not against a copy of the
@@ -19,7 +18,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createUserMessage, type GenerateOptions } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, createUserMessage, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { streamQoderChat, type QoderChatDependencies } from '../../src/qoder/transport/chat.ts'
 import { parseQoderSse } from '../../src/qoder/transport/wire/sse.ts'
 import { validateQoderRequest } from '../../src/qoder/transport/wire/serialize.ts'
@@ -62,7 +61,7 @@ const DEFAULT_RETRYABLE_CODES: ReadonlySet<string> = new Set([
   'TRANSPORT',
 ])
 
-/** Whether the harness would retry a failure carrying this message. */
+/** Whether the harness would retry a transport error thrown with this message. */
 function wouldRetry(message: string): boolean {
   return DEFAULT_RETRYABLE_CODES.has(classifyPiAiError(message))
 }
@@ -177,10 +176,36 @@ test('a truncated event stream is classified retryable by the host classifier', 
   )
 })
 
+test('a completed response with no content carries the retryable EMPTY_RESPONSE code', async () => {
+  // Finish chunks bypass the thrown-error text classifier: the host retry
+  // policy reads this structured code directly from the finish failure.
+  const chunks: unknown[] = []
+  for await (const chunk of parseQoderSse(streamOf([
+    frame({ choices: [{ index: 0, delta: {}, finishReason: 'stop' }] }),
+    'data: [DONE]\n\n',
+  ].join('')))) chunks.push(chunk)
+
+  assert.equal(chunks.length, 1)
+  const finish = chunks[0]
+  assert.ok(finish !== undefined)
+  assert.equal((finish as { type: string }).type, 'finish')
+  if ((finish as { type: string }).type !== 'finish') {
+    throw new Error('expected a finish chunk')
+  }
+  const reason = (finish as { reason: { kind: string; failure?: { message: string; code: string } } }).reason
+  assert.equal(reason.kind, 'error')
+  assert.ok(reason.failure)
+  assert.deepEqual(reason.failure, {
+    message: 'Model returned a completed response with no content.',
+    code: EMPTY_RESPONSE_CODE,
+  })
+  assert.equal(DEFAULT_RETRYABLE_CODES.has(reason.failure.code), true)
+})
+
 test('the phrases this transport used to emit would NOT have been retried', () => {
-  // Negative control: it fixes what the two tests above are guarding. If either
-  // of these ever starts classifying retryably, the copy of the classifier in
-  // this file no longer matches the host and must be re-extracted.
+  // Negative control: it fixes what the two thrown-error tests above are
+  // guarding. If either of these ever starts classifying retryably, the copy
+  // of the classifier in this file no longer matches the host and must be re-extracted.
   assert.equal(classifyPiAiError('Qoder transport request failed.'), 'PI_AI_ERROR')
   assert.equal(classifyPiAiError('SSE stream ended prematurely without [DONE].'), 'PI_AI_ERROR')
   assert.equal(wouldRetry('Qoder transport request failed.'), false)
