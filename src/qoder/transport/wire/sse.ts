@@ -354,7 +354,11 @@ export async function* parseQoderSse(
     reader.releaseLock()
   }
 
-  if (!sawDone) throw new QoderLlmError('SSE stream ended prematurely without [DONE].', 'TRANSPORT')
+  // Same classification contract as the mid-stream failure in chat.ts: the
+  // message must carry a token the harness maps to TRANSPORT ("connection"),
+  // or a truncated stream would end the turn as PI_AI_ERROR instead of being
+  // retried.
+  if (!sawDone) throw new QoderLlmError('Qoder connection ended prematurely: the event stream closed without [DONE].', 'TRANSPORT')
 
   for (const segment of thinkingParser.finish()) {
     for (const chunk of appendSegment(segment)) yield chunk

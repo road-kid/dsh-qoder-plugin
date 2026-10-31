@@ -1004,7 +1004,7 @@ describe('QoderTransport session stickiness', () => {
 
     await drain(transport, SESSION)
     expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
-    await expect(drainStep(transport, SESSION)).rejects.toThrow('Qoder transport request failed.')
+    await expect(drainStep(transport, SESSION)).rejects.toThrow(/Qoder connection failed while streaming the response\./)
     expect(pendingSnapshot(transport)).toEqual([])
   })
 
