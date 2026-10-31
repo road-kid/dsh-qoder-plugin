@@ -886,7 +886,16 @@ export class DefaultQoderTransport implements QoderTransport {
      * connection failure: it persisted a new active account, armed the
      * credential file for a rewrite, and told the user "已自动切换到下一个账号
      * 重试" 218ms into a request that never failed. So this branch only changes
-     * where this request starts; it does not touch the session pin.
+     * where this request starts and never announces a failover.
+     *
+     * It DOES move the session pin, though — see the pin write below. A session
+     * pin is this conversation's own "which account am I using", not the host's
+     * global active pointer, and a conversation whose request was served by
+     * another account is using that account from now on: its counters, its
+     * continuation steps, and its next bound check all belong to the account
+     * that ran the work. Leaving the pin on the skipped account would make the
+     * next step of the same turn collide with the busy account again, and would
+     * charge the skipped account for a request it never served.
      *
      * A cooldown IS a verdict on the account, though, and the host's metadata
      * reads (catalog, billing) sign with the store's active account. Leaving the
@@ -894,13 +903,13 @@ export class DefaultQoderTransport implements QoderTransport {
      * card kept reading through it, so the skip is adopted silently: `adopted`
      * changes the active pointer without a notice or a failover time. A busy
      * account must NOT be adopted — another request is just using it this
-     * second. When nothing else is selectable the account is kept as the only
-     * option: the pool being all-cooling or all-busy is not a reason to invent a
-     * wait or to refuse a request that account may well serve now.
+     * second, which says nothing about the account's health. When nothing else
+     * is selectable the account is kept as the only option: the pool being
+     * all-cooling or all-busy is not a reason to invent a wait or to refuse a
+     * request that account may well serve now.
      */
     const firstCooling = this.penalties.isCooling(first.id)
     const firstBusy = this.traffic.isBusy(first.id)
-    let rerouted = false
     if (firstCooling || firstBusy) {
       const alternative = await this.nextWalkAccount(failover, first.id, new Set([first.id]))
       if (alternative !== undefined) {
@@ -930,13 +939,20 @@ export class DefaultQoderTransport implements QoderTransport {
           penalty: this.penalties.snapshot(first.id),
         })
         first = alternative
-        rerouted = true
       }
     }
-    // Pin only a start that was not rerouted. A local skip is a statement about
-    // this request, so rewriting the session pin from it would carry the
-    // workaround into the next turn.
-    if (!rerouted && (pinned === undefined || first.id !== pinned.id)) this.pinSession(sessionId, first)
+    /*
+     * Pin the account this request ACTUALLY starts on — whichever way it was
+     * chosen. Counters are statements about work an account did, so they must
+     * follow the serving account: a reroute that left the pin behind charged the
+     * skipped account for a request it never served and sent the next step of
+     * the turn back into the busy one.
+     *
+     * This writes only the SESSION pin. The host's global active pointer is a
+     * different thing, owned by `adopted`/`switched`, and a busy skip must not
+     * touch it.
+     */
+    if (pinned === undefined || first.id !== pinned.id) this.pinSession(sessionId, first)
     // Count the request against whichever account it actually starts on. This
     // is the request bound of stickiness; the ROUND bound is counted only when
     // an answer is consumed to the end, below.

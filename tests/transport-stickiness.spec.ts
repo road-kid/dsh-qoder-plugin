@@ -90,6 +90,11 @@ function unavailable(): Response {
   return new Response('', { status: 503 })
 }
 
+/** A rate-limit refusal: one of these cools the account down in the ledger. */
+function rateLimited(): Response {
+  return new Response('', { status: 429 })
+}
+
 // ---------------------------------------------------------------------------
 // Fake credential pool
 // ---------------------------------------------------------------------------
@@ -97,12 +102,16 @@ function unavailable(): Response {
 interface Pool {
   hooks: QoderFailoverHooks
   switches: Array<{ fromId: string; toId: string; reason: string }>
+  /** Silent adoptions: dispatch moves the host must know about but never report. */
+  adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }>
 }
 
 function pool(accounts: readonly { id: string; pat: string }[], active: { id: string; pat: string }): Pool {
   const switches: Array<{ fromId: string; toId: string; reason: string }> = []
+  const adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }> = []
   return {
     switches,
+    adopted,
     hooks: {
       enabled: () => true,
       activeAccount: async () => active,
@@ -120,6 +129,9 @@ function pool(accounts: readonly { id: string; pat: string }[], active: { id: st
       },
       async switched(info) {
         switches.push(info)
+      },
+      async adopted(info) {
+        adopted.push(info)
       },
     },
   }
@@ -242,6 +254,31 @@ async function drainLikeHttp(transport: QoderTransport, sessionId?: Session): Pr
 }
 
 const SESSION = 'session-1' as Session
+
+/**
+ * The transport's pin table, as a value a test can assert on.
+ *
+ * The pin is the transport's own bookkeeping — there is no public accessor for
+ * it, and there should not be: it is not part of the transport's contract. A
+ * test still needs to distinguish "counted on the account that served" from
+ * "counted on the account the request was pointed at", and the counters are the
+ * only observable difference, so read the private table through a cast.
+ */
+function pinSnapshot(transport: QoderTransport): Array<{ id: string; requests: number; rounds: number }> {
+  const table = (transport as unknown as {
+    sessionPins: Map<string, { id: string; requests: number; rounds: number }>
+  }).sessionPins
+  return Array.from(table.values(), pin => ({ id: pin.id, requests: pin.requests, rounds: pin.rounds }))
+}
+
+/** Poll until `predicate` holds; a staged interleaving must never hang a test. */
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3_000
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+    await new Promise<void>(resolve => setTimeout(resolve, 5))
+  }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -523,6 +560,85 @@ describe('QoderTransport session stickiness', () => {
       [ALPHA.id, BETA.id],
       [BETA.id, GAMMA.id],
     ])
+  })
+
+  /**
+   * A request dispatched to another account belongs to the account that ran it.
+   *
+   * The pin names the account the CONVERSATION is using, not the one it was
+   * pointed at before dispatch. When the guard reports the pinned account busy,
+   * the request starts elsewhere; leaving the pin behind would keep the skipped
+   * account's request/round counters growing for work it never did, and the next
+   * step of the same turn would walk straight back into the occupied account —
+   * the exact collision the guard exists to avoid.
+   */
+  it('moves the session pin to the account that serves after a busy skip', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseHolder: () => void = () => {}
+    const holderGate = new Promise<Response>((resolve) => {
+      releaseHolder = (): void => resolve(accepted('holder'))
+    })
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: async (pat, call) => pat === ALPHA.pat && call === 2 ? await holderGate : accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // request 1: Alpha serves, the session pins there
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 1, rounds: 1 }])
+
+    // A concurrent request WITHOUT a session holds Alpha's traffic slot.
+    const holder = drain(transport)
+    await waitFor(() => upstream.chatPats.length === 2, 'the holder to occupy Alpha')
+
+    // Request 2 of the session: pinned Alpha is busy, so it starts on Beta —
+    // and the session must follow, because Beta is the account doing the work.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+    // The next step of the same turn stays on Beta instead of retrying the
+    // occupied account.
+    await drainStep(transport, SESSION)
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+    // Still not a failover: nothing failed, so nothing is announced or adopted.
+    expect(poolState.switches).toEqual([])
+    expect(poolState.adopted).toEqual([])
+
+    releaseHolder()
+    await holder
+  })
+
+  /**
+   * The same rule for a cooldown, which (unlike busy) IS a verdict on the
+   * account: the session follows the serving account and the host is told to
+   * adopt it silently, but no failover is reported.
+   */
+  it('moves the session pin to the account that serves after a cooling skip', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: (pat, call) => {
+        // Alpha's second chat is a rate limit: the ledger cools it and the walk
+        // recovers on Beta.
+        if (pat === ALPHA.pat && call === 2) return rateLimited()
+        return accepted('from-any')
+      },
+    })
+
+    await drain(transport, SESSION) // request 1: Alpha serves, one round
+    await drain(transport) // sessionless request: Alpha 429 → Beta serves, Alpha cools
+    expect(poolState.switches.map(info => [info.fromId, info.toId])).toEqual([[ALPHA.id, BETA.id]])
+
+    // Request 2 of the session: the pinned Alpha is cooling, so it starts on
+    // Beta and the session follows.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+    // Cooling is a real verdict on the account, so the move is adopted — still
+    // silently: a dispatch fact is not a failover.
+    expect(poolState.adopted).toEqual([{ fromId: ALPHA.id, toId: BETA.id, reason: 'cooling' }])
+    expect(poolState.switches).toHaveLength(1)
+    await drainStep(transport, SESSION)
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
   })
 
   it('keeps the session where it is when the pool has nobody to rotate to', async () => {
