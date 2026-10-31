@@ -677,6 +677,36 @@ describe('Qoder plugin card', () => {
     expect(tree).toContain(t('upstreamNoticeRetry', { seconds: 30 }))
   })
 
+  it('reports the measured upstream wait instead of the initial retry advice', async () => {
+    withPool({ upstreamNotice: notice({
+      waited: true,
+      retryAfterMs: 30_000,
+      waits: {
+        attempts: 1,
+        totalWaitMs: 86_000,
+        lastBasis: { source: 'upstream', advisedSeconds: 86, configuredSeconds: 30 },
+      },
+    }) })
+    await mount()
+    expect(rendered()).toContain(t('upstreamNoticeWaited', { seconds: 86 }))
+    expect(rendered()).not.toContain(t('upstreamNoticeWaited', { seconds: 30 }))
+  })
+
+  it('reports a measured configured wait with its actual basis', async () => {
+    withPool({ upstreamNotice: notice({
+      waited: true,
+      retryAfterMs: undefined,
+      waits: {
+        attempts: 1,
+        totalWaitMs: 12_000,
+        lastBasis: { source: 'configured', configuredSeconds: 10 },
+      },
+    }) })
+    await mount()
+    expect(rendered()).toContain('This plugin already waited 12s using the configured fallback; still unavailable.')
+    expect(rendered()).not.toContain(en.upstreamNoticeWaitedNoDelay)
+  })
+
   it('states no delay when the upstream gave none, but still records the wait', async () => {
     withPool({ upstreamNotice: notice({ waited: false, retryAfterMs: undefined }) })
     await mount()

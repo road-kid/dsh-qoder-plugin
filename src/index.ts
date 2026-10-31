@@ -1167,6 +1167,10 @@ function createVariantRuntime(
    * it has come back within the same outage window.
    */
   let queueNotice: QoderWebUpstreamNotice | undefined
+  // Host-clock evidence belongs to one conversation. The outage counter stays
+  // global, but another session's first refusal must not inherit this session's
+  // elapsed retry window and claim a wait that never happened there.
+  let queueNoticeSessionId: string | undefined
   /** The last automatic account switch, for the card. */
   let failoverAt: number | undefined
   let failoverReason: string | undefined
@@ -1388,8 +1392,10 @@ function createVariantRuntime(
       // really waited that long and was refused again. A shorter gap supports no
       // such claim, and `waited: true` there would print "已按上游建议等待 30 秒
       // 仍不可服务" to someone whose wait was seconds.
-      const waitedByHostClock = sameOutage && advisedMs !== undefined && at - previous.at >= advisedMs
+      const waitedByHostClock = sameOutage && sessionId === queueNoticeSessionId
+        && advisedMs !== undefined && at - previous.at >= advisedMs
       const waited = transportWaited || waitedByHostClock
+      queueNoticeSessionId = sessionId
       queueNotice = {
         kind: facts.serviceAvailable === false ? 'unavailable' : 'queued',
         ...facts.upstreamMessage === undefined ? {} : { upstreamMessage: facts.upstreamMessage },

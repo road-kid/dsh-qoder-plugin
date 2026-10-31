@@ -532,6 +532,15 @@ function UpstreamNoticeBlock({ notice, t }: {
   const retrySeconds = typeof notice.retryAfterMs === 'number' && Number.isFinite(notice.retryAfterMs)
     ? Math.max(1, Math.round(notice.retryAfterMs / 1000))
     : undefined
+  // A completed transport wait is direct evidence and supersedes the initial
+  // retry advice (upstream waitTime may have lengthened it). The advice remains
+  // the fallback only for a host-driven retry inferred from the elapsed clock.
+  const waits = typeof notice.waits === 'object' && notice.waits !== null ? notice.waits : undefined
+  const measuredWaitSeconds = waits !== undefined && waits.attempts > 0 && Number.isFinite(waits.totalWaitMs)
+    ? Math.max(1, Math.round(waits.totalWaitMs / 1000))
+    : undefined
+  const waitedSeconds = measuredWaitSeconds ?? retrySeconds
+  const configuredWait = measuredWaitSeconds !== undefined && waits?.lastBasis?.source === 'configured'
   const at = typeof notice.at === 'number' && Number.isFinite(notice.at) ? notice.at : undefined
   const occurrences = typeof notice.occurrences === 'number' && Number.isFinite(notice.occurrences)
     ? notice.occurrences
@@ -551,9 +560,11 @@ function UpstreamNoticeBlock({ notice, t }: {
       {notice.waited
         ? (
           <p className="qdp-body">
-            {retrySeconds === undefined
+            {waitedSeconds === undefined
               ? t('upstreamNoticeWaitedNoDelay')
-              : t('upstreamNoticeWaited', { seconds: retrySeconds })}
+              : configuredWait
+                ? t('upstreamNoticeConfiguredWaited', { seconds: waitedSeconds })
+                : t('upstreamNoticeWaited', { seconds: waitedSeconds })}
           </p>
         )
         : (retrySeconds === undefined ? null : <p className="qdp-body">{t('upstreamNoticeRetry', { seconds: retrySeconds })}</p>)}

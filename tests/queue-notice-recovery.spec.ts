@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
-import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import * as Qoder from '../src/index.ts'
 import { installJobTokenHint } from '../src/job-token-hint.ts'
 import { formatQueueNotice, parseQueueFacts, type QoderQueueWaitSummary } from '../src/qoder/queue-notice.ts'
@@ -235,12 +235,13 @@ async function bootSignedIn(
 }
 
 /** Drive one chat the way the agent loop does, and report the text it produced. */
-async function chat(ctx: Context): Promise<string> {
+async function chat(ctx: Context, sessionId?: string): Promise<string> {
   let text = ''
   try {
     for await (const chunk of ctx.llm.stream({
       provider: 'qoder',
       model: 'live-model',
+      ...sessionId === undefined ? {} : { sessionId: sessionId as NonNullable<GenerateOptions['sessionId']> },
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'Hello' }],
         source: { kind: 'user' },
@@ -410,6 +411,20 @@ describe('queue notice lifecycle', () => {
     // The approved sentence is not just reachable in a formatter: it is the line
     // the second answer prints into the conversation.
     expect(noticeLines(session.appended).at(-1)).toBe(sentence)
+  }, 30_000)
+
+  it("does not borrow another session's elapsed retry window as a wait", async () => {
+    const ctx = await bootSignedIn({ chat: () => queueChat() })
+    await chat(ctx, 'session-a')
+    const first = noticeIn(await statusDocument())!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime((first.at as number) + 31_000)
+    // B is making its first request. A's host retry clock says nothing about
+    // whether B waited, even though both answers describe the same outage.
+    await chat(ctx, 'session-b')
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ waited: false, occurrences: 2 })
+    expect(rowSentence(notice!)).not.toContain('已按上游建议等待')
   }, 30_000)
 
   it('claims a configured wait the transport really completed', async () => {

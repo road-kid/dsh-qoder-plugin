@@ -222,6 +222,13 @@ function isServedFinish(chunk: StreamChunk): boolean {
  * that stored an absolute expiry could not start counting from the instant the
  * account actually took over the session.
  */
+interface TurnObservation {
+  /** Identity of the turn this request opened or continued. */
+  token?: object
+  /** Whether a terminal chunk already ran the finish bookkeeping. */
+  terminal: boolean
+}
+
 interface SessionPin {
   id: string
   pat: string
@@ -492,6 +499,8 @@ export class DefaultQoderTransport implements QoderTransport {
    * turn supersedes it, and when its session loses its pin.
    */
   private readonly pendingTurns = new Map<string, { accountId: string }>()
+  /** Current turn identity per session; late requests may not mutate a newer turn. */
+  private readonly sessionTurns = new Map<string, object>()
   /**
    * The conversations whose self-heal exchanged a fresh job token and whose
    * retry has not been accepted yet, with the time each rotation happened.
@@ -670,7 +679,21 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk> {
-    return this.generate(options, model)
+    // Async-generator bodies do not run until the first next(). Bind the turn
+    // now, at stream creation, so delayed consumption cannot adopt a newer
+    // turn's identity (and an older opening cannot register after a newer one).
+    const sessionId = isTitleRequest(options) ? undefined : sessionIdOf(options)
+    const tracking = sessionId !== undefined && this.stickiness !== undefined && this.stickinessEnabled(this.stickiness)
+    let turnToken: object | undefined
+    if (tracking && sessionId !== undefined) {
+      if (opensNewTurn(options)) {
+        turnToken = {}
+        this.sessionTurns.set(sessionId, turnToken)
+      } else {
+        turnToken = this.sessionTurns.get(sessionId)
+      }
+    }
+    return this.generate(options, model, turnToken)
   }
 
   /**
@@ -826,9 +849,20 @@ export class DefaultQoderTransport implements QoderTransport {
 
   private async * generate(
     options: GenerateOptions,
-    model?: QoderCatalogModel,
+    model: QoderCatalogModel | undefined,
+    observedTurnToken: object | undefined,
   ): AsyncGenerator<StreamChunk> {
-    if (options.signal?.aborted) throw aborted('Request was aborted prior to generation.')
+    if (options.signal?.aborted) {
+      const sessionId = sessionIdOf(options)
+      if (opensNewTurn(options)) {
+        if (sessionId !== undefined && this.sessionTurns.get(sessionId) === observedTurnToken) {
+          this.pendingTurns.delete(sessionId)
+        }
+      } else {
+        this.abandonTurn(sessionId, observedTurnToken)
+      }
+      throw aborted('Request was aborted prior to generation.')
+    }
 
     // Phase 1: static validation finishes before credential resolution or any
     // provider I/O, so an unusable request never consumes a subscription.
@@ -843,8 +877,12 @@ export class DefaultQoderTransport implements QoderTransport {
      * walk — because the final-failure notice below is what quotes the record.
      */
     const queueBudget = this.newQueueWaitLedger()
+    const turn: TurnObservation = {
+      terminal: false,
+      ...observedTurnToken === undefined ? {} : { token: observedTurnToken },
+    }
     try {
-      yield* this.generateWithAccounts(options, model, attribution, queueBudget)
+      yield* this.generateWithAccounts(options, model, attribution, queueBudget, turn)
     } catch (error: unknown) {
       /*
        * The final failure of a request is where the queue explanation belongs.
@@ -867,6 +905,8 @@ export class DefaultQoderTransport implements QoderTransport {
         this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options), queueWaitSummary(queueBudget))
       }
       throw error
+    } finally {
+      if (!turn.terminal) this.abandonTurn(sessionIdOf(options), turn.token)
     }
   }
 
@@ -889,6 +929,7 @@ export class DefaultQoderTransport implements QoderTransport {
     model: QoderCatalogModel | undefined,
     attribution: AttemptAttribution,
     queueBudget: QueueWaitLedger,
+    turn: TurnObservation,
   ): AsyncGenerator<StreamChunk> {
     const failover = this.failover
     if (failover === undefined || !failover.enabled()) {
@@ -911,10 +952,18 @@ export class DefaultQoderTransport implements QoderTransport {
     // steps keep the account their turn opened on, and a bound reached
     // mid-turn waits for the next turn.
     const newTurn = opensNewTurn(options)
-    // A turn that never reached an answer — the user stopped it, the host gave
-    // up, the process restarted — leaves a pending record behind. A new turn
-    // supersedes it: its rounds were never earned and never will be.
-    if (newTurn && sessionId !== undefined) this.pendingTurns.delete(sessionId)
+    const tracking = sessionId !== undefined && this.stickiness !== undefined && this.stickinessEnabled(this.stickiness)
+    const turnToken = turn.token
+    if (!tracking && sessionId !== undefined) {
+      this.sessionTurns.delete(sessionId)
+      this.pendingTurns.delete(sessionId)
+    }
+    // A turn that never reached an answer leaves a pending record behind. A
+    // current new opening supersedes it; an older opening that lost the
+    // creation-order race must not delete the newer turn's pending record.
+    if (newTurn && sessionId !== undefined && turnToken !== undefined && this.sessionTurns.get(sessionId) === turnToken) {
+      this.pendingTurns.delete(sessionId)
+    }
     // Stickiness chooses where a request STARTS, never whether the walk runs: a
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
@@ -1065,11 +1114,12 @@ export class DefaultQoderTransport implements QoderTransport {
         const servedId = account.id
         const servedTurn = newTurn
         return (chunk): void => {
+          turn.terminal = true
           if (!isServedFinish(chunk)) {
             // No answer: an upstream error or a caller abort. It neither
             // exonerates the account nor completes a turn, and any turn that was
             // in flight ends here without a round.
-            if (sessionId !== undefined) this.pendingTurns.delete(sessionId)
+            if (sessionId !== undefined) this.abandonTurn(sessionId, turnToken)
             return
           }
           this.penalties.noteSuccess(servedId)
@@ -1077,13 +1127,16 @@ export class DefaultQoderTransport implements QoderTransport {
           // The walk is over and every deferred penalty has landed, so nothing
           // may blame these accounts again if the caller keeps pulling.
           pendingBlame.length = 0
-          this.noteTurnProgress(sessionId, servedId, chunk, servedTurn)
+          this.noteTurnProgress(sessionId, servedId, chunk, servedTurn, turnToken)
         }
       })()
       // Set before the attempt, not after it: `attempt` reads it when it fires
       // the acceptance handler, and on a failure that escapes the walk it must
       // already name the account whose attempt failed last.
       attribution.accountId = account.id
+      // Capture ownership before the attempt can await the network. Reading it
+      // in catch would mistake a newer request's pin for this attempt's baseline.
+      const pinBeforeAttempt = sessionId === undefined ? undefined : this.sessionPins.get(sessionId)
       try {
         yield* this.attempt(options, model, account, state, account.id, queueBudget)
         // Reached only when the source ended without a terminal chunk at all,
@@ -1119,7 +1172,9 @@ export class DefaultQoderTransport implements QoderTransport {
         // The session follows the walk. A pin left pointing at the account that
         // just failed would send the very next turn straight back to it, once
         // per request for as long as the pin lives — the opposite of recovery.
-        this.pinSession(sessionId, next)
+        if (sessionId === undefined || this.sessionPins.get(sessionId) === pinBeforeAttempt) {
+          this.pinSession(sessionId, next)
+        }
         // The retry is a request served by the account taking over, so it has
         // to count against that account's request bound. `pinSession` started
         // the counters at zero; without this line the account that rescued the
@@ -1557,6 +1612,8 @@ export class DefaultQoderTransport implements QoderTransport {
         if (this.sessionPins.get(sessionId) !== pin) continue
         if (account === undefined) {
           this.sessionPins.delete(sessionId)
+          this.pendingTurns.delete(sessionId)
+          this.sessionTurns.delete(sessionId)
           return undefined
         }
         pin.pat = account.pat
@@ -1691,8 +1748,10 @@ export class DefaultQoderTransport implements QoderTransport {
     accountId: string,
     chunk: StreamChunk,
     opening: boolean,
+    turnToken: object | undefined,
   ): void {
     if (sessionId === undefined || chunk.type !== 'finish') return
+    if (turnToken === undefined || this.sessionTurns.get(sessionId) !== turnToken) return
     const kind = chunk.reason.kind
     if (kind === 'stop' || kind === 'max-tokens') {
       // An opening request whose answer is already final completes its turn on
@@ -1702,12 +1761,21 @@ export class DefaultQoderTransport implements QoderTransport {
       // turn that this transport did not see open.
       if (opening || this.pendingTurns.has(sessionId)) this.completeRound(sessionId, accountId)
       this.pendingTurns.delete(sessionId)
+      this.sessionTurns.delete(sessionId)
       return
     }
     // `tool-calls`: the turn is in flight and now belongs to the account that
     // served this step, which a failover may have changed. Without a pin there is
     // no stickiness to serve, so there is nothing worth remembering.
     if (this.sessionPins.has(sessionId)) this.pendingTurns.set(sessionId, { accountId })
+  }
+
+  /** Drop an unfinished turn only if no newer request has superseded it. */
+  private abandonTurn(sessionId: string | undefined, turnToken: object | undefined): void {
+    if (sessionId === undefined || turnToken === undefined) return
+    if (this.sessionTurns.get(sessionId) !== turnToken) return
+    this.sessionTurns.delete(sessionId)
+    this.pendingTurns.delete(sessionId)
   }
 
   /**
@@ -1734,6 +1802,7 @@ export class DefaultQoderTransport implements QoderTransport {
         if (oldest.done === true) break
         this.sessionPins.delete(oldest.value)
         this.pendingTurns.delete(oldest.value)
+        this.sessionTurns.delete(oldest.value)
       }
     }
     this.sessionPins.delete(sessionId)
