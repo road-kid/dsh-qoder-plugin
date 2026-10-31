@@ -492,10 +492,10 @@ const QUEUE_WAIT_ENABLED_FIELD = volatileField(z.boolean()
   .description('排队重试总开关：关闭后上游排队直接报错，不再等待重试（默认开启）'))
 /** Queue wait retry count: 0 = report at once, 1..10 retries. */
 const QUEUE_WAIT_ATTEMPTS_FIELD = volatileField(z.number()
-  .default(0)
+  .default(5)
   .min(0)
   .max(10)
-  .description('上游排队时的重试次数（0 = 不重试，最多 10 次）'))
+  .description('上游排队时的重试次数（0 = 不重试，默认 5 次，最多 10 次）'))
 /** Queue wait seconds per retry: 1..300. */
 const QUEUE_WAIT_SECONDS_FIELD = volatileField(z.number()
   .default(30)
@@ -515,21 +515,21 @@ const ROUTING_ORDER_FIELD = volatileField(z.array(z.string()).default([])
 const STICKINESS_ENABLED_FIELD = volatileField(z.boolean()
   .default(true)
   .description('会话粘性总开关：关闭后不再保持同一账号，每次请求都重新选择账号'))
-/** Stickiness rounds: 0 disables. Default 3 — three rounds per account. */
+/** Stickiness rounds: 0 disables. Default 0 — requests and minutes still bound. */
 const STICKINESS_ROUNDS_FIELD = volatileField(z.number()
-  .default(3)
+  .default(0)
   .min(0)
   .max(100)
   .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号（0 = 不限制）'))
-/** Stickiness requests: 0 disables. Default 200. */
+/** Stickiness requests: 0 disables. Default 0 — minutes still bound. */
 const STICKINESS_REQUESTS_FIELD = volatileField(z.number()
-  .default(200)
+  .default(0)
   .min(0)
   .max(10_000)
   .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号（0 = 不限制）'))
-/** Stickiness minutes: 0 disables. Default 180. */
+/** Stickiness minutes: 0 disables. Default 240. */
 const STICKINESS_MINUTES_FIELD = volatileField(z.number()
-  .default(180)
+  .default(240)
   .min(0)
   .max(1440)
   .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号（0 = 不限制）'))
@@ -1429,7 +1429,7 @@ function createVariantRuntime(
       // The master switch collapses the count to zero rather than hiding the
       // two bounds: the transport's budget is the ONE place that decides how
       // long a caller waits, so "off" has to be visible there and nowhere else.
-      attempts: () => (current().queueWaitEnabled === false ? 0 : current().queueWaitAttempts ?? 0),
+      attempts: () => (current().queueWaitEnabled === false ? 0 : current().queueWaitAttempts ?? 5),
       seconds: () => current().queueWaitSeconds ?? 30,
     },
     stickiness: {
@@ -1440,9 +1440,9 @@ function createVariantRuntime(
       // The master switch is read live too: turning it off means no account
       // is ever pinned, and the three bounds stop mattering until it returns.
       enabled: () => current().stickinessEnabled !== false,
-      rounds: () => current().stickinessRounds ?? 3,
-      requests: () => current().stickinessRequests ?? 200,
-      minutes: () => current().stickinessMinutes ?? 180,
+      rounds: () => current().stickinessRounds ?? 0,
+      requests: () => current().stickinessRequests ?? 0,
+      minutes: () => current().stickinessMinutes ?? 240,
     },
     routing: {
       // The user's own order, spanning both variants, with save order as the
@@ -1802,14 +1802,14 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       quotaPollMs: 300_000,
       autoFailoverEnabled: true,
       queueWaitEnabled: true,
-      queueWaitAttempts: 0,
+      queueWaitAttempts: 5,
       queueWaitSeconds: 30,
       routingStrategy: 'save-order',
       routingOrder: [],
       stickinessEnabled: true,
-      stickinessRounds: 3,
-      stickinessRequests: 200,
-      stickinessMinutes: 180,
+      stickinessRounds: 0,
+      stickinessRequests: 0,
+      stickinessMinutes: 240,
     }
   }
   return out

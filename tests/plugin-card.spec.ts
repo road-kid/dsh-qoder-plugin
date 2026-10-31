@@ -1211,12 +1211,12 @@ describe('Qoder plugin card', () => {
   it('shows the three stickiness bounds with the host defaults', async () => {
     const scope = fakeSettingsScope()
     await mountWithSettings(scope)
-    // The host defaults: 3 rounds, 200 requests, 180 minutes. A control that
+    // The host defaults: 0 rounds, 0 requests, 240 minutes. A control that
     // rendered a different default would silently tell the user a number the
     // host is not using.
-    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('3')
-    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('200')
-    expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('180')
+    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('0')
+    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('0')
+    expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('240')
   })
 
   // ---- advanced card: master switches own their sub-menus --------------------

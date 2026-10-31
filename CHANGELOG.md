@@ -2,6 +2,24 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## Unreleased
+
+### Changed — queued requests now wait five times by default
+
+The queue retry count defaults to 5 instead of 0: when Qoder reports a
+saturated model, a request waits out the upstream's advised window
+(`retryAfterSeconds` / `waitTime`, whichever is longer, capped at five minutes)
+and retries, instead of failing at once. The configured 排队等待秒数 stays a
+fallback used only when the upstream advises no window, so the upstream's own
+advice still wins. Users who want the old fail-fast behaviour can set
+排队重试次数 back to 0.
+
+### Changed — stickiness defaults: rounds and requests off, minutes 240
+
+The conversation-stickiness bounds now default to 0 rounds and 0 requests
+(round- and request-based rotation disabled) and 240 minutes. Only the minute
+bound still forces a rotation, so stickiness stays on.
+
 ## 1.1.0 — 2026-10-27
 
 The Global daily check-in no longer requires the Qoder desktop app. The identity

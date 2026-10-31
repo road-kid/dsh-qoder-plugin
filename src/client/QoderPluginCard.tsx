@@ -178,16 +178,16 @@ const POLL_MINUTES_MAX = 1440
  * fields existed — means, so the controls render the behaviour that is actually
  * in force rather than zeroed-out inputs.
  */
-const QUEUE_WAIT_ATTEMPTS_DEFAULT = 0
+const QUEUE_WAIT_ATTEMPTS_DEFAULT = 5
 const QUEUE_WAIT_ATTEMPTS_MAX = 10
 const QUEUE_WAIT_SECONDS_DEFAULT = 30
 const QUEUE_WAIT_SECONDS_MIN = 1
 const QUEUE_WAIT_SECONDS_MAX = 300
-const STICKINESS_ROUNDS_DEFAULT = 3
+const STICKINESS_ROUNDS_DEFAULT = 0
 const STICKINESS_ROUNDS_MAX = 100
-const STICKINESS_REQUESTS_DEFAULT = 200
+const STICKINESS_REQUESTS_DEFAULT = 0
 const STICKINESS_REQUESTS_MAX = 10_000
-const STICKINESS_MINUTES_DEFAULT = 180
+const STICKINESS_MINUTES_DEFAULT = 240
 const STICKINESS_MINUTES_MAX = 1440
 /** The routing strategies the host accepts; 'save-order' is the default. */
 type QoderRoutingStrategy = 'save-order' | 'custom'
