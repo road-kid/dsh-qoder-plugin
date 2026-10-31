@@ -676,6 +676,53 @@ describe('QoderTransport session stickiness', () => {
     expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
   })
 
+  it('does not let a slow pin re-resolution overwrite a newer rotation', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    /*
+     * A continuation re-reads its pinned account through `accountById`, and that
+     * lookup is held open. While it is in flight a new turn rotates the session
+     * to Beta; the stale lookup must then not write Alpha back over Beta.
+     */
+    let releaseLookup: () => void = () => {}
+    const lookupGate = new Promise<void>((resolve) => { releaseLookup = resolve })
+    let held = false
+    poolState.hooks.accountById = async (id) => {
+      const account = [ALPHA, BETA].find(candidate => candidate.id === id)
+      if (account === undefined) return undefined
+      if (account.id === ALPHA.id && !held) {
+        held = true
+        await lookupGate
+      }
+      return account
+    }
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-either'),
+    })
+
+    // The turn opens on Alpha and completes one round, spending its bound.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 1, rounds: 1 }])
+
+    // The next step of that turn re-resolves the pin and is held inside the
+    // lookup, before it can read which account the pin names.
+    const continuation = drainStep(transport, SESSION)
+    await waitFor(() => held, 'the continuation to reach its pin lookup')
+
+    // A new turn arrives while the continuation is held. It opens, finds the
+    // bound spent, and rotates the session to Beta.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+
+    // Releasing the stale lookup must not overwrite the rotation: the
+    // continuation re-reads the pin instead of writing back what it saw first.
+    releaseLookup()
+    await continuation
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+  })
+
   it('evicts the oldest session once the pin table is full', async () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     /*

@@ -240,6 +240,20 @@ interface SessionPin {
 }
 
 /**
+ * Outcome of one attempt to rotate a session pin.
+ *
+ * `stale` means another request changed (or dropped) this session's pin while
+ * this one was choosing the next account. The caller must re-read the pin, not
+ * write back a choice computed from a pin that no longer exists: the account
+ * just picked would otherwise be re-inserted under the counters of the account
+ * the session left.
+ */
+type PinRotation =
+  | { kind: 'moved'; account: QoderPooledAccount }
+  | { kind: 'none' }
+  | { kind: 'stale' }
+
+/**
  * Per-attempt bookkeeping handed from the account walk down into `attempt`.
  *
  * `emitted` says bytes have already left this transport, so a retry would
@@ -1463,32 +1477,47 @@ export class DefaultQoderTransport implements QoderTransport {
   private async pinnedAccount(sessionId: string | undefined, examineBounds: boolean): Promise<QoderPooledAccount | undefined> {
     const policy = this.stickiness
     if (sessionId === undefined || policy === undefined || !this.stickinessEnabled(policy)) return undefined
-    const pin = this.sessionPins.get(sessionId)
-    if (pin === undefined) return undefined
     const resolve = this.failover?.accountById
-    if (resolve !== undefined) {
-      const account = await resolve(pin.id)
-      if (account === undefined) {
-        this.sessionPins.delete(sessionId)
-        return undefined
+    /*
+     * Read the pin, then read it AGAIN after every await and act only on the pin
+     * that is still in the table. Two requests of one session can run at once
+     * (a continuation while the next turn opens), and either can rotate the
+     * session while the other waits in a lookup. Writing back whatever the pin
+     * said when a request started is how a rotated session is dragged back to
+     * the account it just left, carrying that account's counters with it.
+     */
+    for (;;) {
+      const pin = this.sessionPins.get(sessionId)
+      if (pin === undefined) return undefined
+      if (resolve !== undefined) {
+        const account = await resolve(pin.id)
+        if (this.sessionPins.get(sessionId) !== pin) continue
+        if (account === undefined) {
+          this.sessionPins.delete(sessionId)
+          return undefined
+        }
+        pin.pat = account.pat
+        pin.region = account.region
       }
-      pin.pat = account.pat
-      pin.region = account.region
+      if (examineBounds && this.pinExhausted(pin, policy)) {
+        const moved = await this.rotatePin(sessionId, pin)
+        if (moved.kind === 'stale') continue
+        if (moved.kind === 'moved') return moved.account
+        // A pool of one, or a walk that has nobody after this account: the
+        // session cannot move, so restart its counters. Without this the bound
+        // would be re-examined and re-rejected on every request of the session.
+        pin.pinnedAtMs = this.now()
+        pin.rounds = 0
+        pin.requests = 0
+      }
+      // A pin rotated away while this request read it must not be re-inserted:
+      // that would resurrect a stale account AND the counters it made stale.
+      if (this.sessionPins.get(sessionId) !== pin) continue
+      // Re-inserting moves the pin to the young end of the eviction order.
+      this.sessionPins.delete(sessionId)
+      this.sessionPins.set(sessionId, pin)
+      return { id: pin.id, pat: pin.pat, ...pin.region === undefined ? {} : { region: pin.region } }
     }
-    if (examineBounds && this.pinExhausted(pin, policy)) {
-      const moved = await this.rotatePin(sessionId, pin)
-      if (moved !== undefined) return moved
-      // A pool of one, or a walk that has nobody after this account: the
-      // session cannot move, so restart its counters. Without this the bound
-      // would be re-examined and re-rejected on every request of the session.
-      pin.pinnedAtMs = this.now()
-      pin.rounds = 0
-      pin.requests = 0
-    }
-    // Re-inserting moves the pin to the young end of the eviction order.
-    this.sessionPins.delete(sessionId)
-    this.sessionPins.set(sessionId, pin)
-    return { id: pin.id, pat: pin.pat, ...pin.region === undefined ? {} : { region: pin.region } }
   }
 
   /**
@@ -1532,15 +1561,23 @@ export class DefaultQoderTransport implements QoderTransport {
   private async rotatePin(
     sessionId: string,
     pin: SessionPin,
-  ): Promise<QoderPooledAccount | undefined> {
+  ): Promise<PinRotation> {
     const failover = this.failover
-    if (failover === undefined) return undefined
+    if (failover === undefined) return { kind: 'none' }
     const tried = new Set<string>([pin.id])
     const free = await this.nextWalkAccount(failover, pin.id, tried)
+    // The walk awaits the host: the session may already have moved (or been
+    // dropped) by the time it answers. Committing a choice computed from the
+    // old pin would undo that newer decision.
+    if (this.sessionPins.get(sessionId) !== pin) return { kind: 'stale' }
     const next = free ?? await this.nextAccount(failover, pin.id, tried)
-    if (next === undefined || next.id === pin.id) return undefined
+    if (this.sessionPins.get(sessionId) !== pin) return { kind: 'stale' }
+    if (next === undefined || next.id === pin.id) return { kind: 'none' }
     this.pinSession(sessionId, next)
-    return { id: next.id, pat: next.pat, ...next.region === undefined ? {} : { region: next.region } }
+    return {
+      kind: 'moved',
+      account: { id: next.id, pat: next.pat, ...next.region === undefined ? {} : { region: next.region } },
+    }
   }
 
   /**
