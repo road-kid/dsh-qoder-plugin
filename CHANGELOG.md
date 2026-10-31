@@ -37,6 +37,30 @@ even started, because it shares the session id and looked like a turn. It is
 now detected by its framing text (the only marker that survives the plugin's
 own shim) and takes no part in stickiness at all.
 
+### Fixed — audit round: rounds, reroutes, catalog scope, queue waits, UMID
+
+- **A turn is counted when its final answer arrives.** A turn that ended at a
+  tool call, was aborted, or was never continued no longer spends a round of
+  the stickiness bound; a turn answered in several steps spends one, and a
+  `max-tokens` cutoff counts as its final answer.
+- **A rerouted request now moves the conversation with it.** When the first
+  choice is cooling down or busy, the request starts on the account that
+  actually serves it, and the session pin follows, so the rest of the turn and
+  the next bound check belong to the account that did the work.
+- **A slow credential lookup can no longer undo a rotation.** Two overlapping
+  requests could let the older one write its expired pin back over the newer
+  account; the pin is now written only if it is still the one the request read.
+- **Configured queue waits are reported as waits.** A request that waited the
+  configured 排队等待秒数 and was refused again used to be described as
+  "本次未按上游建议等待即返回此结果"; the notice now distinguishes a completed
+  configured wait, a completed upstream-advised wait, and no wait at all.
+- **Catalog and identity caches are scoped to the data root.** Two profiles
+  (host and alternate data root) sharing one account no longer inherit each
+  other's catalog freshness or mistake each other for an account switch.
+- **`umid install` waits for its self-check to exit** before removing the
+  staging directory, so a slow shutdown can no longer leave a half-deleted
+  staging tree behind.
+
 ## 1.1.0 — 2026-10-27
 
 The Global daily check-in no longer requires the Qoder desktop app. The identity
