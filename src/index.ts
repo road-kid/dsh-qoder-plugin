@@ -1167,10 +1167,6 @@ function createVariantRuntime(
    * it has come back within the same outage window.
    */
   let queueNotice: QoderWebUpstreamNotice | undefined
-  // Host-clock evidence belongs to one conversation. The outage counter stays
-  // global, but another session's first refusal must not inherit this session's
-  // elapsed retry window and claim a wait that never happened there.
-  let queueNoticeSessionId: string | undefined
   /** The last automatic account switch, for the card. */
   let failoverAt: number | undefined
   let failoverReason: string | undefined
@@ -1366,36 +1362,32 @@ function createVariantRuntime(
       const previous = queueNotice
       // Reports inside one window are the same outage recurring; a report after
       // the window is a new one, and the risk-control sentence — which is only
-      // honest about a REPEATED answer — must start counting again.
+      // honest about a REPEATED answer — must start counting again. This is the
+      // ONLY thing the elapsed clock between two notices is still allowed to
+      // decide: how often the same answer has come back in this process.
       const sameOutage = previous !== undefined && at - previous.at <= queueNoticeMaxAgeMs
       // A "0 seconds" advice is the upstream saying "retry now", which is no
-      // window at all. Carried as a number it would make `waited` true on a
-      // zero-length gap and print "已按上游建议等待 0 秒仍不可服务" — a claim
+      // window at all. Carried as a number it would make the card announce a
+      // zero-length countdown and print "已按上游建议等待 0 秒仍不可服务" — a claim
       // about waiting that the advice never supported. Treated as absent, the
-      // notice falls back to its no-delay sentence, while the head still quotes
+      // card falls back to its no-delay sentence, while the head still quotes
       // the upstream's own advice verbatim.
       const advisedMs = facts.retryAfterSeconds === undefined || facts.retryAfterSeconds <= 0
         ? undefined
         : facts.retryAfterSeconds * 1000
-      // The transport's own record, when it reported one, is the only hard
-      // evidence that the PLUGIN waited — a configured fallback has no advised
-      // window to compare against, so the clock below used to describe it as
-      // "never waited" while the request had in fact sat for the whole setting.
-      // It says nothing about the host's own retry cycle, though: a turn the
-      // harness retried after a 30s advise window waited far longer than the
-      // transport, which never sat the window out — that is what the elapsed
-      // time below still reports.
-      const transportWaited = waits !== undefined && waits.attempts > 0
-      // Elapsed time is the remaining evidence for the wait sentence: the
-      // harness retries the turn itself, so an answer that arrives at least one
-      // advised window after the previous one can only describe a user who
-      // really waited that long and was refused again. A shorter gap supports no
-      // such claim, and `waited: true` there would print "已按上游建议等待 30 秒
-      // 仍不可服务" to someone whose wait was seconds.
-      const waitedByHostClock = sameOutage && sessionId === queueNoticeSessionId
-        && advisedMs !== undefined && at - previous.at >= advisedMs
-      const waited = transportWaited || waitedByHostClock
-      queueNoticeSessionId = sessionId
+      // The transport's own record is the ONLY evidence that this plugin
+      // waited, and the plan's rule follows from that: a wait is claimed when
+      // the transport reports completed waits, and never otherwise.
+      //
+      // This used to be ORed with a host-clock inference — "the previous notice
+      // for this conversation arrived at least one advised window ago, so the
+      // harness must have retried after the user waited". It is gone because it
+      // is not evidence about THIS request: the gap between two notices says
+      // nothing about what happened inside either one. A turn the user left
+      // idle, a slow tool call, or a request issued minutes after the last
+      // refusal all produce the same gap while the request itself returned
+      // immediately, and the notice then claimed a wait that never happened.
+      const waited = waits !== undefined && waits.attempts > 0
       queueNotice = {
         kind: facts.serviceAvailable === false ? 'unavailable' : 'queued',
         ...facts.upstreamMessage === undefined ? {} : { upstreamMessage: facts.upstreamMessage },

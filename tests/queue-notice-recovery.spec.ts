@@ -327,6 +327,19 @@ function noticeLines(appended: AppendedRow[]): string[] {
   return appended.filter(row => row.type === 'command/done').map(row => String(row.data['text']))
 }
 
+/**
+ * The seconds a notice row states, derived from the record it carries.
+ *
+ * The row must report what the transport MEASURED, so the expectation is
+ * computed from `waits.totalWaitMs` rather than from the advice or the configured
+ * window the wait was built on. The rounding (whole seconds, never below 1) is
+ * the one the notice applies, restated here so a zero-length wait cannot be
+ * expected as "0 秒" — the sentence never claims a wait of zero.
+ */
+function waitedSeconds(totalWaitMs: number): number {
+  return Math.max(1, Math.round(totalWaitMs / 1000))
+}
+
 /** The sentence the conversation row prints for the record the card is showing. */
 function rowSentence(notice: Record<string, unknown>): string {
   // Built from the body the record itself carries, through the plugin's own
@@ -394,20 +407,31 @@ describe('queue notice lifecycle', () => {
     expect(rowSentence(notice!)).toContain('可能代表当前账号已被风控')
   }, 30_000)
 
-  it('claims the advised wait once the elapsed time really covers it', async () => {
+  it('never infers a transport wait from the host clock, however long the gap', async () => {
+    // Both requests wait NOTHING (the explicit fail-fast fixture), so the only
+    // thing that could make the second answer claim a wait is the wall-clock gap
+    // between the two notices — which is exactly the inference this contract
+    // forbids: the host's own retry cycle is not a wait the plugin performed,
+    // and "已按上游建议等待" would tell the user the plugin sat out a window it
+    // never did.
     const session = conversation()
     let answer: ChatAnswer = () => queueChat()
     const ctx = await bootSignedIn({ chat: () => answer() })
-    session.running('agent-notice-waited')
+    session.running('agent-notice-clock')
     await chat(ctx)
     const first = noticeIn(await statusDocument())!
+    // Thirty-one seconds is one past the thirty the queue advises: under the old
+    // clock rule this alone was the evidence.
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime((first.at as number) + 31_000)
     await chat(ctx)
     const notice = noticeIn(await statusDocument())
-    expect(notice).toMatchObject({ waited: true, occurrences: 2 })
+    // The recurrence is still counted — dropping the clock must not cost the
+    // outage lifecycle its streak — but the wait stays unclaimed.
+    expect(notice).toMatchObject({ waited: false, occurrences: 2 })
     const sentence = rowSentence(notice!)
-    expect(sentence).toContain('已按上游建议等待 30 秒仍不可服务')
+    expect(sentence).not.toContain('已按上游建议等待')
+    expect(sentence).toContain('本次未按上游建议等待即返回此结果')
     // The approved sentence is not just reachable in a formatter: it is the line
     // the second answer prints into the conversation.
     expect(noticeLines(session.appended).at(-1)).toBe(sentence)
@@ -448,6 +472,11 @@ describe('queue notice lifecycle', () => {
     expect(waits?.totalWaitMs).toBeGreaterThanOrEqual(1_000)
     const sentence = rowSentence(notice!)
     expect(sentence).toContain('已按配置等待')
+    // The number in the row is the MEASURED total, at the same rounding the
+    // formatter applies: the configured second is what was asked for, the
+    // padding/jitter is what actually elapsed, and the row must report the
+    // latter.
+    expect(sentence).toContain(`已按配置等待 ${waitedSeconds(waits!.totalWaitMs!)} 秒`)
     expect(sentence).not.toContain('本次未按上游建议等待即返回此结果')
     // The row the user sees is that same sentence, not merely a renderable one.
     expect(noticeLines(session.appended).at(-1)).toBe(sentence)
@@ -463,12 +492,17 @@ describe('queue notice lifecycle', () => {
     expect(await chat(ctx)).toBe('')
     const notice = noticeIn(await statusDocument())
     expect(notice).toMatchObject({ waited: true, occurrences: 1 })
-    const waits = notice!.waits as { attempts?: number; lastBasis?: { source?: string; advisedSeconds?: number } } | undefined
+    const waits = notice!.waits as { attempts?: number; totalWaitMs?: number; lastBasis?: { source?: string; advisedSeconds?: number } } | undefined
     expect(waits?.attempts).toBe(1)
     // The advice (1s), not the configured 60s, is what the wait was built on.
     expect(waits?.lastBasis).toMatchObject({ source: 'upstream', advisedSeconds: 1 })
     const sentence = rowSentence(notice!)
-    expect(sentence).toContain('已按上游建议等待 1 秒仍不可服务')
+    // The advice is a RECOMMENDATION, not a measurement: the transport really
+    // slept the advised second plus its anti-stampede padding and jitter, so the
+    // row must state that measured total — quoting the advice as if it were the
+    // wait told the user 1s about a wait of several.
+    expect(sentence).toContain(`已按上游建议等待，实际累计 ${waitedSeconds(waits!.totalWaitMs!)} 秒后仍不可服务`)
+    expect(sentence).not.toContain('已按上游建议等待 1 秒仍不可服务')
     expect(sentence).not.toContain('本次未按上游建议等待即返回此结果')
     expect(noticeLines(session.appended).at(-1)).toBe(sentence)
   }, 30_000)
@@ -499,4 +533,105 @@ describe('queue notice lifecycle', () => {
     vi.setSystemTime(base + 5 * 60 * 1000 + 60_000)
     expect(noticeIn(await statusDocument())).toBeUndefined()
   }, 30_000)
+})
+
+describe('default queue budget, end to end', () => {
+  /**
+   * The default budget is a DURATION, so pinning it needs time to pass — but
+   * not real time. Fake timers make the transport's own `setTimeout` sleeps
+   * instantaneous, so this case waits the genuine default (5 retries of 30 s,
+   * about 2.5 minutes of virtual time) in a few hundred milliseconds of wall
+   * clock, through the same adapter, loopback shim and transport the other
+   * cases use. Nothing here is a hand-mounted re-creation of the budget: the
+   * empty config is exactly what a user who never touched the card has.
+   *
+   * `{ queueWaitAttempts: 0 }` (the fixture default the other cases use) would
+   * make this a test of the fixture instead of of the shipped default, so the
+   * config passed below is deliberately empty and every number asserted comes
+   * from the schema default the transport read.
+   */
+  it('waits the shipped 5 × 30 s budget before reporting, without real time passing', async () => {
+    // Per retry the transport sleeps the configured 30 s PLUS its fixed
+    // anti-stampede padding, plus up to 2 s of jitter (default-transport.ts:
+    // `queueWaitPaddingMs`/`queueWaitJitterMs`). Five waits therefore sum to
+    // 150 s + 5 s + jitter. The bands below are the exact theoretical bounds of
+    // that arithmetic, not a tolerance chosen to make a run pass.
+    const MIN_TOTAL_WAIT_MS = 5 * (30_000 + 1_000)
+    const MAX_TOTAL_WAIT_MS = 5 * (30_000 + 1_000 + 2_000)
+    // The measured virtual time the whole chat should occupy: five waits, plus
+    // the per-attempt account pacing gap (account-limiter.ts: 400 ms + up to
+    // 100 ms jitter), plus slack for the loopback round trips themselves.
+    const VIRTUAL_BUDGET_MS = MAX_TOTAL_WAIT_MS + 6 * 500 + 5_000
+    // Attempts the upstream must serve: the first request plus one per retry.
+    const UPSTREAM_CHATS = 6
+
+    let upstreamChats = 0
+    const session = conversation()
+    const ctx = await bootSignedIn(
+      {
+        chat: () => {
+          upstreamChats += 1
+          return queueChatWithoutAdvice()
+        },
+      },
+      // Deliberately EMPTY: the shipped defaults are under test.
+      {},
+    )
+    session.running('agent-notice-default-budget')
+
+    // Boot is over (it polls on its own intervals), so the transport's sleeps can
+    // be virtualised from here on. Advance in bounded steps: one large jump can
+    // fire the stream's 300-second idle timeout before the mocked upstream's
+    // promise continuations have delivered the next SSE response.
+    vi.useFakeTimers()
+    let settled = false
+    const pending = chat(ctx).finally(() => { settled = true })
+    const advance = async (durationMs: number): Promise<void> => {
+      for (let remaining = durationMs; remaining > 0;) {
+        const step = Math.min(1_000, remaining)
+        await vi.advanceTimersByTimeAsync(step)
+        remaining -= step
+      }
+    }
+    await advance(0)
+    // One wait short of the whole budget: a request that gives up early would
+    // already have settled here.
+    await advance(MIN_TOTAL_WAIT_MS - 2_000)
+    expect(settled).toBe(false)
+    // Now the rest of the virtual budget, which covers all five waits.
+    await advance(VIRTUAL_BUDGET_MS)
+    const text = await pending
+    // The chat never streamed: every answer was the queue, so the final one is
+    // an error finish.
+    expect(text).toBe('')
+
+    expect(upstreamChats).toBe(UPSTREAM_CHATS)
+
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ kind: 'queued', waited: true, occurrences: 1 })
+    const waits = notice!.waits as {
+      attempts?: number
+      totalWaitMs?: number
+      lastBasis?: { source?: string; advisedSeconds?: number; configuredSeconds?: number }
+    } | undefined
+    // Every retry in the shipped budget was spent, on the configured fallback:
+    // the queue advises no window at all, so 排队等待秒数 is what held each one.
+    expect(waits?.attempts).toBe(5)
+    expect(waits?.lastBasis?.source).toBe('configured')
+    expect(waits?.lastBasis?.configuredSeconds).toBe(30)
+    // The advice was absent, so nothing may be quoted as one.
+    expect(waits?.lastBasis?.advisedSeconds).toBeUndefined()
+    expect(waits!.totalWaitMs).toBeGreaterThanOrEqual(MIN_TOTAL_WAIT_MS)
+    expect(waits!.totalWaitMs).toBeLessThanOrEqual(MAX_TOTAL_WAIT_MS)
+
+    // The row states the measured total, and the sentence is the one the
+    // conversation really received.
+    const sentence = rowSentence(notice!)
+    expect(sentence).toContain(`已按配置等待 ${waitedSeconds(waits!.totalWaitMs!)} 秒，重试后仍不可服务`)
+    // The configured wait is the ONLY claim available: no advice was quoted, and
+    // the request did not return without waiting.
+    expect(sentence).not.toContain('已按上游建议等待')
+    expect(sentence).not.toContain('本次未按上游建议等待即返回此结果')
+    expect(noticeLines(session.appended).at(-1)).toBe(sentence)
+  }, 60_000)
 })

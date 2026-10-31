@@ -105,12 +105,18 @@ export function parseQueueFacts(body: string): QoderQueueFacts | undefined {
 /**
  * Render the user-facing notice for one queue answer.
  *
- * `waited` and `occurrences` are facts, not decoration: the sentence claiming a
- * wait appears only when the plugin really waited out the upstream's window,
- * and the risk-control possibility is mentioned only when the same answer has
- * recurred (a single saturated queue is an ordinary busy minute, while the
- * same answer coming back repeatedly is what suggests the account is being
- * throttled upstream).
+ * `waited` and `occurrences` are facts, not decoration: a sentence that says a
+ * wait is behind the refusal appears only when one is on record, and the
+ * risk-control possibility is mentioned only when the same answer has recurred
+ * (a single saturated queue is an ordinary busy minute, while the same answer
+ * coming back repeatedly is what suggests the account is being throttled
+ * upstream).
+ *
+ * The duration in that sentence comes from `waits` alone — the transport's
+ * measurement of what it really slept through. `waited` is the coarse flag that
+ * can still say "a wait happened" without a measurement, and `facts.retryAfterSeconds`
+ * is the upstream's ADVICE, which is never evidence of how long anything waited:
+ * it is rendered in the head, beside "上游建议", and nowhere else.
  */
 export function formatQueueNotice(
   facts: QoderQueueFacts,
@@ -127,7 +133,7 @@ export function formatQueueNotice(
   const head = seconds === undefined
     ? `上游模型排队中（${state}，上游未给出建议重试时间）`
     : `上游模型排队中（${state}，上游建议 ${seconds} 秒后重试）`
-  const wait = waitedSentence(seconds, options)
+  const wait = waitedSentence(options)
   const risk = options.occurrences > 1
     ? '，如果频繁返回此结果可能代表当前账号已被风控'
     : ''
@@ -143,33 +149,49 @@ export function formatQueueNotice(
 /**
  * The sentence claiming what waiting happened, from what was really observed.
  *
+ * The ONLY measurable fact is the transport's own record of completed waits, so
+ * both branches that name a duration read `totalWaitMs` — one clock, one
+ * rounding rule, and the same number the card renders from the status document.
+ * The upstream's advice is deliberately not one of those numbers: it says how
+ * long ONE window is, not how long the request sat, and after two waits on a
+ * 30-second advice the request sat 62 seconds. Quoting the advice there
+ * understated the wait by half while the card said 62.
+ *
  * Three states, and the difference matters because each sentence is a claim:
  *
  * - the transport completed at least one wait on the CONFIGURED fallback: the
  *   upstream advised nothing, so no advice may be quoted — say plainly how long
  *   the configured window held the request;
- * - the transport completed at least one wait on the upstream's ADVICE: quote
- *   the advice, which is the window the wait was built on;
- * - the transport waited nothing: keep the old contract, including the case
- *   where the host's own retry cycle (not the plugin) is what sat out the
- *   advised window — {@link formatQueueNotice}'s `waited` flag stays the only
- *   evidence for that, and a request that never waited must not borrow it from
- *   a clock reading.
+ * - the transport completed at least one wait on the upstream's ADVICE: name
+ *   the measured total, with no verdict about the advice's length;
+ * - the transport waited nothing: keep the old contract. `waited` may still
+ *   claim in general terms that a wait happened (an input from a caller that
+ *   kept the coarse flag), but with no summary there is no measurement, so the
+ *   sentence stays general and never borrows `retryAfterSeconds` to invent one.
  */
 function waitedSentence(
-  seconds: number | undefined,
   options: { waited?: boolean; occurrences: number; waits?: QoderQueueWaitSummary },
 ): string {
   const waits = options.waits
   const completed = waits !== undefined && waits.attempts > 0 ? waits : undefined
-  if (completed !== undefined && completed.lastBasis?.source === 'configured') {
-    const waitedSeconds = Math.max(1, Math.round(completed.totalWaitMs / 1000))
-    return `已按配置等待 ${waitedSeconds} 秒，重试后仍不可服务`
+  if (completed !== undefined) {
+    // `totalWaitMs` is a wire value, not a promise: a hand-built or older
+    // summary may omit it or carry a non-finite number, and neither may turn
+    // into "实际累计 NaN 秒".
+    const measured = Number.isFinite(completed.totalWaitMs) && completed.totalWaitMs > 0
+      ? Math.max(1, Math.round(completed.totalWaitMs / 1000))
+      : undefined
+    if (completed.lastBasis?.source === 'configured') {
+      return measured === undefined
+        ? '已按配置等待，重试后仍不可服务'
+        : `已按配置等待 ${measured} 秒，重试后仍不可服务`
+    }
+    return measured === undefined
+      ? '已按上游建议等待后仍不可服务'
+      : `已按上游建议等待，实际累计 ${measured} 秒后仍不可服务`
   }
-  const waitedBefore = completed !== undefined || options.waited === true
-  if (!waitedBefore) return '本次未按上游建议等待即返回此结果'
-  const advised = completed?.lastBasis?.advisedSeconds ?? seconds
-  return advised === undefined ? '已按上游建议等待后仍不可服务' : `已按上游建议等待 ${advised} 秒仍不可服务`
+  if (options.waited !== true) return '本次未按上游建议等待即返回此结果'
+  return '已按上游建议等待后仍不可服务'
 }
 
 /**
@@ -180,6 +202,12 @@ function waitedSentence(
  * whichever is larger), or — only when it advised nothing — the 排队等待秒数 the
  * user configured. Without this, a row reading "等待约 86 秒" beside a setting of
  * 30 looks like the setting was ignored, when the queue actually named 86.
+ *
+ * This is a description of the DECISION, not a measurement: `advisedSeconds` is
+ * the value the last wait was built on, and a request that completed several
+ * waits has several bases — only the last one is here. How long the request
+ * actually sat is `QoderQueueWaitSummary.totalWaitMs`, and a notice must take
+ * its duration from there.
  */
 export interface QoderQueueWaitBasis {
   /** `'upstream'` when the queue's own advice won, else the configured fallback. */
@@ -198,8 +226,15 @@ export interface QoderQueueWaitBasis {
  * clock (the previous wire) both over-claimed a wait nobody performed and
  * missed the configured fallback — the transport waited the configured window,
  * then reported "本次未按上游建议等待即返回此结果", telling the user the opposite
- * of what happened. `attempts` counts COMPLETED waits only: a wait the caller
- * aborted did not happen and must not be described.
+ * of what happened. The same clock-guessing has now been removed from the host
+ * too, so this summary is the only source of a wait's LENGTH: a notice that has
+ * none of it says a wait happened in general terms and names no seconds.
+ *
+ * `attempts` counts COMPLETED waits only: a wait the caller aborted did not
+ * happen and must not be described. `totalWaitMs` is cumulative — the number
+ * every renderer (conversation row and status card) must use for "how long the
+ * request sat" — while `lastBasis.advisedSeconds` only says which window the
+ * LAST wait was built on and is NOT a substitute for it.
  */
 export interface QoderQueueWaitSummary {
   /** Waits this request completed before giving up, 0 when it never waited. */

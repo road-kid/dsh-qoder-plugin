@@ -224,18 +224,19 @@ test('formatQueueNotice states the parsed facts and never hardcodes them', () =>
   const facts = parseQueueFacts(nestedBody('403'))
   assert.ok(facts !== undefined)
   const text = formatQueueNotice(facts, { waited: true, occurrences: 1 })
+  // The head quotes the upstream's ADVICE; the wait clause claims no seconds,
+  // because this input carries no measurement — the advice is not one.
   assert.equal(
     text,
     '上游模型排队中（模型暂不可服务，上游建议 30 秒后重试）：这不是登录态或额度问题，'
-      + '已按上游建议等待 30 秒仍不可服务（上游原文：{"isQueued":true,"modelKey":"qfmodel",'
+      + '已按上游建议等待后仍不可服务（上游原文：{"isQueued":true,"modelKey":"qfmodel",'
       + '"queueCount":8887,"queueType":"p3","retryAfterSeconds":30,"serviceAvailable":false}）',
   )
 
-  // The numbers come from the facts: a different upstream delay must move both
-  // the suggestion and the claim.
+  // The numbers come from the facts: a different upstream delay must move the
+  // suggestion.
   const other = formatQueueNotice({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 45 }, { waited: true, occurrences: 1 })
   assert.match(other, /上游建议 45 秒后重试/u)
-  assert.match(other, /已按上游建议等待 45 秒仍不可服务/u)
   assert.doesNotMatch(other, /30 秒/u)
   assert.doesNotMatch(other, /上游原文/u)
 })
@@ -245,7 +246,10 @@ test('formatQueueNotice claims a wait only when one happened', () => {
   assert.ok(facts !== undefined)
 
   const waited = formatQueueNotice(facts, { waited: true, occurrences: 1 })
-  assert.match(waited, /已按上游建议等待 30 秒仍不可服务/u)
+  assert.match(waited, /已按上游建议等待后仍不可服务/u)
+  // No measurement came with the flag, so no duration may be claimed for it.
+  assert.doesNotMatch(waited, /已按上游建议等待 \d+ 秒/u)
+  assert.doesNotMatch(waited, /实际累计/u)
 
   // The defect this guards: a notice that announced a 30-second wait on a
   // request that returned immediately, so the user waited for nothing.
@@ -282,8 +286,82 @@ test('formatQueueNotice quotes the real advisory seconds of a completed upstream
     occurrences: 1,
     waits: { attempts: 1, totalWaitMs: 31_000, lastBasis: { source: 'upstream', advisedSeconds: 30, configuredSeconds: 5 } },
   })
-  assert.match(text, /已按上游建议等待 30 秒仍不可服务/u)
+  assert.match(text, /已按上游建议等待，实际累计 31 秒后仍不可服务/u)
   assert.doesNotMatch(text, /本次未按上游建议等待即返回此结果/u)
+})
+
+test('formatQueueNotice reports the MEASURED total, not the last advice, after two upstream waits', () => {
+  // The bug this closes: the transport slept two advise windows (30s + 30s,
+  // plus padding/jitter), and the row quoted the LAST `advisedSeconds` as if it
+  // were the total — understating the wait by half while the card, which reads
+  // `totalWaitMs`, said 62. The advice and the measurement are different facts:
+  // the advice says how long one window is, the measurement says how long the
+  // request actually sat.
+  const facts = { isQueued: true, serviceAvailable: true, retryAfterSeconds: 30 }
+  const text = formatQueueNotice(facts, {
+    waited: true,
+    occurrences: 1,
+    waits: {
+      attempts: 2,
+      totalWaitMs: 62_000,
+      lastBasis: { source: 'upstream', advisedSeconds: 30, configuredSeconds: 30 },
+    },
+  })
+  assert.match(text, /已按上游建议等待，实际累计 62 秒后仍不可服务/u)
+  // The advice is NOT promoted into a claim of how long was waited.
+  assert.doesNotMatch(text, /已按上游建议等待 30 秒/u)
+
+  // Same measured wording once the advice and the configured fallback differ:
+  // the source of the LAST wait decides which sentence, never which number.
+  const mixed = formatQueueNotice(facts, {
+    waited: true,
+    occurrences: 1,
+    waits: { attempts: 3, totalWaitMs: 95_500, lastBasis: { source: 'upstream', advisedSeconds: 45, configuredSeconds: 30 } },
+  })
+  assert.match(mixed, /已按上游建议等待，实际累计 96 秒后仍不可服务/u)
+})
+
+test('formatQueueNotice never invents measured seconds for a wait it cannot measure', () => {
+  // A hand-built (or older-transport) summary can say a wait happened without
+  // carrying a measurement. The claim stays generalized: the suggestion in the
+  // head is NOT evidence of how long the request sat, so it must not be quoted
+  // as one.
+  const facts = { isQueued: true, serviceAvailable: true, retryAfterSeconds: 30 }
+  const text = formatQueueNotice(facts, {
+    waited: true,
+    occurrences: 1,
+    waits: { attempts: 2 } as unknown as { attempts: number; totalWaitMs: number },
+  })
+  assert.match(text, /已按上游建议等待后仍不可服务/u)
+  assert.match(text, /上游建议 30 秒后重试/u)
+  assert.doesNotMatch(text, /已按上游建议等待 30 秒/u)
+  assert.doesNotMatch(text, /实际累计/u)
+
+  // And the same for a summary whose measurement is not a finite number.
+  const broken = formatQueueNotice(facts, {
+    waited: true,
+    occurrences: 1,
+    waits: { attempts: 1, totalWaitMs: Number.NaN },
+  })
+  assert.match(broken, /已按上游建议等待后仍不可服务/u)
+  assert.doesNotMatch(broken, /实际累计/u)
+})
+
+test('formatQueueNotice never borrows the advice for measured seconds on a host-clock claim', () => {
+  // The wire this closes: `waited: true` used to be inferable from the host's
+  // own retry cycle (the elapsed gap between two notices). The host no longer
+  // infers that, but the formatter must hold the same line on its own: with no
+  // wait summary there is no measurement, so the sentence may not name one.
+  const facts = { isQueued: true, serviceAvailable: false, retryAfterSeconds: 45 }
+  const text = formatQueueNotice(facts, { waited: true, occurrences: 2 })
+  assert.match(text, /已按上游建议等待后仍不可服务/u)
+  assert.doesNotMatch(text, /\d+ 秒仍不可服务/u)
+  // An explicit zero-attempt summary is "no completed wait", so the general
+  // claim stands (`waited: true`) but no seconds are named — the existing
+  // `attempts: 0` contract, unchanged here.
+  const zero = formatQueueNotice(facts, { waited: true, occurrences: 1, waits: { attempts: 0, totalWaitMs: 0 } })
+  assert.match(zero, /已按上游建议等待后仍不可服务/u)
+  assert.doesNotMatch(zero, /\d+ 秒仍不可服务/u)
 })
 
 test('formatQueueNotice treats a reported zero-wait request as never having waited', () => {
