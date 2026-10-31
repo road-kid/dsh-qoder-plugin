@@ -185,7 +185,21 @@ export async function* streamQoderChat(
       })
       throw error
     }
-    const failure = new QoderLlmError('Qoder transport request failed.', 'TRANSPORT', { cause: error })
+    /*
+     * The wording is part of a contract with the host, not decoration: the
+     * harness classifies a provider failure by matching text in its MESSAGE,
+     * and retries only the codes in the provider's retryable set. A phrase it
+     * cannot classify becomes PI_AI_ERROR, which is outside that set — so the
+     * first dropped response ended the turn instead of being retried. The lead
+     * phrase therefore carries "connection", the token that classifier maps to
+     * TRANSPORT.
+     *
+     * The cause chain stays on `cause` (and in the redacted log line below)
+     * instead of inside the message: appended upstream text may contain a
+     * status digit, and the classifier's ORDERED arms would read that as a
+     * non-retryable code before ever reaching the token above.
+     */
+    const failure = new QoderLlmError('Qoder connection failed while streaming the response.', 'TRANSPORT', { cause: error })
     dependencies.logger?.error?.('[Qoder Stream] Request failed', redactLogValue(failure), {
       chunkCount,
       elapsedMs,
