@@ -45,6 +45,44 @@ declare function qoderPluginDataDir(): string;
 /** Qoder upstream deployment selected for one immutable transport instance. */
 type QoderRegion = 'global' | 'china';
 //#endregion
+//#region src/qoder/queue-notice.d.ts
+/**
+ * Which value drove the wait, as the transport computed it.
+ *
+ * The length of a queue wait comes from one of two places, and the row must say
+ * which: the upstream's own retry window (its `retryAfterSeconds` / `waitTime`,
+ * whichever is larger), or — only when it advised nothing — the 排队等待秒数 the
+ * user configured. Without this, a row reading "等待约 86 秒" beside a setting of
+ * 30 looks like the setting was ignored, when the queue actually named 86.
+ */
+interface QoderQueueWaitBasis {
+  /** `'upstream'` when the queue's own advice won, else the configured fallback. */
+  source: 'upstream' | 'configured';
+  /** The advice's length in whole seconds; absent when `'configured'`. */
+  advisedSeconds?: number;
+  /** The configured fallback in force, in whole seconds. */
+  configuredSeconds: number;
+}
+/**
+ * The waits one request actually completed before its final queue answer.
+ *
+ * Built by the transport from the waits it really slept through, and carried to
+ * the notice because the notice's sentence claims a wait: guessing it from the
+ * clock (the previous wire) both over-claimed a wait nobody performed and
+ * missed the configured fallback — the transport waited the configured window,
+ * then reported "本次未按上游建议等待即返回此结果", telling the user the opposite
+ * of what happened. `attempts` counts COMPLETED waits only: a wait the caller
+ * aborted did not happen and must not be described.
+ */
+interface QoderQueueWaitSummary {
+  /** Waits this request completed before giving up, 0 when it never waited. */
+  attempts: number;
+  /** Sum of those waits, milliseconds, empty when `attempts` is 0. */
+  totalWaitMs: number;
+  /** What drove the LAST completed wait; absent when no wait completed. */
+  lastBasis?: QoderQueueWaitBasis;
+}
+//#endregion
 //#region src/status-paths.d.ts
 /** The two Qoder product variants this plugin serves, by provider id. */
 type QoderVariantId = 'qoder' | 'qoder-global';
@@ -425,6 +463,17 @@ interface QoderWebUpstreamNotice {
   at: number;
   /** How many times this same notice has recurred in this process. */
   occurrences: number;
+  /**
+   * The waits the failed request itself completed, when the transport reported
+   * them.
+   *
+   * `waited` above stays the coarse card flag; this is the evidence behind it.
+   * A configured-fallback wait has no advised seconds to quote, so the row needs
+   * the measured total to say how long the request really sat — and the card
+   * needs to distinguish "waited the upstream's window" from "waited the
+   * configured fallback". Absent for a request that never waited.
+   */
+  waits?: QoderQueueWaitSummary;
 }
 /**
  * State of the official native device-identity component.
