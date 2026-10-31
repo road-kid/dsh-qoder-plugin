@@ -1470,8 +1470,12 @@ function createVariantRuntime(
     stickiness: {
       // How long one account serves a conversation before the session moves to
       // the next account. All three are bounds: whichever is reached first
-      // moves the conversation on, so a single big turn cannot pin a session to
-      // one account for longer than the round or request bound allows.
+      // moves the conversation on — but they are only EXAMINED when a new turn
+      // opens, never between the steps of the turn already running. A single
+      // big turn therefore serves entirely on one account and may cross the
+      // round or request bound, which then takes effect at the turn after it:
+      // switching mid-turn would lose that turn's context (and its tool
+      // results) to an account that never saw the prompt.
       // The master switch is read live too: turning it off means no account
       // is ever pinned, and the three bounds stop mattering until it returns.
       enabled: () => current().stickinessEnabled !== false,

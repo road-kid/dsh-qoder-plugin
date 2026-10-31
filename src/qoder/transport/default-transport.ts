@@ -257,11 +257,13 @@ type PinRotation =
  * Per-attempt bookkeeping handed from the account walk down into `attempt`.
  *
  * `emitted` says bytes have already left this transport, so a retry would
- * duplicate rather than recover. `onServed` is the answer to the other question
+ * duplicate rather than recover. `onFinish` is the answer to the other question
  * a walk asks: did this account finish a response? It has to be a callback
  * rather than a flag the walk checks afterwards, because the HTTP layer closes
  * the body stream at the terminal chunk instead of resuming the generator — see
  * `attempt` — so the walk's own code after `yield*` never runs in production.
+ * The chunk is passed through because only the finish REASON distinguishes a
+ * turn's final answer from a step that still owes a tool call.
  */
 interface AttemptState {
   /**
@@ -1766,20 +1768,18 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
-   * How many queue waits ONE REQUEST may spend.
+   * A fresh wait budget for ONE REQUEST, with nothing yet recorded against it.
    *
    * The budget belongs to the request, not to an attempt: a request that walks
    * from one account to the next is still one caller waiting, and refreshing
    * the budget on every switch would let an N-account pool hold that caller for
    * N times the configured number of waits (the reference implementation hit
-   * exactly that and saw a single request take 197s). It is computed once in
-   * `generateWithAccounts` and shared by every attempt of the walk.
-   */
-  /**
-   * A fresh budget for one request, with nothing yet recorded against it.
+   * exactly that and saw a single request take 197s). It is minted once in
+   * `generate` and threaded through the whole walk.
    *
-   * Both halves start empty: `attempts` counts waits that actually completed,
-   * so it must not begin at the budget's size.
+   * `attempts`/`totalWaitMs` start empty because they record what actually
+   * happened: a wait the caller aborted mid-sleep must not be reported as one
+   * the transport completed.
    */
   private newQueueWaitLedger(): QueueWaitLedger {
     const total = this.queueWaitBudget()
