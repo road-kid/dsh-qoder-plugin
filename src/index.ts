@@ -1354,7 +1354,7 @@ function createVariantRuntime(
         emitUpstreamNotice(failoverNoticeText(info.reason), info.sessionId)
       },
     },
-    onUpstreamQueue: (facts, accountId, sessionId) => {
+    onUpstreamQueue: (facts, accountId, sessionId, waits) => {
       const at = Date.now()
       // Health is per account and outlives one notice: recorded before the
       // document-wide notice, which is replaced on every answer.
@@ -1373,16 +1373,23 @@ function createVariantRuntime(
       const advisedMs = facts.retryAfterSeconds === undefined || facts.retryAfterSeconds <= 0
         ? undefined
         : facts.retryAfterSeconds * 1000
-      // Elapsed time is the only evidence this seam can have for the wait
-      // sentence: the transport refuses to sit the upstream's window out (that
-      // would hold the stream open) and the harness retries the turn itself, so
-      // what is left is the clock, and an accepted chat clears the record —
-      // meaning an answer that arrives at least one advised window after the
-      // previous one can only describe a user who really waited that long and
-      // was refused again. A shorter gap supports no such claim, and `waited:
-      // true` there would print "已按上游建议等待 30 秒仍不可服务" to someone
-      // whose wait was seconds.
-      const waited = sameOutage && advisedMs !== undefined && at - previous.at >= advisedMs
+      // The transport's own record, when it reported one, is the only hard
+      // evidence that the PLUGIN waited — a configured fallback has no advised
+      // window to compare against, so the clock below used to describe it as
+      // "never waited" while the request had in fact sat for the whole setting.
+      // It says nothing about the host's own retry cycle, though: a turn the
+      // harness retried after a 30s advise window waited far longer than the
+      // transport, which never sat the window out — that is what the elapsed
+      // time below still reports.
+      const transportWaited = waits !== undefined && waits.attempts > 0
+      // Elapsed time is the remaining evidence for the wait sentence: the
+      // harness retries the turn itself, so an answer that arrives at least one
+      // advised window after the previous one can only describe a user who
+      // really waited that long and was refused again. A shorter gap supports no
+      // such claim, and `waited: true` there would print "已按上游建议等待 30 秒
+      // 仍不可服务" to someone whose wait was seconds.
+      const waitedByHostClock = sameOutage && advisedMs !== undefined && at - previous.at >= advisedMs
+      const waited = transportWaited || waitedByHostClock
       queueNotice = {
         kind: facts.serviceAvailable === false ? 'unavailable' : 'queued',
         ...facts.upstreamMessage === undefined ? {} : { upstreamMessage: facts.upstreamMessage },
@@ -1390,11 +1397,16 @@ function createVariantRuntime(
         waited,
         at,
         occurrences: sameOutage ? previous.occurrences + 1 : 1,
+        ...waits === undefined ? {} : { waits },
       }
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
       )
-      emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }), sessionId)
+      emitUpstreamNotice(formatQueueNotice(facts, {
+        waited,
+        occurrences: queueNotice.occurrences,
+        ...waits === undefined ? {} : { waits },
+      }), sessionId)
     },
     onQueueWait: (facts, accountId, wait, sessionId) => {
       // Progress, not the explanation: this row is printed when the wait

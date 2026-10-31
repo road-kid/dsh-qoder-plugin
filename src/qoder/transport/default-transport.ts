@@ -22,7 +22,7 @@ import { QoderUsageReader } from './account-reader.ts'
 import { QoderCheckInService, type QoderCheckInResult } from './checkin.ts'
 import type { QoderAccountInfo } from '../account.ts'
 import type { QoderPooledAccount, QoderTransport, QoderTransportOptions } from './index.ts'
-import type { QoderQueueWaitBasis } from '../queue-notice.ts'
+import type { QoderQueueWaitBasis, QoderQueueWaitSummary } from '../queue-notice.ts'
 import { streamQoderChat } from './chat.ts'
 import type { CosyCredentials } from './wire/cosy.ts'
 import type { QoderWireMessage } from './wire/wire-types.ts'
@@ -291,6 +291,37 @@ interface AttemptState {
  */
 interface AttemptAttribution {
   accountId: string | undefined
+}
+
+/**
+ * One request's queue-wait budget AND its record of waits really completed.
+ *
+ * The budget half decides whether another wait may still happen; the record half
+ * is what the final notice quotes. They live in the same per-request object on
+ * purpose: a transport-wide "last wait" would let one request's wait be reported
+ * beside another request's failure, and a wait that was aborted mid-sleep is not
+ * a completed wait, so only `waitOutQueue` returning normally may add to it.
+ */
+interface QueueWaitLedger {
+  /** Waits still allowed for this request. */
+  waitsLeft: number
+  /** The budget this request started with. */
+  total: number
+  /** Waits this request actually completed. */
+  attempts: number
+  /** Sum of the completed waits, milliseconds. */
+  totalWaitMs: number
+  /** What drove the last completed wait. */
+  lastBasis: QoderQueueWaitBasis | undefined
+}
+
+/** The summary the host renders from: the ledger's completed-wait half. */
+function queueWaitSummary(ledger: QueueWaitLedger): QoderQueueWaitSummary {
+  return {
+    attempts: ledger.attempts,
+    totalWaitMs: ledger.totalWaitMs,
+    ...(ledger.lastBasis === undefined ? {} : { lastBasis: ledger.lastBasis }),
+  }
 }
 
 function aborted(message: string): QoderLlmError {
@@ -804,8 +835,14 @@ export class DefaultQoderTransport implements QoderTransport {
     // with, and the handlers below read it AFTER the walk has finished, so the
     // id they report is the one that actually produced the outcome.
     const attribution: AttemptAttribution = { accountId: undefined }
+    /*
+     * One wait budget per request, shared by every attempt of the walk below,
+     * and the record of waits it really completed. Created here — outside the
+     * walk — because the final-failure notice below is what quotes the record.
+     */
+    const queueBudget = this.newQueueWaitLedger()
     try {
-      yield* this.generateWithAccounts(options, model, attribution)
+      yield* this.generateWithAccounts(options, model, attribution, queueBudget)
     } catch (error: unknown) {
       /*
        * The final failure of a request is where the queue explanation belongs.
@@ -822,7 +859,10 @@ export class DefaultQoderTransport implements QoderTransport {
        */
       const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
       if (facts !== undefined && options.signal?.aborted !== true) {
-        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options))
+        // The real wait record beside the real failure: the notice's wait
+        // sentence is a claim about THIS request, so it quotes the waits this
+        // request completed rather than the clock between two reports.
+        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options), queueWaitSummary(queueBudget))
       }
       throw error
     }
@@ -846,16 +886,8 @@ export class DefaultQoderTransport implements QoderTransport {
     options: GenerateOptions,
     model: QoderCatalogModel | undefined,
     attribution: AttemptAttribution,
+    queueBudget: QueueWaitLedger,
   ): AsyncGenerator<StreamChunk> {
-    /*
-     * One wait budget per request, shared by every attempt of the walk below.
-     *
-     * A queue wait is the caller choosing to wait for a busy model, so switching
-     * accounts must not hand the same caller a second full budget — see
-     * `queueWaitBudget`.
-     */
-    const totalWaits = this.queueWaitBudget()
-    const queueBudget = { waitsLeft: totalWaits, total: totalWaits }
     const failover = this.failover
     if (failover === undefined || !failover.enabled()) {
       // No pool to walk, or the user turned switching off: resolve the ambient
@@ -1110,7 +1142,7 @@ export class DefaultQoderTransport implements QoderTransport {
     account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: AttemptState = { emitted: false },
     accountId?: string,
-    queueBudget: { waitsLeft: number; total: number } = { waitsLeft: 0, total: 0 },
+    queueBudget: QueueWaitLedger = this.newQueueWaitLedger(),
   ): AsyncGenerator<StreamChunk> {
     /*
      * Hold one account's traffic slot for the whole attempt.
@@ -1189,7 +1221,7 @@ export class DefaultQoderTransport implements QoderTransport {
     account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: { emitted: boolean },
     accountId: string | undefined,
-    queueBudget: { waitsLeft: number; total: number },
+    queueBudget: QueueWaitLedger,
   ): AsyncGenerator<StreamChunk> {
     /*
      * Everything below signs against the ACCOUNT's region, not the variant's.
@@ -1278,6 +1310,12 @@ export class DefaultQoderTransport implements QoderTransport {
               }, pendingId)
             }
             await this.waitOutQueue(waitMs, options.signal)
+            // Only a wait that COMPLETED may be claimed: a thrown abort above
+            // leaves the record untouched, so the final notice cannot describe a
+            // sleep the caller cancelled.
+            queueBudget.attempts += 1
+            queueBudget.totalWaitMs += waitMs
+            queueBudget.lastBasis = plan.basis
             continue
           }
         }
@@ -1737,6 +1775,17 @@ export class DefaultQoderTransport implements QoderTransport {
    * exactly that and saw a single request take 197s). It is computed once in
    * `generateWithAccounts` and shared by every attempt of the walk.
    */
+  /**
+   * A fresh budget for one request, with nothing yet recorded against it.
+   *
+   * Both halves start empty: `attempts` counts waits that actually completed,
+   * so it must not begin at the budget's size.
+   */
+  private newQueueWaitLedger(): QueueWaitLedger {
+    const total = this.queueWaitBudget()
+    return { waitsLeft: total, total, attempts: 0, totalWaitMs: 0, lastBasis: undefined }
+  }
+
   private queueWaitBudget(): number {
     const policy = this.queueWait
     if (policy === undefined) return 0

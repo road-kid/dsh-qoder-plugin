@@ -256,6 +256,45 @@ test('formatQueueNotice claims a wait only when one happened', () => {
   assert.match(immediate, /上游建议 30 秒后重试/u)
 })
 
+test('formatQueueNotice reports a completed configured wait in its own words', () => {
+  // The upstream advised nothing, so the configured fallback drove the wait and
+  // there is no advice seconds to quote: the row must say what was configured
+  // and how long it actually held the request (rounded from the measured total).
+  const facts = parseQueueFacts('{"isQueued":true,"modelKey":"qfmodel","serviceAvailable":true}')
+  assert.ok(facts !== undefined)
+  const text = formatQueueNotice(facts, {
+    waited: false,
+    occurrences: 1,
+    waits: { attempts: 1, totalWaitMs: 2_400, lastBasis: { source: 'configured', configuredSeconds: 1 } },
+  })
+  assert.match(text, /已按配置等待 2 秒，重试后仍不可服务/u)
+  assert.doesNotMatch(text, /本次未按上游建议等待即返回此结果/u)
+  assert.doesNotMatch(text, /已按上游建议等待/u)
+  // No advice was given, so the head must not invent one either.
+  assert.match(text, /上游未给出建议重试时间/u)
+})
+
+test('formatQueueNotice quotes the real advisory seconds of a completed upstream wait', () => {
+  const facts = parseQueueFacts(nestedBody('403'))
+  assert.ok(facts !== undefined)
+  const text = formatQueueNotice(facts, {
+    waited: false,
+    occurrences: 1,
+    waits: { attempts: 1, totalWaitMs: 31_000, lastBasis: { source: 'upstream', advisedSeconds: 30, configuredSeconds: 5 } },
+  })
+  assert.match(text, /已按上游建议等待 30 秒仍不可服务/u)
+  assert.doesNotMatch(text, /本次未按上游建议等待即返回此结果/u)
+})
+
+test('formatQueueNotice treats a reported zero-wait request as never having waited', () => {
+  const facts = parseQueueFacts(nestedBody('403'))
+  assert.ok(facts !== undefined)
+  // `attempts: 0` is the transport saying it never slept — not a wait of 0
+  // seconds, which the sentence would otherwise have to claim.
+  const text = formatQueueNotice(facts, { waited: false, occurrences: 1, waits: { attempts: 0, totalWaitMs: 0 } })
+  assert.match(text, /本次未按上游建议等待即返回此结果/u)
+})
+
 test('formatQueueNotice mentions risk control only when the answer recurs', () => {
   const facts = parseQueueFacts(nestedBody('403'))
   assert.ok(facts !== undefined)

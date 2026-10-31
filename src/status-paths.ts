@@ -1,5 +1,6 @@
 /** Node-free constants and types shared by the Host and browser halves. */
 
+import type { QoderQueueWaitSummary } from './qoder/queue-notice.ts'
 import type { QoderRegion } from './qoder/region.ts'
 
 /** The two Qoder product variants this plugin serves, by provider id. */
@@ -434,6 +435,17 @@ export interface QoderWebUpstreamNotice {
   at: number
   /** How many times this same notice has recurred in this process. */
   occurrences: number
+  /**
+   * The waits the failed request itself completed, when the transport reported
+   * them.
+   *
+   * `waited` above stays the coarse card flag; this is the evidence behind it.
+   * A configured-fallback wait has no advised seconds to quote, so the row needs
+   * the measured total to say how long the request really sat — and the card
+   * needs to distinguish "waited the upstream's window" from "waited the
+   * configured fallback". Absent for a request that never waited.
+   */
+  waits?: QoderQueueWaitSummary
 }
 
 /**

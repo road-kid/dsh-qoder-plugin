@@ -7,7 +7,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as Qoder from '../src/index.ts'
 import { installJobTokenHint } from '../src/job-token-hint.ts'
-import { formatQueueNotice, parseQueueFacts } from '../src/qoder/queue-notice.ts'
+import { formatQueueNotice, parseQueueFacts, type QoderQueueWaitSummary } from '../src/qoder/queue-notice.ts'
 
 /**
  * The live queue notice, end to end.
@@ -131,6 +131,41 @@ function queueChat(): Response {
   )
 }
 
+/** A queue answer that advises NO window: the configured fallback is all there is. */
+const QUEUE_BODY_WITHOUT_ADVICE = JSON.stringify({
+  isQueued: true,
+  modelKey: 'live-model',
+  queueCount: 7,
+  queueType: 'p3',
+  serviceAvailable: true,
+})
+
+/** One queue answer that advises nothing, so only 排队等待秒数 can drive a wait. */
+function queueChatWithoutAdvice(): Response {
+  return new Response(
+    `data: ${JSON.stringify({ statusCodeValue: 403, body: QUEUE_BODY_WITHOUT_ADVICE })}\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } },
+  )
+}
+
+/** One queue answer whose advice is a single second, so a real wait stays cheap. */
+const QUEUE_BODY_ONE_SECOND = JSON.stringify({
+  isQueued: true,
+  modelKey: 'live-model',
+  queueCount: 12,
+  queueType: 'p3',
+  retryAfterSeconds: 1,
+  serviceAvailable: true,
+})
+
+/** One queue answer that advises a one-second window. */
+function queueChatOneSecond(): Response {
+  return new Response(
+    `data: ${JSON.stringify({ statusCodeValue: 403, body: QUEUE_BODY_ONE_SECOND })}\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } },
+  )
+}
+
 /** One accepted chat, as Qoder streams it: an envelope carrying a delta. */
 function acceptedChat(text = 'hello'): Response {
   const body = JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: 'stop' }] })
@@ -169,7 +204,10 @@ async function serve(routes: Map<string, (req: IncomingMessage, res: ServerRespo
 }
 
 /** A signed-in plugin served by `state`'s fake upstream, with the catalog read. */
-async function bootSignedIn(state: UpstreamState): Promise<Context> {
+async function bootSignedIn(
+  state: UpstreamState,
+  pluginConfig: Record<string, unknown> = { queueWaitAttempts: 0 },
+): Promise<Context> {
   const root = await tempDir()
   vi.stubEnv('DSH_QODER_POLL_MS', '100')
   vi.stubEnv('DSH_HOME', root)
@@ -189,7 +227,7 @@ async function bootSignedIn(state: UpstreamState): Promise<Context> {
   // real time for a queued answer) and turns every case into a suite timeout.
   // The default itself is pinned by tests/plugin-card.spec.ts and the full
   // integration run; this fixture stays on the explicit fail-fast path.
-  await ctx.plugin(Qoder, { queueWaitAttempts: 0 })
+  await ctx.plugin(Qoder, pluginConfig)
   await vi.waitFor(async () => {
     expect((await ctx.llm.listModels('qoder')).map(model => model.id)).toEqual(['live-model'])
   }, { timeout: 15_000 })
@@ -295,9 +333,11 @@ function rowSentence(notice: Record<string, unknown>): string {
   // reconstructed.
   const facts = parseQueueFacts(String(notice.upstreamMessage))
   if (facts === undefined) throw new Error('the recorded notice carries no parseable upstream body')
+  const waits = notice.waits as QoderQueueWaitSummary | undefined
   return formatQueueNotice(facts, {
     waited: notice.waited === true,
     occurrences: notice.occurrences as number,
+    ...(waits === undefined ? {} : { waits }),
   })
 }
 
@@ -369,6 +409,52 @@ describe('queue notice lifecycle', () => {
     expect(sentence).toContain('已按上游建议等待 30 秒仍不可服务')
     // The approved sentence is not just reachable in a formatter: it is the line
     // the second answer prints into the conversation.
+    expect(noticeLines(session.appended).at(-1)).toBe(sentence)
+  }, 30_000)
+
+  it('claims a configured wait the transport really completed', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn(
+      // No advice at all in the body, so the configured 排队等待秒数 is the only
+      // window that can drive a wait.
+      { chat: () => queueChatWithoutAdvice() },
+      { queueWaitAttempts: 1, queueWaitSeconds: 1 },
+    )
+    session.running('agent-notice-configured')
+    expect(await chat(ctx)).toBe('')
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ waited: true, occurrences: 1 })
+    // The real evidence, next to the claim it supports: one completed wait, on
+    // the configured basis, and the seconds are the wait that happened (the
+    // configured second plus the anti-stampede padding), not an invented advice.
+    const waits = notice!.waits as { attempts?: number; totalWaitMs?: number; lastBasis?: { source?: string } } | undefined
+    expect(waits?.attempts).toBe(1)
+    expect(waits?.lastBasis?.source).toBe('configured')
+    expect(waits?.totalWaitMs).toBeGreaterThanOrEqual(1_000)
+    const sentence = rowSentence(notice!)
+    expect(sentence).toContain('已按配置等待')
+    expect(sentence).not.toContain('本次未按上游建议等待即返回此结果')
+    // The row the user sees is that same sentence, not merely a renderable one.
+    expect(noticeLines(session.appended).at(-1)).toBe(sentence)
+  }, 30_000)
+
+  it('claims the advised wait the transport really completed', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn(
+      { chat: () => queueChatOneSecond() },
+      { queueWaitAttempts: 1, queueWaitSeconds: 60 },
+    )
+    session.running('agent-notice-upstream-wait')
+    expect(await chat(ctx)).toBe('')
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ waited: true, occurrences: 1 })
+    const waits = notice!.waits as { attempts?: number; lastBasis?: { source?: string; advisedSeconds?: number } } | undefined
+    expect(waits?.attempts).toBe(1)
+    // The advice (1s), not the configured 60s, is what the wait was built on.
+    expect(waits?.lastBasis).toMatchObject({ source: 'upstream', advisedSeconds: 1 })
+    const sentence = rowSentence(notice!)
+    expect(sentence).toContain('已按上游建议等待 1 秒仍不可服务')
+    expect(sentence).not.toContain('本次未按上游建议等待即返回此结果')
     expect(noticeLines(session.appended).at(-1)).toBe(sentence)
   }, 30_000)
 
