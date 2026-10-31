@@ -113,11 +113,10 @@ function isTitleRequest(options: GenerateOptions): boolean {
  *
  * The host runs one `generate` call per model step, and a turn's later steps
  * arrive with the previous step's tool results appended — their LAST message is
- * a tool result. The stickiness bounds are examined only at turn openings and
- * the round bound is credited only to a turn-opening request that finishes
- * normally, which is what keeps a multi-step turn on one account: a bound
- * reached mid-turn waits for the next turn instead of splitting the turn
- * across accounts.
+ * a tool result. The stickiness bounds are examined only at turn openings, and
+ * the round bound is credited at the turn's FINAL answer, which is what keeps a
+ * multi-step turn on one account: a bound reached mid-turn waits for the next
+ * turn instead of splitting the turn across accounts.
  */
 function opensNewTurn(options: GenerateOptions): boolean {
   const messages = options.messages
@@ -199,8 +198,9 @@ function penaltyKind(error: unknown): QoderAccountPenaltyKind {
  * The `finish` chunk is the single terminal signal of a stream, and it carries
  * a failure reason for the two kinds that did not produce an answer: an upstream
  * error and a caller abort. Everything else — `stop`, `tool-calls`, `max-tokens`
- * — means the conversation was served to the end, which is what the stickiness
- * round bound counts and what exonerates an account in the penalty ledger.
+ * — means the step was served to the end, which exonerates the account in the
+ * penalty ledger. Only `stop` and `max-tokens` are a turn's FINAL answer; see
+ * `noteTurnProgress` for why `tool-calls` must not credit a round yet.
  */
 function isServedFinish(chunk: StreamChunk): boolean {
   if (chunk.type !== 'finish') return false
@@ -233,7 +233,7 @@ interface SessionPin {
   region?: QoderRegion | undefined
   /** Wall-clock instant this account took over the session. */
   pinnedAtMs: number
-  /** Conversations this account served to the end while holding the pin. */
+  /** Turns this account served through their final answer while pinning. */
   rounds: number
   /** Requests this account started while holding the pin. */
   requests: number
@@ -269,13 +269,16 @@ interface AttemptState {
    */
   emitted: boolean
   /**
-   * Called once when this attempt produced a finished ANSWER, at the terminal
-   * chunk. Optional so an ambient attempt with no pool walk can pass none.
+   * Called once for this attempt's terminal `finish` chunk, whatever it says: a
+   * served answer, an upstream failure or a caller abort. Optional so an ambient
+   * attempt with no pool walk can pass none.
    *
-   * Cleared (deleted) by `attempt` after the first call, so it is declared
-   * optional-but-assignable rather than merely absent.
+   * The chunk is passed because the outcomes are not the same bookkeeping: only
+   * a FINAL answer credits a stickiness round, while `tool-calls` means the turn
+   * simply continues. Cleared by `attempt` after the first call, so a misbehaving
+   * source that yields twice cannot credit anything twice.
    */
-  onServed?: (() => void) | undefined
+  onFinish?: ((chunk: StreamChunk) => void) | undefined
 }
 
 /**
@@ -444,6 +447,18 @@ export class DefaultQoderTransport implements QoderTransport {
    * storage, ordered by Map insertion so the oldest pin is the one evicted.
    */
   private readonly sessionPins = new Map<string, SessionPin>()
+  /**
+   * The turns currently in flight, keyed by conversation, with the account that
+   * served their LATEST step.
+   *
+   * A turn that ends in `tool-calls` is not finished, so it earns no round until
+   * its final answer arrives — which may be several steps and one failover
+   * later. This record is what lets that final answer complete the turn it
+   * belongs to instead of looking like the first step of something new. It is
+   * dropped when the turn completes, when it dies without an answer, when a new
+   * turn supersedes it, and when its session loses its pin.
+   */
+  private readonly pendingTurns = new Map<string, { accountId: string }>()
   /**
    * The conversations whose self-heal exchanged a fresh job token and whose
    * retry has not been accepted yet, with the time each rotation happened.
@@ -862,6 +877,10 @@ export class DefaultQoderTransport implements QoderTransport {
     // steps keep the account their turn opened on, and a bound reached
     // mid-turn waits for the next turn.
     const newTurn = opensNewTurn(options)
+    // A turn that never reached an answer — the user stopped it, the host gave
+    // up, the process restarted — leaves a pending record behind. A new turn
+    // supersedes it: its rounds were never earned and never will be.
+    if (newTurn && sessionId !== undefined) this.pendingTurns.delete(sessionId)
     // Stickiness chooses where a request STARTS, never whether the walk runs: a
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
@@ -1002,25 +1021,29 @@ export class DefaultQoderTransport implements QoderTransport {
        * Wired as a callback rather than left after the `yield*` below because
        * the HTTP layer closes the body stream at the terminal chunk instead of
        * resuming this generator (see `attempt`): code after `yield*` is
-       * unreachable in production, and the round bound plus this whole
+       * unreachable in production, and the round bookkeeping plus this whole
        * exoneration path died with it.
        */
-      state.onServed = ((): (() => void) => {
+      state.onFinish = ((): ((chunk: StreamChunk) => void) => {
         // Captured by value: `account` is reassigned as the walk moves, and a
         // late callback must credit the account that actually served, not
         // whichever one the walk happens to hold when it fires.
         const servedId = account.id
         const servedTurn = newTurn
-        return (): void => {
+        return (chunk): void => {
+          if (!isServedFinish(chunk)) {
+            // No answer: an upstream error or a caller abort. It neither
+            // exonerates the account nor completes a turn, and any turn that was
+            // in flight ends here without a round.
+            if (sessionId !== undefined) this.pendingTurns.delete(sessionId)
+            return
+          }
           this.penalties.noteSuccess(servedId)
           for (const blame of pendingBlame) this.penalties.noteFailure(blame.accountId, blame.kind)
-          // Only a turn-opening request credits the round bound: a turn is the
-          // user's message through its final answer, tool steps included, so
-          // its later steps must not spend additional rounds.
-          if (servedTurn) this.completeRound(sessionId, servedId)
           // The walk is over and every deferred penalty has landed, so nothing
           // may blame these accounts again if the caller keeps pulling.
           pendingBlame.length = 0
+          this.noteTurnProgress(sessionId, servedId, chunk, servedTurn)
         }
       })()
       // Set before the attempt, not after it: `attempt` reads it when it fires
@@ -1030,8 +1053,8 @@ export class DefaultQoderTransport implements QoderTransport {
       try {
         yield* this.attempt(options, model, account, state, account.id, queueBudget)
         // Reached only when the source ended without a terminal chunk at all,
-        // which the SSE layer treats as a failure. A normally finished answer
-        // was already recorded by `state.onServed` at its finish chunk.
+        // which the SSE layer treats as a failure. A normally finished stream
+        // was already recorded by `state.onFinish` at its finish chunk.
         return
       } catch (error: unknown) {
         if (options.signal?.aborted || state.emitted) throw error
@@ -1130,23 +1153,23 @@ export class DefaultQoderTransport implements QoderTransport {
          */
         if (chunk.type === 'finish') release()
         /*
-         * Fire the served-answer hook at that same terminal chunk, for the same
-         * reason: the walk never resumes after the finish chunk, so anything it
-         * wants to record about a completed answer has to be recorded here,
-         * while the transport is still being pulled. `isServedFinish` keeps an
-         * error or aborted terminal chunk out of it — those produced no answer
-         * and must not count as a round or exonerate the account.
+         * Fire the finish hook at that same terminal chunk, for the same reason:
+         * the walk never resumes after the finish chunk, so anything it wants to
+         * record about the end of a step has to be recorded here, while the
+         * transport is still being pulled. The hook receives the chunk because
+         * the outcome matters — `stop`/`max-tokens` complete a turn, `tool-calls`
+         * continues it, and an error or abort completes nothing.
          */
-        if (state.onServed !== undefined && isServedFinish(chunk)) {
-          const onServed = state.onServed
-          // One shot: a misbehaving source that yields twice must not count the
+        if (chunk.type === 'finish' && state.onFinish !== undefined) {
+          const onFinish = state.onFinish
+          // One shot: a misbehaving source that yields twice must not credit the
           // round twice, and the callback must never be able to affect the
           // chunk stream by throwing.
-          state.onServed = undefined
+          state.onFinish = undefined
           try {
-            onServed()
+            onFinish(chunk)
           } catch (error: unknown) {
-            this.logger?.warn?.('[Qoder Stream] Served-answer bookkeeping threw; continuing the stream', {
+            this.logger?.warn?.('[Qoder Stream] Finish bookkeeping threw; continuing the stream', {
               message: error instanceof Error ? error.message : String(error),
             })
           }
@@ -1595,20 +1618,56 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
-   * Count one completed TURN against the account that served it.
+   * Count one completed TURN against the account that served its final answer.
    *
-   * Fired only for a turn-opening request whose stream finished normally —
-   * a turn is the user's message through its final answer, tool steps
-   * included, so the opening request stands for the whole turn and its later
-   * steps must not spend additional rounds. A request that failed, or that
-   * the caller stopped reading, did not produce an output, so it must not
-   * move the session on.
+   * A turn is the user's message through its final answer, tool steps included,
+   * so it is worth exactly one round — credited when that answer arrives
+   * (`stop` or `max-tokens`), never when an intermediate step merely asked for a
+   * tool. A request that failed, or that the caller stopped reading, produced no
+   * answer and must not move the session on.
    */
   private completeRound(sessionId: string | undefined, accountId: string): void {
     if (sessionId === undefined) return
     const pin = this.sessionPins.get(sessionId)
     if (pin === undefined || pin.id !== accountId) return
     pin.rounds += 1
+  }
+
+  /**
+   * Record where a turn stands at the terminal chunk of one of its steps.
+   *
+   * A round is one COMPLETED turn, so it is credited only when the model's FINAL
+   * answer arrives: `stop`, or `max-tokens` (a truncated answer is still an
+   * answer). `tool-calls` means the model asked for tools and the SAME turn
+   * continues in the next request, so the turn is only remembered as pending —
+   * counting that step would spend the bound on a turn that has not finished.
+   *
+   * The final answer is credited to the account that actually served it. A turn
+   * can be rerouted mid-way (the opening account fails and the walk lands
+   * elsewhere), and the round belongs to the account that ran it to the end.
+   */
+  private noteTurnProgress(
+    sessionId: string | undefined,
+    accountId: string,
+    chunk: StreamChunk,
+    opening: boolean,
+  ): void {
+    if (sessionId === undefined || chunk.type !== 'finish') return
+    const kind = chunk.reason.kind
+    if (kind === 'stop' || kind === 'max-tokens') {
+      // An opening request whose answer is already final completes its turn on
+      // the spot; a continued step completes the turn its opening step started.
+      // A continuation with no pending turn (the transport restarted mid-turn,
+      // or was never told one started) credits nothing rather than inventing a
+      // turn that this transport did not see open.
+      if (opening || this.pendingTurns.has(sessionId)) this.completeRound(sessionId, accountId)
+      this.pendingTurns.delete(sessionId)
+      return
+    }
+    // `tool-calls`: the turn is in flight and now belongs to the account that
+    // served this step, which a failover may have changed. Without a pin there is
+    // no stickiness to serve, so there is nothing worth remembering.
+    if (this.sessionPins.has(sessionId)) this.pendingTurns.set(sessionId, { accountId })
   }
 
   /**
@@ -1634,6 +1693,7 @@ export class DefaultQoderTransport implements QoderTransport {
         const oldest = this.sessionPins.keys().next()
         if (oldest.done === true) break
         this.sessionPins.delete(oldest.value)
+        this.pendingTurns.delete(oldest.value)
       }
     }
     this.sessionPins.delete(sessionId)

@@ -95,6 +95,42 @@ function rateLimited(): Response {
   return new Response('', { status: 429 })
 }
 
+/** One step that ASKS for a tool: the turn continues in the next request. */
+function toolCalls(): Response {
+  const body = JSON.stringify({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: 'call-1',
+          type: 'function',
+          function: { name: 'read', arguments: '{"path":"a.txt"}' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  })
+  return new Response(`data: ${JSON.stringify({ statusCodeValue: 200, body })}
+
+data: [DONE]
+
+`, {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
+/** A final answer cut off by the output limit: truncated, but an answer. */
+function maxTokens(text: string): Response {
+  const body = JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: 'length' }] })
+  return new Response(`data: ${JSON.stringify({ statusCodeValue: 200, body })}
+
+data: [DONE]
+
+`, {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Fake credential pool
 // ---------------------------------------------------------------------------
@@ -217,6 +253,13 @@ async function drain(transport: QoderTransport, sessionId?: Session): Promise<St
 async function drainStep(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
   const chunks: StreamChunk[] = []
   for await (const chunk of transport.stream(stepRequest(sessionId))) chunks.push(chunk)
+  return chunks
+}
+
+/** Run one arbitrary generate call — a step with its own signal, for aborts. */
+async function drainWith(transport: QoderTransport, options: GenerateOptions): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(options)) chunks.push(chunk)
   return chunks
 }
 
@@ -721,6 +764,85 @@ describe('QoderTransport session stickiness', () => {
     await continuation
     expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
     expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+  })
+
+  /**
+   * A turn that stopped at a tool call is not a finished round.
+   *
+   * An opening request that ends in `tool-calls` only ASKED for a tool; the
+   * answer the round bound counts has not been produced yet. Counting that step
+   * spends the bound on a turn that never finished, so the session rotates away
+   * between a tool call and the result the turn was waiting for.
+   */
+  it('does not count a turn that stopped at a tool call as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+
+    // Turn 1 opens and stops at its tool call: unfinished, so it spends nothing,
+    // and the next turn must open on the same account.
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
+  })
+
+  /**
+   * ...while a turn that runs its tools through to the final answer spends
+   * exactly one round, credited when that answer arrives.
+   */
+  it('counts one round for a tool-using turn when its final answer arrives', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: (_pat, call) => call === 3 ? accepted('done') : toolCalls(),
+    })
+
+    await drain(transport, SESSION) // step 1: a tool call, no round yet
+    await drainStep(transport, SESSION) // step 2: another tool call
+    await drainStep(transport, SESSION) // step 3: the final answer — round 1
+    await drain(transport, SESSION) // turn 2: the bound is spent, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('counts a truncated final answer as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => maxTokens('cut off'),
+    })
+
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    // `max-tokens` is a finished answer, just a truncated one: the account
+    // served the conversation, so the bound is spent and turn 2 moves on.
+    expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat])
+  })
+
+  it('does not count an aborted turn as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+    const controller = new AbortController()
+
+    await drain(transport, SESSION) // turn 1 opens and stops at its tool call
+    controller.abort()
+    await expect(drainWith(transport, { ...stepRequest(SESSION), signal: controller.signal })).rejects.toThrow()
+
+    // The turn never produced an answer, so it spends no round and the next
+    // turn still opens on Alpha.
+    await drain(transport, SESSION)
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
   })
 
   it('evicts the oldest session once the pin table is full', async () => {
