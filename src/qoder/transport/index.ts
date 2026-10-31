@@ -6,13 +6,13 @@ import type { QoderAccountInfo } from '../account.ts'
 import type { QoderCatalogModel } from '../catalog.ts'
 import type { QoderRegion } from '../region.ts'
 import type { QoderCheckInResult } from './checkin.ts'
-import type { QoderQueueFacts, QoderQueueWaitProgress } from '../queue-notice.ts'
+import type { QoderQueueFacts, QoderQueueWaitProgress, QoderQueueWaitSummary } from '../queue-notice.ts'
 import { DefaultQoderTransport, defaultStreamIdleTimeoutMs } from './default-transport.ts'
 import { defaultResponseHeaderTimeoutMs } from './request.ts'
 import type { QoderLogger } from './logging.ts'
 
 export { defaultResponseHeaderTimeoutMs, defaultStreamIdleTimeoutMs }
-export type { QoderCheckInResult }
+export type { QoderCheckInResult, QoderQueueWaitSummary }
 
 export interface QoderTransport {
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk>
@@ -195,8 +195,19 @@ export interface QoderTransportOptions {
    *   most recently looked busy is a notice about someone else's request (this
    *   is what made rows land in the wrong conversation). Absent when the request
    *   carries no session, in which case the host falls back to its best guess.
+   * @param waits - The waits THIS request completed before the final answer,
+   *   accumulated per request rather than remembered on the transport: requests
+   *   run concurrently, and a transport-wide "last wait" would let one request's
+   *   wait be reported beside another request's failure. Absent (or `attempts`
+   *   0) when the request never waited, which the host needs to keep the "no
+   *   wait" sentence honest.
    */
-  onUpstreamQueue?: (facts: QoderQueueFacts, accountId?: string, sessionId?: string) => void
+  onUpstreamQueue?: (
+    facts: QoderQueueFacts,
+    accountId?: string,
+    sessionId?: string,
+    waits?: QoderQueueWaitSummary,
+  ) => void
   /**
    * Called right before this transport waits out a queue answer, once per wait.
    *

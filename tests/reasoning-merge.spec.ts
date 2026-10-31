@@ -23,10 +23,16 @@ import { modelInfoOf } from '../src/upstream.ts'
  * - a declared set is never overridden, and probing never confers `off`.
  */
 
-const CLEANUP: string[] = []
+/**
+ * Teardown per booted plugin: a disposer that awaits the Context, then removes
+ * the temporary data root. Awaiting matters — a fire-and-forget dispose raced
+ * this cleanup against a still-running plugin, so one test's file writes and
+ * timers could land in the next test's data root.
+ */
+const CLEANUP: (() => Promise<void>)[] = []
 
 afterEach(async () => {
-  for (const path of CLEANUP.splice(0)) await rm(path, { recursive: true, force: true })
+  for (const dispose of CLEANUP.splice(0)) await dispose()
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
 })
@@ -99,9 +105,12 @@ async function boot(options: {
   model?: string
   account?: string
   record?: (fingerprint: string) => Qoder.QoderProbeRecord
+  /** The model list this root's fake upstream answers with, replacing the default envelope. */
+  envelope?: string
+  /** The model id to wait for before returning; defaults to {@link UNDECLARED_ID}. */
+  expectModel?: string
 }): Promise<Context> {
   const root = await mkdtemp(join(tmpdir(), 'dsh-qoder-probe-'))
-  CLEANUP.push(root)
   vi.stubEnv('DSH_HOME', root)
   // The plugin keeps its files under its own data directory; point that at the
   // same temporary root so the credential below is the one the store reads.
@@ -115,7 +124,7 @@ async function boot(options: {
   await writeFile(join(root, Qoder.CHINA_VARIANT.ownFilename), credentialDocument())
   // The upstream only ever answers with this fixed roster: a real fetch would
   // replace it with whatever the live catalog happens to say today.
-  const envelope = catalogEnvelope()
+  const envelope = options.envelope ?? catalogEnvelope()
   vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
     const href = String(url)
     if (href.includes('/api/v1/jobToken/exchange')) {
@@ -139,10 +148,20 @@ async function boot(options: {
   }
 
   const ctx = new Context()
+  // Registered before the plugins load, so a boot that times out still has its
+  // plugin disposed and its root removed instead of leaking into the next test.
+  CLEANUP.push(async () => {
+    await ctx.fiber.dispose()
+    await rm(root, { recursive: true, force: true })
+  })
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(Qoder, {})
+  const expected = options.expectModel ?? UNDECLARED_ID
+  // The timeout here is deliberately shorter than each test's outer timeout:
+  // a boot that never sees its catalog must fail with the assertion below, not
+  // as an opaque "Test timed out".
   await vi.waitFor(async () => {
-    expect((await ctx.llm.listModels('qoder')).map(model => model.id)).toContain(UNDECLARED_ID)
+    expect((await ctx.llm.listModels('qoder')).map(model => model.id)).toContain(expected)
   }, { timeout: 10_000 })
   return ctx
 }
@@ -158,8 +177,7 @@ describe('probe results merged into the provider', () => {
     const ctx = await boot({})
     // The undeclared row: no effort set from upstream, no observation.
     expect(await effortsFor(ctx, UNDECLARED_ID)).toBeUndefined()
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
 
   it('grants exactly the verified spellings for a validating observation', async () => {
     const ctx = await boot({
@@ -178,8 +196,7 @@ describe('probe results merged into the provider', () => {
     // `off` is never conferred by probing, even though the picker knows the level.
     expect(efforts).not.toContain('off')
     expect(efforts).not.toContain('minimal')
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
 
   it('grants nothing for a non-validating observation', async () => {
     const ctx = await boot({
@@ -194,8 +211,7 @@ describe('probe results merged into the provider', () => {
       }),
     })
     expect(await effortsFor(ctx, UNDECLARED_ID)).toBeUndefined()
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
 
   it('never overrides a declared set with an observation', async () => {
     const ctx = await boot({
@@ -222,8 +238,7 @@ describe('probe results merged into the provider', () => {
     expect(efforts).toEqual(expected)
     // `max` was in the fabricated observation; it must not appear uninvited.
     expect(efforts).not.toContain('max')
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
 
   it('ignores an observation whose fingerprint no longer matches the catalog', async () => {
     const ctx = await boot({
@@ -238,8 +253,7 @@ describe('probe results merged into the provider', () => {
       }),
     })
     expect(await effortsFor(ctx, UNDECLARED_ID)).toBeUndefined()
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
 
   it('ignores an observation made under a different account', async () => {
     const ctx = await boot({
@@ -256,6 +270,34 @@ describe('probe results merged into the provider', () => {
       }),
     })
     expect(await effortsFor(ctx, UNDECLARED_ID)).toBeUndefined()
-    void ctx.fiber.dispose()
-  })
+  }, 20_000)
+
+  it('fetches its own catalog for a second data root under the same account', async () => {
+    // Same PAT, so the same account: only the data root differs. The catalog
+    // caches outlive one plugin instance (a settings write re-applies the
+    // plugin), so they have to be keyed by data root as well — otherwise this
+    // second root inherits the first root's live-fetch record, considers its
+    // catalog fresh, skips its own fetch, and serves the built-in fallback.
+    const first = await boot({})
+    await first.fiber.dispose()
+
+    const secondRootModel = 'second-root-model'
+    const second = await boot({
+      envelope: JSON.stringify({
+        assistant: [
+          {
+            key: secondRootModel,
+            enable: true,
+            display_name: 'Second Root',
+            max_input_tokens: 100_000,
+            max_output_tokens: 1_000,
+            price_factor: 1,
+          },
+        ],
+      }),
+      expectModel: secondRootModel,
+    })
+    // Its own upstream answer: not the other root's cache, not the fallback.
+    expect((await second.llm.listModels('qoder')).map(model => model.id)).toEqual([secondRootModel])
+  }, 20_000)
 })

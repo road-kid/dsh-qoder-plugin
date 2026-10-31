@@ -114,7 +114,7 @@ export function parseQueueFacts(body: string): QoderQueueFacts | undefined {
  */
 export function formatQueueNotice(
   facts: QoderQueueFacts,
-  options: { waited: boolean; occurrences: number },
+  options: { waited?: boolean; occurrences: number; waits?: QoderQueueWaitSummary },
 ): string {
   const seconds = facts.retryAfterSeconds
   // The upstream distinguishes "the service is off" from "your request is
@@ -127,11 +127,7 @@ export function formatQueueNotice(
   const head = seconds === undefined
     ? `上游模型排队中（${state}，上游未给出建议重试时间）`
     : `上游模型排队中（${state}，上游建议 ${seconds} 秒后重试）`
-  const wait = options.waited
-    ? seconds === undefined
-      ? '已按上游建议等待后仍不可服务'
-      : `已按上游建议等待 ${seconds} 秒仍不可服务`
-    : '本次未按上游建议等待即返回此结果'
+  const wait = waitedSentence(seconds, options)
   const risk = options.occurrences > 1
     ? '，如果频繁返回此结果可能代表当前账号已被风控'
     : ''
@@ -142,6 +138,38 @@ export function formatQueueNotice(
     : boundMessage(facts.upstreamMessage)
   const source = quoted === undefined ? '' : `（上游原文：${quoted}）`
   return `${head}：这不是登录态或额度问题，${wait}${risk}${source}`
+}
+
+/**
+ * The sentence claiming what waiting happened, from what was really observed.
+ *
+ * Three states, and the difference matters because each sentence is a claim:
+ *
+ * - the transport completed at least one wait on the CONFIGURED fallback: the
+ *   upstream advised nothing, so no advice may be quoted — say plainly how long
+ *   the configured window held the request;
+ * - the transport completed at least one wait on the upstream's ADVICE: quote
+ *   the advice, which is the window the wait was built on;
+ * - the transport waited nothing: keep the old contract, including the case
+ *   where the host's own retry cycle (not the plugin) is what sat out the
+ *   advised window — {@link formatQueueNotice}'s `waited` flag stays the only
+ *   evidence for that, and a request that never waited must not borrow it from
+ *   a clock reading.
+ */
+function waitedSentence(
+  seconds: number | undefined,
+  options: { waited?: boolean; occurrences: number; waits?: QoderQueueWaitSummary },
+): string {
+  const waits = options.waits
+  const completed = waits !== undefined && waits.attempts > 0 ? waits : undefined
+  if (completed !== undefined && completed.lastBasis?.source === 'configured') {
+    const waitedSeconds = Math.max(1, Math.round(completed.totalWaitMs / 1000))
+    return `已按配置等待 ${waitedSeconds} 秒，重试后仍不可服务`
+  }
+  const waitedBefore = completed !== undefined || options.waited === true
+  if (!waitedBefore) return '本次未按上游建议等待即返回此结果'
+  const advised = completed?.lastBasis?.advisedSeconds ?? seconds
+  return advised === undefined ? '已按上游建议等待后仍不可服务' : `已按上游建议等待 ${advised} 秒仍不可服务`
 }
 
 /**
@@ -160,6 +188,26 @@ export interface QoderQueueWaitBasis {
   advisedSeconds?: number
   /** The configured fallback in force, in whole seconds. */
   configuredSeconds: number
+}
+
+/**
+ * The waits one request actually completed before its final queue answer.
+ *
+ * Built by the transport from the waits it really slept through, and carried to
+ * the notice because the notice's sentence claims a wait: guessing it from the
+ * clock (the previous wire) both over-claimed a wait nobody performed and
+ * missed the configured fallback — the transport waited the configured window,
+ * then reported "本次未按上游建议等待即返回此结果", telling the user the opposite
+ * of what happened. `attempts` counts COMPLETED waits only: a wait the caller
+ * aborted did not happen and must not be described.
+ */
+export interface QoderQueueWaitSummary {
+  /** Waits this request completed before giving up, 0 when it never waited. */
+  attempts: number
+  /** Sum of those waits, milliseconds, empty when `attempts` is 0. */
+  totalWaitMs: number
+  /** What drove the LAST completed wait; absent when no wait completed. */
+  lastBasis?: QoderQueueWaitBasis
 }
 
 /** The wait about to start, as reported by the transport's `onQueueWait`. */

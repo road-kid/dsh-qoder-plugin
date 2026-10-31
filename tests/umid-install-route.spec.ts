@@ -1,12 +1,17 @@
+import { EventEmitter } from 'node:events'
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { gzipSync } from 'node:zlib'
 import { Context, Service } from '@deepseek-ai/cordis'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import { createElement } from 'react'
 import { act, create, type ReactTestRenderer } from 'react-test-renderer'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { installUmid, runSelfCheckProcess } from '../src/qoder/transport/umid-extract.ts'
 import * as Qoder from '../src/index.ts'
 import { QODER_PAT_ENV_CN, QODER_PAT_ENV_GLOBAL, QoderCredentialStore } from '../src/auth.ts'
 import {
@@ -826,5 +831,241 @@ describe('assembled plugin reports the native component', () => {
     // this machine lacks — the honest reason stays `no-client`, whose hint does
     // not point at a button that would not help.
     expect(notInstallable['reasonCode']).toBe('no-client')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Q-07 — the self-check child is stopped, then awaited, then staging is removed
+// ---------------------------------------------------------------------------
+
+/**
+ * The self-check child used to be killed and the install's staging directory
+ * deleted in the same tick, without waiting for the child to close its stdio
+ * pipes. On Windows that is an EBUSY race: the directory is still held by the
+ * process that was just killed (or is still flushing its answer).
+ *
+ * These cases script the child's events so the contract is observable: the
+ * child is killed, its `close` arrives, the runner settles, and only then is
+ * the staging directory removed. A real short-lived Node child covers the
+ * ordinary close path on whatever host runs the suite.
+ */
+describe('self-check process teardown', () => {
+  type SpawnInjection = Parameters<typeof runSelfCheckProcess>[1]
+
+  /** A `ChildProcess` stand-in whose kill → close ordering the case scripts. */
+  class FakeSelfCheckChild extends EventEmitter {
+    readonly stdout = new PassThrough()
+    readonly stderr = new PassThrough()
+    exitCode: number | null = null
+    signalCode: NodeJS.Signals | null = null
+    kills = 0
+    /** Called when the runner kills this child; the case decides what follows. */
+    onKill: (child: FakeSelfCheckChild) => void = () => {}
+    kill(): boolean {
+      this.kills += 1
+      this.onKill(this)
+      return true
+    }
+    /** End the child the way a real process does: exit, then close. */
+    exit(code: number): void {
+      this.exitCode = code
+      this.emit('close', code, null)
+    }
+  }
+
+  const cleanups: (() => void)[] = []
+
+  afterEach(() => {
+    for (const clean of cleanups.splice(0)) clean()
+  })
+
+  function tempDir(prefix = 'qoder-umid-teardown-'): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix))
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+    return dir
+  }
+
+  function stagingDirs(destDir: string): string[] {
+    try {
+      return readdirSync(destDir).filter(name => name.startsWith('.staging-'))
+    } catch {
+      return []
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The smallest package shape installUmid accepts on any host: one ELF blob,
+  // base64'd into a bundle, wrapped in a real gzip'd ustar tarball.
+  // -------------------------------------------------------------------------
+
+  const fixtureHints = { fileMin: 100, fileMax: 4096, dllMin: 1024 }
+  const fixtureBlobMinChars = 60
+
+  function fixtureElf(size = 512): Buffer {
+    const bytes = Buffer.alloc(size)
+    bytes[0] = 0x7F
+    bytes[1] = 0x45
+    bytes[2] = 0x4C
+    bytes[3] = 0x46
+    bytes[4] = 2 // ELFCLASS64
+    bytes[5] = 1 // little endian
+    bytes.writeUInt16LE(0x3E, 18) // EM_X86_64
+    return bytes
+  }
+
+  function fixtureTarHeader(name: string, size: number): Buffer {
+    const header = Buffer.alloc(512)
+    header.write(name, 0, 'utf8')
+    header.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 'latin1')
+    header[156] = 0x30 // typeflag '0'
+    header.write('ustar\0', 257, 'latin1')
+    header.write('00', 263, 'latin1')
+    header.fill(0x20, 148, 156)
+    let sum = 0
+    for (const byte of header) sum += byte
+    header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'latin1')
+    return header
+  }
+
+  function fixtureTarArchive(entries: readonly { name: string; data: Buffer }[]): Buffer {
+    const parts: Buffer[] = []
+    for (const entry of entries) {
+      parts.push(fixtureTarHeader(entry.name, entry.data.length))
+      parts.push(entry.data)
+      const pad = (512 - (entry.data.length % 512)) % 512
+      if (pad > 0) parts.push(Buffer.alloc(pad))
+    }
+    parts.push(Buffer.alloc(1024)) // end-of-archive marker
+    return Buffer.concat(parts)
+  }
+
+  function fixtureTarball(): string {
+    const bundle = `const asset0 = "${fixtureElf().toString('base64')}"\n`
+    const archive = fixtureTarArchive([
+      { name: 'package/package.json', data: Buffer.from(JSON.stringify({ name: '@qoder-ai/qodercli', version: '9.9.9' })) },
+      { name: 'package/bundle/qoder-worker-runtime.mjs', data: Buffer.from(bundle, 'utf8') },
+    ])
+    const path = join(tempDir(), 'fixture.tgz')
+    writeFileSync(path, gzipSync(archive))
+    return path
+  }
+
+  it('T-Q07-1 settles a timed-out self-check only after the child closes', async () => {
+    const events: string[] = []
+    const child = new FakeSelfCheckChild()
+    child.onKill = killed => {
+      events.push('kill')
+      // The killed component has not flushed its pipes yet. The runner must
+      // wait for the close before it reports the timeout.
+      setTimeout(() => {
+        killed.stdout.write('{"machineToken":"too-late"}\n')
+        events.push('close')
+        killed.exit(3)
+      }, 20)
+    }
+    const outcome = await runSelfCheckProcess(
+      { binary: 'component', cwd: tempDir(), args: ['3'], timeoutMs: 5 },
+      (() => child) as unknown as SpawnInjection,
+    )
+    events.push('self-check-settled')
+    expect(events).toEqual(['kill', 'close', 'self-check-settled'])
+    expect(child.kills).toBe(1)
+    expect(outcome.code).toBeNull()
+    expect(outcome.spawnError).toContain('did not answer within')
+  })
+
+  it('T-Q07-2 settles a flooding self-check only after the child closes', async () => {
+    const events: string[] = []
+    const child = new FakeSelfCheckChild()
+    child.onKill = killed => {
+      events.push('kill')
+      // Exits non-zero, but only after flushing: the exact Windows case that
+      // used to leave a busy staging directory behind.
+      setTimeout(() => {
+        killed.stdout.write('{"machineToken":"flushed"}\n')
+        events.push('close')
+        killed.exit(7)
+      }, 20)
+    }
+    const outcome = await runSelfCheckProcess(
+      { binary: 'component', cwd: tempDir(), args: ['3'], timeoutMs: 10_000 },
+      (() => {
+        child.stdout.write(Buffer.alloc(1024 * 1024 + 64, 'x'))
+        return child
+      }) as unknown as SpawnInjection,
+    )
+    events.push('self-check-settled')
+    expect(events).toEqual(['kill', 'close', 'self-check-settled'])
+    expect(outcome.spawnError).toContain('flooded stdout')
+  })
+
+  it('T-Q07-3 never removes staging before the self-check child has closed', async () => {
+    const destDir = tempDir('qoder-umid-dest-')
+    const tarballPath = fixtureTarball()
+    const events: string[] = []
+    let stagingAtKill = 0
+    let stagingAtClose = 0
+    const child = new FakeSelfCheckChild()
+    child.onKill = killed => {
+      events.push('kill')
+      stagingAtKill = stagingDirs(destDir).length
+      setTimeout(() => {
+        killed.stdout.write('{"machineToken":"flushed"}\n')
+        events.push('close')
+        stagingAtClose = stagingDirs(destDir).length
+        killed.exit(9)
+      }, 30)
+    }
+    const result = await installUmid({
+      destDir,
+      tarballPath,
+      platform: 'linux',
+      arch: 'x64',
+      sizeHints: fixtureHints,
+      minBlobChars: fixtureBlobMinChars,
+      selfCheck: async request => {
+        const outcome = await runSelfCheckProcess(request, (() => {
+          setImmediate(() => {
+            child.stdout.write(Buffer.alloc(1024 * 1024 + 64, 'x'))
+          })
+          return child
+        }) as unknown as SpawnInjection)
+        events.push('self-check-settled')
+        return outcome
+      },
+    })
+    events.push('staging-removed')
+    expect(events).toEqual(['kill', 'close', 'self-check-settled', 'staging-removed'])
+    // The staging directory existed while the child was stopped, and it was
+    // still there when the child closed: nothing was removed before the close.
+    expect(stagingAtKill).toBe(1)
+    expect(stagingAtClose).toBe(1)
+    expect(stagingDirs(destDir)).toEqual([])
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('flooded stdout')
+  })
+
+  it('T-Q07-4 completes a real child through close and stays bounded on a kill', async () => {
+    const answered = await runSelfCheckProcess({
+      binary: process.execPath,
+      cwd: tempDir(),
+      args: ['-e', 'process.stdout.write(JSON.stringify({ machineToken: "real" }) + "\\n")'],
+      timeoutMs: 15_000,
+    })
+    expect(answered.code).toBe(0)
+    expect(answered.spawnError).toBeUndefined()
+    expect(answered.stdout).toContain('"machineToken":"real"')
+
+    const started = Date.now()
+    const silent = await runSelfCheckProcess({
+      binary: process.execPath,
+      cwd: tempDir(),
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      timeoutMs: 150,
+    })
+    expect(silent.spawnError).toContain('did not answer within')
+    // The kill path is bounded: the runner waited for the close, not for the
+    // child's own lifetime.
+    expect(Date.now() - started).toBeLessThan(5_000)
   })
 })

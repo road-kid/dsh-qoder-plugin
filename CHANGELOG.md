@@ -2,6 +2,71 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.1.1 — 2026-11-01
+
+### Changed — queued requests now wait five times by default
+
+The queue retry count defaults to 5 instead of 0: when Qoder reports a
+saturated model, a request waits out the upstream's advised window
+(`retryAfterSeconds` / `waitTime`, whichever is longer, capped at five minutes)
+and retries, instead of failing at once. The configured 排队等待秒数 stays a
+fallback used only when the upstream advises no window, so the upstream's own
+advice still wins. Users who want the old fail-fast behaviour can set
+排队重试次数 back to 0.
+
+### Changed — stickiness defaults: rounds and requests off, minutes 240
+
+The conversation-stickiness bounds now default to 0 rounds and 0 requests
+(round- and request-based rotation disabled) and 240 minutes. Only the minute
+bound still forces a rotation, so stickiness stays on.
+
+### Fixed — rotation no longer switches accounts in the middle of a turn
+
+Stickiness rotation used to count "rounds" per completed model stream — one
+per tool-call step — and to re-examine its bounds at the start of EVERY
+request, so a multi-step turn could reach a bound halfway through and switch
+accounts between two of its steps. Rotation is now examined only when a
+request OPENS a turn (the last message is not a tool result), and one round
+means one complete turn from the user's message to the final answer, tool
+steps included. A bound reached mid-turn waits for the next turn, so a
+conversation is never split across accounts in the middle of an answer.
+
+The host's automatic session-title call is also excluded: it used to burn one
+round and one request of the session's first account before the user's turn
+even started, because it shares the session id and looked like a turn. It is
+now detected by its framing text (the only marker that survives the plugin's
+own shim) and takes no part in stickiness at all.
+
+### Fixed — audit round: rounds, reroutes, catalog scope, queue waits, UMID
+
+- **A turn is counted when its final answer arrives.** A turn that ended at a
+  tool call, was aborted, or was never continued no longer spends a round of
+  the stickiness bound; a turn answered in several steps spends one, and a
+  `max-tokens` cutoff counts as its final answer.
+- **A rerouted request now moves the conversation with it.** When the first
+  choice is cooling down or busy, the request starts on the account that
+  actually serves it, and the session pin follows, so the rest of the turn and
+  the next bound check belong to the account that did the work.
+- **A slow credential lookup can no longer undo a rotation.** Two overlapping
+  requests could let the older one write its expired pin back over the newer
+  account; the pin is now written only if it is still the one the request read.
+- **Configured queue waits are reported as waits.** A request that waited the
+  configured 排队等待秒数 and was refused again used to be described as
+  "本次未按上游建议等待即返回此结果"; the notice now distinguishes a completed
+  configured wait, a completed upstream-advised wait, and no wait at all.
+  The settings card now reports the measured wait instead of the upstream's
+  advisory value, and a clock-based wait is never attributed to another
+  conversation.
+- **Overlapping requests can no longer erase newer progress.** Late failover
+  completions and stream finishes now update only the pin and turn they started
+  with; failed, aborted, and removed-account turns leave no pending state behind.
+- **Catalog and identity caches are scoped to the data root.** Two profiles
+  (host and alternate data root) sharing one account no longer inherit each
+  other's catalog freshness or mistake each other for an account switch.
+- **`umid install` waits for its self-check to exit** before removing the
+  staging directory, so a slow shutdown can no longer leave a half-deleted
+  staging tree behind.
+
 ## 1.1.0 — 2026-10-27
 
 The Global daily check-in no longer requires the Qoder desktop app. The identity

@@ -677,6 +677,36 @@ describe('Qoder plugin card', () => {
     expect(tree).toContain(t('upstreamNoticeRetry', { seconds: 30 }))
   })
 
+  it('reports the measured upstream wait instead of the initial retry advice', async () => {
+    withPool({ upstreamNotice: notice({
+      waited: true,
+      retryAfterMs: 30_000,
+      waits: {
+        attempts: 1,
+        totalWaitMs: 86_000,
+        lastBasis: { source: 'upstream', advisedSeconds: 86, configuredSeconds: 30 },
+      },
+    }) })
+    await mount()
+    expect(rendered()).toContain(t('upstreamNoticeWaited', { seconds: 86 }))
+    expect(rendered()).not.toContain(t('upstreamNoticeWaited', { seconds: 30 }))
+  })
+
+  it('reports a measured configured wait with its actual basis', async () => {
+    withPool({ upstreamNotice: notice({
+      waited: true,
+      retryAfterMs: undefined,
+      waits: {
+        attempts: 1,
+        totalWaitMs: 12_000,
+        lastBasis: { source: 'configured', configuredSeconds: 10 },
+      },
+    }) })
+    await mount()
+    expect(rendered()).toContain('This plugin already waited 12s using the configured fallback; still unavailable.')
+    expect(rendered()).not.toContain(en.upstreamNoticeWaitedNoDelay)
+  })
+
   it('states no delay when the upstream gave none, but still records the wait', async () => {
     withPool({ upstreamNotice: notice({ waited: false, retryAfterMs: undefined }) })
     await mount()
@@ -1211,12 +1241,22 @@ describe('Qoder plugin card', () => {
   it('shows the three stickiness bounds with the host defaults', async () => {
     const scope = fakeSettingsScope()
     await mountWithSettings(scope)
-    // The host defaults: 3 rounds, 200 requests, 180 minutes. A control that
+    // The host defaults: 0 rounds, 0 requests, 240 minutes. A control that
     // rendered a different default would silently tell the user a number the
     // host is not using.
-    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('3')
-    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('200')
-    expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('180')
+    expect(inputFor(en.stickinessRoundsLabel).props.value).toBe('0')
+    expect(inputFor(en.stickinessRequestsLabel).props.value).toBe('0')
+    expect(inputFor(en.stickinessMinutesLabel).props.value).toBe('240')
+  })
+
+  it('shows the queue retry bounds with the host defaults', async () => {
+    const scope = fakeSettingsScope({ queueWaitEnabled: true })
+    await mountWithSettings(scope)
+    // The host defaults: 5 attempts of 30 seconds each. The queue-notice
+    // fixtures opt out of this budget explicitly, so this is the one cheap
+    // place that pins the defaults the host actually ships.
+    expect(inputFor(en.queueWaitAttemptsLabel).props.value).toBe('5')
+    expect(inputFor(en.queueWaitSecondsLabel).props.value).toBe('30')
   })
 
   // ---- advanced card: master switches own their sub-menus --------------------

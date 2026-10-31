@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import {
+  createToolResultMessage,
+  createUserMessage,
+  ToolCallId,
+  type GenerateOptions,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
 import { sessionPinCapacity } from '../src/qoder/transport/default-transport.ts'
 import {
   createQoderTransport,
@@ -84,6 +90,47 @@ function unavailable(): Response {
   return new Response('', { status: 503 })
 }
 
+/** A rate-limit refusal: one of these cools the account down in the ledger. */
+function rateLimited(): Response {
+  return new Response('', { status: 429 })
+}
+
+/** One step that ASKS for a tool: the turn continues in the next request. */
+function toolCalls(): Response {
+  const body = JSON.stringify({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: 'call-1',
+          type: 'function',
+          function: { name: 'read', arguments: '{"path":"a.txt"}' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  })
+  return new Response(`data: ${JSON.stringify({ statusCodeValue: 200, body })}
+
+data: [DONE]
+
+`, {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
+/** A final answer cut off by the output limit: truncated, but an answer. */
+function maxTokens(text: string): Response {
+  const body = JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: 'length' }] })
+  return new Response(`data: ${JSON.stringify({ statusCodeValue: 200, body })}
+
+data: [DONE]
+
+`, {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Fake credential pool
 // ---------------------------------------------------------------------------
@@ -91,12 +138,16 @@ function unavailable(): Response {
 interface Pool {
   hooks: QoderFailoverHooks
   switches: Array<{ fromId: string; toId: string; reason: string }>
+  /** Silent adoptions: dispatch moves the host must know about but never report. */
+  adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }>
 }
 
 function pool(accounts: readonly { id: string; pat: string }[], active: { id: string; pat: string }): Pool {
   const switches: Array<{ fromId: string; toId: string; reason: string }> = []
+  const adopted: Array<{ fromId: string; toId: string; reason: 'cooling' }> = []
   return {
     switches,
+    adopted,
     hooks: {
       enabled: () => true,
       activeAccount: async () => active,
@@ -114,6 +165,9 @@ function pool(accounts: readonly { id: string; pat: string }[], active: { id: st
       },
       async switched(info) {
         switches.push(info)
+      },
+      async adopted(info) {
+        adopted.push(info)
       },
     },
   }
@@ -152,9 +206,67 @@ function request(sessionId?: Session): GenerateOptions {
   }
 }
 
+/**
+ * A continuation STEP of the same turn: the previous step produced a tool call
+ * and the host appended its result, so the last message is a tool result.
+ */
+function stepRequest(sessionId?: Session): GenerateOptions {
+  return {
+    provider: 'qoder-official',
+    model: 'cmodel',
+    messages: [
+      createUserMessage({ content: [{ type: 'text', text: 'Hello' }], source: { kind: 'user' } }),
+      createToolResultMessage({
+        callId: ToolCallId('call-step'),
+        content: [{ type: 'text', text: 'tool result' }],
+        isError: false,
+      }),
+    ],
+    ...sessionId === undefined ? {} : { sessionId },
+  }
+}
+
+/**
+ * The host's automatic session-title call, as its `frameMessages` helper
+ * builds it: one user message framing the human messages as JSON. This exact
+ * prefix is the only marker that survives the plugin's own shim translation.
+ */
+function titleRequest(sessionId?: Session): GenerateOptions {
+  return {
+    provider: 'qoder-official',
+    model: 'cmodel',
+    messages: [createUserMessage({
+      content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"Hello"}]' }],
+      source: { kind: 'user' },
+    })],
+    ...sessionId === undefined ? {} : { sessionId },
+  }
+}
+
 async function drain(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
   const chunks: StreamChunk[] = []
   for await (const chunk of transport.stream(request(sessionId))) chunks.push(chunk)
+  return chunks
+}
+
+/** Run one continuation step of the current turn. */
+async function drainStep(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(stepRequest(sessionId))) chunks.push(chunk)
+  return chunks
+}
+
+/** Run one arbitrary generate call — a step with its own signal, for aborts. */
+async function drainWith(transport: QoderTransport, options: GenerateOptions): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(options)) chunks.push(chunk)
+  return chunks
+}
+
+/** Run the host's automatic session-title call. */
+async function drainTitle(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(titleRequest(sessionId))) chunks.push(chunk)
   return chunks
 }
 
@@ -185,6 +297,38 @@ async function drainLikeHttp(transport: QoderTransport, sessionId?: Session): Pr
 }
 
 const SESSION = 'session-1' as Session
+
+/**
+ * The transport's pin table, as a value a test can assert on.
+ *
+ * The pin is the transport's own bookkeeping — there is no public accessor for
+ * it, and there should not be: it is not part of the transport's contract. A
+ * test still needs to distinguish "counted on the account that served" from
+ * "counted on the account the request was pointed at", and the counters are the
+ * only observable difference, so read the private table through a cast.
+ */
+function pinSnapshot(transport: QoderTransport): Array<{ id: string; requests: number; rounds: number }> {
+  const table = (transport as unknown as {
+    sessionPins: Map<string, { id: string; requests: number; rounds: number }>
+  }).sessionPins
+  return Array.from(table.values(), pin => ({ id: pin.id, requests: pin.requests, rounds: pin.rounds }))
+}
+
+/** Poll until `predicate` holds; a staged interleaving must never hang a test. */
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3_000
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+    await new Promise<void>(resolve => setTimeout(resolve, 5))
+  }
+}
+
+function pendingSnapshot(transport: QoderTransport): Array<[string, { accountId: string }]> {
+  const table = (transport as unknown as {
+    pendingTurns: Map<string, { accountId: string }>
+  }).pendingTurns
+  return Array.from(table.entries())
+}
 
 // ---------------------------------------------------------------------------
 
@@ -327,6 +471,76 @@ describe('QoderTransport session stickiness', () => {
     expect(failingHarness.upstream.chatPats.slice(before)).toEqual([BETA.pat, ALPHA.pat])
   })
 
+  /**
+   * A turn is the user's message through its final answer, tool steps
+   * included, so a bound reached MID-TURN must wait for the next turn. Before
+   * the fix, "rounds" counted each completed model stream (each step), so a
+   * multi-step turn rotated its session halfway through.
+   */
+  it('keeps a multi-step turn on one account even after the round bound is reached mid-turn', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1: Alpha, one round spent
+    await drainStep(transport, SESSION) // turn 1, step 2: same account
+    await drainStep(transport, SESSION) // turn 1, step 3: same account
+    await drain(transport, SESSION) // turn 2 opens: the bound is reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('counts one round per turn regardless of how many steps it has', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 2, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1 → round 1
+    await drainStep(transport, SESSION)
+    await drainStep(transport, SESSION)
+    await drain(transport, SESSION) // turn 2 → round 2
+    await drain(transport, SESSION) // turn 3: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('does not let the automatic session-title request pin or spend any bound', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drainTitle(transport, SESSION) // bookkeeping: no pin, no round
+    await drain(transport, SESSION) // turn 1: Alpha, round 1 spent
+    await drain(transport, SESSION) // turn 2: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('waits for the next turn to rotate on the request bound, even when steps cross it', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 0, requests: () => 2, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1: requests = 1
+    await drainStep(transport, SESSION) // turn 1, step 2: requests = 2
+    await drainStep(transport, SESSION) // turn 1, step 3: requests = 3 — bound crossed mid-turn, no rotation
+    await drain(transport, SESSION) // turn 2 opens: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
   it('rotates on the request bound even when no round has been completed', async () => {
     const poolState = pool([ALPHA, BETA], ALPHA)
     const { transport, upstream } = harness({
@@ -398,6 +612,85 @@ describe('QoderTransport session stickiness', () => {
     ])
   })
 
+  /**
+   * A request dispatched to another account belongs to the account that ran it.
+   *
+   * The pin names the account the CONVERSATION is using, not the one it was
+   * pointed at before dispatch. When the guard reports the pinned account busy,
+   * the request starts elsewhere; leaving the pin behind would keep the skipped
+   * account's request/round counters growing for work it never did, and the next
+   * step of the same turn would walk straight back into the occupied account —
+   * the exact collision the guard exists to avoid.
+   */
+  it('moves the session pin to the account that serves after a busy skip', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseHolder: () => void = () => {}
+    const holderGate = new Promise<Response>((resolve) => {
+      releaseHolder = (): void => resolve(accepted('holder'))
+    })
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: async (pat, call) => pat === ALPHA.pat && call === 2 ? await holderGate : accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // request 1: Alpha serves, the session pins there
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 1, rounds: 1 }])
+
+    // A concurrent request WITHOUT a session holds Alpha's traffic slot.
+    const holder = drain(transport)
+    await waitFor(() => upstream.chatPats.length === 2, 'the holder to occupy Alpha')
+
+    // Request 2 of the session: pinned Alpha is busy, so it starts on Beta —
+    // and the session must follow, because Beta is the account doing the work.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+    // The next step of the same turn stays on Beta instead of retrying the
+    // occupied account.
+    await drainStep(transport, SESSION)
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+    // Still not a failover: nothing failed, so nothing is announced or adopted.
+    expect(poolState.switches).toEqual([])
+    expect(poolState.adopted).toEqual([])
+
+    releaseHolder()
+    await holder
+  })
+
+  /**
+   * The same rule for a cooldown, which (unlike busy) IS a verdict on the
+   * account: the session follows the serving account and the host is told to
+   * adopt it silently, but no failover is reported.
+   */
+  it('moves the session pin to the account that serves after a cooling skip', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: (pat, call) => {
+        // Alpha's second chat is a rate limit: the ledger cools it and the walk
+        // recovers on Beta.
+        if (pat === ALPHA.pat && call === 2) return rateLimited()
+        return accepted('from-any')
+      },
+    })
+
+    await drain(transport, SESSION) // request 1: Alpha serves, one round
+    await drain(transport) // sessionless request: Alpha 429 → Beta serves, Alpha cools
+    expect(poolState.switches.map(info => [info.fromId, info.toId])).toEqual([[ALPHA.id, BETA.id]])
+
+    // Request 2 of the session: the pinned Alpha is cooling, so it starts on
+    // Beta and the session follows.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+    // Cooling is a real verdict on the account, so the move is adopted — still
+    // silently: a dispatch fact is not a failover.
+    expect(poolState.adopted).toEqual([{ fromId: ALPHA.id, toId: BETA.id, reason: 'cooling' }])
+    expect(poolState.switches).toHaveLength(1)
+    await drainStep(transport, SESSION)
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+  })
+
   it('keeps the session where it is when the pool has nobody to rotate to', async () => {
     const poolState = pool([ALPHA], ALPHA)
     const { transport, upstream } = harness({
@@ -431,6 +724,318 @@ describe('QoderTransport session stickiness', () => {
     // active account. Pinning under a synthetic id would silently make every
     // sessionless caller share one account.
     expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('does not let a slow pin re-resolution overwrite a newer rotation', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    /*
+     * A continuation re-reads its pinned account through `accountById`, and that
+     * lookup is held open. While it is in flight a new turn rotates the session
+     * to Beta; the stale lookup must then not write Alpha back over Beta.
+     */
+    let releaseLookup: () => void = () => {}
+    const lookupGate = new Promise<void>((resolve) => { releaseLookup = resolve })
+    let held = false
+    poolState.hooks.accountById = async (id) => {
+      const account = [ALPHA, BETA].find(candidate => candidate.id === id)
+      if (account === undefined) return undefined
+      if (account.id === ALPHA.id && !held) {
+        held = true
+        await lookupGate
+      }
+      return account
+    }
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-either'),
+    })
+
+    // The turn opens on Alpha and completes one round, spending its bound.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 1, rounds: 1 }])
+
+    // The next step of that turn re-resolves the pin and is held inside the
+    // lookup, before it can read which account the pin names.
+    const continuation = drainStep(transport, SESSION)
+    await waitFor(() => held, 'the continuation to reach its pin lookup')
+
+    // A new turn arrives while the continuation is held. It opens, finds the
+    // bound spent, and rotates the session to Beta.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+
+    // Releasing the stale lookup must not overwrite the rotation: the
+    // continuation re-reads the pin instead of writing back what it saw first.
+    releaseLookup()
+    await continuation
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+    expect(upstream.chatPats.at(-1)).toBe(BETA.pat)
+  })
+
+  /**
+   * A turn that stopped at a tool call is not a finished round.
+   *
+   * An opening request that ends in `tool-calls` only ASKED for a tool; the
+   * answer the round bound counts has not been produced yet. Counting that step
+   * spends the bound on a turn that never finished, so the session rotates away
+   * between a tool call and the result the turn was waiting for.
+   */
+  it('does not count a turn that stopped at a tool call as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+
+    // Turn 1 opens and stops at its tool call: unfinished, so it spends nothing,
+    // and the next turn must open on the same account.
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
+  })
+
+  /**
+   * ...while a turn that runs its tools through to the final answer spends
+   * exactly one round, credited when that answer arrives.
+   */
+  it('counts one round for a tool-using turn when its final answer arrives', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: (_pat, call) => call === 3 ? accepted('done') : toolCalls(),
+    })
+
+    await drain(transport, SESSION) // step 1: a tool call, no round yet
+    await drainStep(transport, SESSION) // step 2: another tool call
+    await drainStep(transport, SESSION) // step 3: the final answer — round 1
+    await drain(transport, SESSION) // turn 2: the bound is spent, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('counts a truncated final answer as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => maxTokens('cut off'),
+    })
+
+    await drain(transport, SESSION)
+    await drain(transport, SESSION)
+
+    // `max-tokens` is a finished answer, just a truncated one: the account
+    // served the conversation, so the bound is spent and turn 2 moves on.
+    expect(upstream.chatPats).toEqual([ALPHA.pat, BETA.pat])
+  })
+
+  it('does not count an aborted turn as a completed round', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+    const controller = new AbortController()
+
+    await drain(transport, SESSION) // turn 1 opens and stops at its tool call
+    controller.abort()
+    await expect(drainWith(transport, { ...stepRequest(SESSION), signal: controller.signal })).rejects.toThrow()
+    expect(pendingSnapshot(transport)).toEqual([])
+
+    // The turn never produced an answer, so it spends no round and the next
+    // turn still opens on Alpha.
+    await drain(transport, SESSION)
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
+  })
+
+  it('does not let a delayed pre-aborted continuation erase a newer turn', async () => {
+    const poolState = pool([ALPHA], ALPHA)
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: (_pat, call) => call === 2 ? accepted('new final') : toolCalls(),
+    })
+    const controller = new AbortController()
+    controller.abort()
+    const oldContinuation = transport.stream({ ...stepRequest(SESSION), signal: controller.signal })
+
+    await drain(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    await expect((async () => {
+      for await (const _chunk of oldContinuation) { /* consume the pre-abort */ }
+    })()).rejects.toThrow()
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    await drainStep(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 2, rounds: 1 }])
+  })
+
+  it('binds opening turn identity before account resolution', async () => {
+    const poolState = pool([ALPHA], ALPHA)
+    let releaseOldResolution: () => void = () => {}
+    const oldResolution = new Promise<void>((resolve) => { releaseOldResolution = resolve })
+    let resolutions = 0
+    poolState.hooks.activeAccount = async () => {
+      resolutions += 1
+      if (resolutions === 1) await oldResolution
+      return ALPHA
+    }
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: (_pat, call) => call === 1 ? toolCalls() : accepted('answer'),
+    })
+
+    const oldOpening = drain(transport, SESSION)
+    await waitFor(() => resolutions === 1, 'the old opening to hold account resolution')
+    await drain(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    releaseOldResolution()
+    await oldOpening
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    await drainStep(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: ALPHA.id, requests: 3, rounds: 1 }])
+  })
+
+  it('does not let a delayed failover reset a newer pin and its counters', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseFirstSwitch: () => void = () => {}
+    const firstSwitch = new Promise<void>((resolve) => { releaseFirstSwitch = resolve })
+    let releaseOldAnswer: () => void = () => {}
+    const oldAnswer = new Promise<Response>((resolve) => { releaseOldAnswer = (): void => resolve(accepted('old')) })
+    let switches = 0
+    poolState.hooks.switched = async (info) => {
+      poolState.switches.push(info)
+      switches += 1
+      if (switches === 1) await firstSwitch
+    }
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: async (pat, call) => {
+        if (pat === ALPHA.pat) return unavailable()
+        if (call === 2) return await oldAnswer
+        return accepted('new')
+      },
+    })
+
+    const oldRequest = drain(transport, SESSION)
+    await waitFor(() => switches === 1, 'the old failover to hold')
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+
+    releaseFirstSwitch()
+    await waitFor(() => upstream.chatPats.filter(pat => pat === BETA.pat).length === 2, 'the old request to reach Beta')
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+
+    releaseOldAnswer()
+    await oldRequest
+  })
+
+  it('does not adopt a newer pin as the baseline for an older failed attempt', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseOldFailure: () => void = () => {}
+    const oldFailure = new Promise<Response>((resolve) => { releaseOldFailure = (): void => resolve(unavailable()) })
+    let releaseOldAnswer: () => void = () => {}
+    const oldAnswer = new Promise<Response>((resolve) => { releaseOldAnswer = (): void => resolve(accepted('old')) })
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: async (pat, call) => {
+        if (pat === ALPHA.pat) return await oldFailure
+        if (call === 2) return await oldAnswer
+        return accepted('new')
+      },
+    })
+
+    const oldRequest = drain(transport, SESSION)
+    await waitFor(() => upstream.chatPats.length === 1, 'the old attempt to hold its failure')
+    // Alpha is still occupied, so the newer turn is served by Beta and pins it.
+    await drain(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 1, rounds: 1 }])
+
+    releaseOldFailure()
+    await waitFor(() => upstream.chatPats.filter(pat => pat === BETA.pat).length === 2, 'the old failover to reach Beta')
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+
+    releaseOldAnswer()
+    await oldRequest
+  })
+
+  it('does not let an old final answer erase a newer tool-using turn', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    let releaseOldAnswer: () => void = () => {}
+    const oldAnswer = new Promise<Response>((resolve) => { releaseOldAnswer = (): void => resolve(accepted('old')) })
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 5, requests: () => 0, minutes: () => 0 },
+      chat: async (pat, call) => {
+        if (pat === ALPHA.pat) return await oldAnswer
+        return call === 1 ? toolCalls() : accepted('new final')
+      },
+    })
+
+    const oldRequest = drain(transport, SESSION)
+    await waitFor(() => upstream.chatPats.length === 1, 'the old turn to hold Alpha')
+    await drain(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: BETA.id }]])
+
+    releaseOldAnswer()
+    await oldRequest
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: BETA.id }]])
+    await drainStep(transport, SESSION)
+    expect(pinSnapshot(transport)).toEqual([{ id: BETA.id, requests: 2, rounds: 1 }])
+  })
+
+  it('clears a pending turn when its continuation throws', async () => {
+    const poolState = pool([ALPHA], ALPHA)
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: (_pat, call) => {
+        if (call === 2) throw new TypeError('socket reset')
+        return toolCalls()
+      },
+    })
+
+    await drain(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    await expect(drainStep(transport, SESSION)).rejects.toThrow('Qoder transport request failed.')
+    expect(pendingSnapshot(transport)).toEqual([])
+  })
+
+  it('clears a pending turn when its pinned account disappears', async () => {
+    const poolState = pool([ALPHA], ALPHA)
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+
+    await drain(transport, SESSION)
+    poolState.hooks.accountById = async () => undefined
+    await drainStep(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([])
+  })
+
+  it('clears a pending turn when stickiness is disabled', async () => {
+    const poolState = pool([ALPHA], ALPHA)
+    let enabled = true
+    const { transport } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => enabled, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => toolCalls(),
+    })
+
+    await drain(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([[SESSION, { accountId: ALPHA.id }]])
+    enabled = false
+    await drainStep(transport, SESSION)
+    expect(pendingSnapshot(transport)).toEqual([])
   })
 
   it('evicts the oldest session once the pin table is full', async () => {

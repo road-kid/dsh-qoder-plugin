@@ -178,16 +178,16 @@ const POLL_MINUTES_MAX = 1440
  * fields existed — means, so the controls render the behaviour that is actually
  * in force rather than zeroed-out inputs.
  */
-const QUEUE_WAIT_ATTEMPTS_DEFAULT = 0
+const QUEUE_WAIT_ATTEMPTS_DEFAULT = 5
 const QUEUE_WAIT_ATTEMPTS_MAX = 10
 const QUEUE_WAIT_SECONDS_DEFAULT = 30
 const QUEUE_WAIT_SECONDS_MIN = 1
 const QUEUE_WAIT_SECONDS_MAX = 300
-const STICKINESS_ROUNDS_DEFAULT = 3
+const STICKINESS_ROUNDS_DEFAULT = 0
 const STICKINESS_ROUNDS_MAX = 100
-const STICKINESS_REQUESTS_DEFAULT = 200
+const STICKINESS_REQUESTS_DEFAULT = 0
 const STICKINESS_REQUESTS_MAX = 10_000
-const STICKINESS_MINUTES_DEFAULT = 180
+const STICKINESS_MINUTES_DEFAULT = 240
 const STICKINESS_MINUTES_MAX = 1440
 /** The routing strategies the host accepts; 'save-order' is the default. */
 type QoderRoutingStrategy = 'save-order' | 'custom'
@@ -532,6 +532,15 @@ function UpstreamNoticeBlock({ notice, t }: {
   const retrySeconds = typeof notice.retryAfterMs === 'number' && Number.isFinite(notice.retryAfterMs)
     ? Math.max(1, Math.round(notice.retryAfterMs / 1000))
     : undefined
+  // A completed transport wait is direct evidence and supersedes the initial
+  // retry advice (upstream waitTime may have lengthened it). The advice remains
+  // the fallback only for a host-driven retry inferred from the elapsed clock.
+  const waits = typeof notice.waits === 'object' && notice.waits !== null ? notice.waits : undefined
+  const measuredWaitSeconds = waits !== undefined && waits.attempts > 0 && Number.isFinite(waits.totalWaitMs)
+    ? Math.max(1, Math.round(waits.totalWaitMs / 1000))
+    : undefined
+  const waitedSeconds = measuredWaitSeconds ?? retrySeconds
+  const configuredWait = measuredWaitSeconds !== undefined && waits?.lastBasis?.source === 'configured'
   const at = typeof notice.at === 'number' && Number.isFinite(notice.at) ? notice.at : undefined
   const occurrences = typeof notice.occurrences === 'number' && Number.isFinite(notice.occurrences)
     ? notice.occurrences
@@ -551,9 +560,11 @@ function UpstreamNoticeBlock({ notice, t }: {
       {notice.waited
         ? (
           <p className="qdp-body">
-            {retrySeconds === undefined
+            {waitedSeconds === undefined
               ? t('upstreamNoticeWaitedNoDelay')
-              : t('upstreamNoticeWaited', { seconds: retrySeconds })}
+              : configuredWait
+                ? t('upstreamNoticeConfiguredWaited', { seconds: waitedSeconds })
+                : t('upstreamNoticeWaited', { seconds: waitedSeconds })}
           </p>
         )
         : (retrySeconds === undefined ? null : <p className="qdp-body">{t('upstreamNoticeRetry', { seconds: retrySeconds })}</p>)}

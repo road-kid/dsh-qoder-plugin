@@ -13,6 +13,7 @@
  * @module dsh-qoder-plugin
  */
 
+import { dirname, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -333,16 +334,23 @@ export interface Config {
    */
   stickinessEnabled?: boolean
   /**
-   * Conversation stickiness: how many completed rounds one account serves
-   * before the session moves to the next account. 0 disables round counting.
+   * Conversation stickiness: how many completed turns one account serves
+   * before the session moves to the next account. A turn is one user message
+   * through its final answer, tool-call steps included, and rotation only
+   * happens between turns. 0 disables round counting.
    */
   stickinessRounds?: number
   /**
    * Conversation stickiness: how many requests one account serves before the
-   * session moves to the next account. 0 disables request counting.
+   * session moves to the next account. Every model call counts; the bound is
+   * examined only between turns. 0 disables request counting.
    */
   stickinessRequests?: number
-  /** Conversation stickiness: how many minutes one account serves. 0 disables. */
+  /**
+   * Conversation stickiness: how many minutes one account serves before the
+   * session moves to the next account, examined only between turns.
+   * 0 disables.
+   */
   stickinessMinutes?: number
 }
 
@@ -492,10 +500,10 @@ const QUEUE_WAIT_ENABLED_FIELD = volatileField(z.boolean()
   .description('排队重试总开关：关闭后上游排队直接报错，不再等待重试（默认开启）'))
 /** Queue wait retry count: 0 = report at once, 1..10 retries. */
 const QUEUE_WAIT_ATTEMPTS_FIELD = volatileField(z.number()
-  .default(0)
+  .default(5)
   .min(0)
   .max(10)
-  .description('上游排队时的重试次数（0 = 不重试，最多 10 次）'))
+  .description('上游排队时的重试次数（0 = 不重试，默认 5 次，最多 10 次）'))
 /** Queue wait seconds per retry: 1..300. */
 const QUEUE_WAIT_SECONDS_FIELD = volatileField(z.number()
   .default(30)
@@ -515,24 +523,24 @@ const ROUTING_ORDER_FIELD = volatileField(z.array(z.string()).default([])
 const STICKINESS_ENABLED_FIELD = volatileField(z.boolean()
   .default(true)
   .description('会话粘性总开关：关闭后不再保持同一账号，每次请求都重新选择账号'))
-/** Stickiness rounds: 0 disables. Default 3 — three rounds per account. */
+/** Stickiness rounds: 0 disables. Default 0 — requests and minutes still bound. */
 const STICKINESS_ROUNDS_FIELD = volatileField(z.number()
-  .default(3)
+  .default(0)
   .min(0)
   .max(100)
-  .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号（0 = 不限制）'))
-/** Stickiness requests: 0 disables. Default 200. */
+  .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号；一轮 = 一次用户提问到回答完成（含工具调用步骤），换号只在两轮之间发生（0 = 不限制）'))
+/** Stickiness requests: 0 disables. Default 0 — minutes still bound. */
 const STICKINESS_REQUESTS_FIELD = volatileField(z.number()
-  .default(200)
+  .default(0)
   .min(0)
   .max(10_000)
-  .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号（0 = 不限制）'))
-/** Stickiness minutes: 0 disables. Default 180. */
+  .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号；换号只在两轮之间发生（0 = 不限制）'))
+/** Stickiness minutes: 0 disables. Default 240. */
 const STICKINESS_MINUTES_FIELD = volatileField(z.number()
-  .default(180)
+  .default(240)
   .min(0)
   .max(1440)
-  .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号（0 = 不限制）'))
+  .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号；换号只在两轮之间发生（0 = 不限制）'))
 
 export const Config: z<Config> = z.object({
   probeConsent: PROBE_CONSENT_FIELD,
@@ -659,6 +667,16 @@ function readConfig(config: Config | undefined): Config {
 interface VariantRuntime {
   variant: QoderVariant
   store: QoderCredentialStore
+  /**
+   * The data root this runtime's catalog bookkeeping is scoped to.
+   *
+   * The identity and live-fetch caches outlive a fiber on purpose — a settings
+   * write re-applies the plugin — but a module-level map keyed by variant id
+   * alone would let one installation answer for another (two profiles, or two
+   * temporary roots in one process). Normalized from the credential file's
+   * directory so a custom store path is isolated correctly too.
+   */
+  cacheScope: string
   client: QoderUpstreamClient
   transport: QoderTransport
   catalog: QoderCatalog
@@ -1120,11 +1138,16 @@ function createVariantRuntime(
   config: Config,
   variant: QoderVariant,
   current: () => Config,
-  identityOf: (variantId: string) => string | undefined,
+  identityOf: (variantId: string, cacheScope: string) => string | undefined,
   pool: () => readonly VariantRuntime[],
   health: QoderAccountHealthTracker,
 ): VariantRuntime {
   const store = new QoderCredentialStore({ variant, logger: ctx.logger })
+  // One normalization of "which installation this is", shared by every catalog
+  // cache key below: the directory holding this variant's credential file. Read
+  // from the store rather than the environment so a custom `ownPath` (a
+  // non-default profile root) is still isolated as its own scope.
+  const cacheScope = resolve(dirname(store.ownAuthPath()))
   // The self-heal's auto-refresh record, surfaced on the card. Per variant:
   // each region's transport reports its own refreshes.
   let jobTokenRefreshedAt: number | undefined
@@ -1144,6 +1167,10 @@ function createVariantRuntime(
    * it has come back within the same outage window.
    */
   let queueNotice: QoderWebUpstreamNotice | undefined
+  // Host-clock evidence belongs to one conversation. The outage counter stays
+  // global, but another session's first refusal must not inherit this session's
+  // elapsed retry window and claim a wait that never happened there.
+  let queueNoticeSessionId: string | undefined
   /** The last automatic account switch, for the card. */
   let failoverAt: number | undefined
   let failoverReason: string | undefined
@@ -1331,7 +1358,7 @@ function createVariantRuntime(
         emitUpstreamNotice(failoverNoticeText(info.reason), info.sessionId)
       },
     },
-    onUpstreamQueue: (facts, accountId, sessionId) => {
+    onUpstreamQueue: (facts, accountId, sessionId, waits) => {
       const at = Date.now()
       // Health is per account and outlives one notice: recorded before the
       // document-wide notice, which is replaced on every answer.
@@ -1350,16 +1377,25 @@ function createVariantRuntime(
       const advisedMs = facts.retryAfterSeconds === undefined || facts.retryAfterSeconds <= 0
         ? undefined
         : facts.retryAfterSeconds * 1000
-      // Elapsed time is the only evidence this seam can have for the wait
-      // sentence: the transport refuses to sit the upstream's window out (that
-      // would hold the stream open) and the harness retries the turn itself, so
-      // what is left is the clock, and an accepted chat clears the record —
-      // meaning an answer that arrives at least one advised window after the
-      // previous one can only describe a user who really waited that long and
-      // was refused again. A shorter gap supports no such claim, and `waited:
-      // true` there would print "已按上游建议等待 30 秒仍不可服务" to someone
-      // whose wait was seconds.
-      const waited = sameOutage && advisedMs !== undefined && at - previous.at >= advisedMs
+      // The transport's own record, when it reported one, is the only hard
+      // evidence that the PLUGIN waited — a configured fallback has no advised
+      // window to compare against, so the clock below used to describe it as
+      // "never waited" while the request had in fact sat for the whole setting.
+      // It says nothing about the host's own retry cycle, though: a turn the
+      // harness retried after a 30s advise window waited far longer than the
+      // transport, which never sat the window out — that is what the elapsed
+      // time below still reports.
+      const transportWaited = waits !== undefined && waits.attempts > 0
+      // Elapsed time is the remaining evidence for the wait sentence: the
+      // harness retries the turn itself, so an answer that arrives at least one
+      // advised window after the previous one can only describe a user who
+      // really waited that long and was refused again. A shorter gap supports no
+      // such claim, and `waited: true` there would print "已按上游建议等待 30 秒
+      // 仍不可服务" to someone whose wait was seconds.
+      const waitedByHostClock = sameOutage && sessionId === queueNoticeSessionId
+        && advisedMs !== undefined && at - previous.at >= advisedMs
+      const waited = transportWaited || waitedByHostClock
+      queueNoticeSessionId = sessionId
       queueNotice = {
         kind: facts.serviceAvailable === false ? 'unavailable' : 'queued',
         ...facts.upstreamMessage === undefined ? {} : { upstreamMessage: facts.upstreamMessage },
@@ -1367,11 +1403,16 @@ function createVariantRuntime(
         waited,
         at,
         occurrences: sameOutage ? previous.occurrences + 1 : 1,
+        ...waits === undefined ? {} : { waits },
       }
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
       )
-      emitUpstreamNotice(formatQueueNotice(facts, { waited, occurrences: queueNotice.occurrences }), sessionId)
+      emitUpstreamNotice(formatQueueNotice(facts, {
+        waited,
+        occurrences: queueNotice.occurrences,
+        ...waits === undefined ? {} : { waits },
+      }), sessionId)
     },
     onQueueWait: (facts, accountId, wait, sessionId) => {
       // Progress, not the explanation: this row is printed when the wait
@@ -1429,20 +1470,24 @@ function createVariantRuntime(
       // The master switch collapses the count to zero rather than hiding the
       // two bounds: the transport's budget is the ONE place that decides how
       // long a caller waits, so "off" has to be visible there and nowhere else.
-      attempts: () => (current().queueWaitEnabled === false ? 0 : current().queueWaitAttempts ?? 0),
+      attempts: () => (current().queueWaitEnabled === false ? 0 : current().queueWaitAttempts ?? 5),
       seconds: () => current().queueWaitSeconds ?? 30,
     },
     stickiness: {
       // How long one account serves a conversation before the session moves to
       // the next account. All three are bounds: whichever is reached first
-      // moves the conversation on, so a single big turn cannot pin a session to
-      // one account for longer than the round or request bound allows.
+      // moves the conversation on — but they are only EXAMINED when a new turn
+      // opens, never between the steps of the turn already running. A single
+      // big turn therefore serves entirely on one account and may cross the
+      // round or request bound, which then takes effect at the turn after it:
+      // switching mid-turn would lose that turn's context (and its tool
+      // results) to an account that never saw the prompt.
       // The master switch is read live too: turning it off means no account
       // is ever pinned, and the three bounds stop mattering until it returns.
       enabled: () => current().stickinessEnabled !== false,
-      rounds: () => current().stickinessRounds ?? 3,
-      requests: () => current().stickinessRequests ?? 200,
-      minutes: () => current().stickinessMinutes ?? 180,
+      rounds: () => current().stickinessRounds ?? 0,
+      requests: () => current().stickinessRequests ?? 0,
+      minutes: () => current().stickinessMinutes ?? 240,
     },
     routing: {
       // The user's own order, spanning both variants, with save order as the
@@ -1502,11 +1547,12 @@ function createVariantRuntime(
     // Observations are per account: the service reads and writes its records
     // against this identity, so one token's detected levels never answer for
     // another's, and an in-flight sweep cannot store under a new token.
-    account: () => identityOf(variant.id),
+    account: () => identityOf(variant.id, cacheScope),
   })
   return {
     variant,
     store,
+    cacheScope,
     client,
     transport,
     catalog,
@@ -1802,14 +1848,14 @@ const DEFAULT_FOR_FIELD: Partial<Record<keyof Config, unknown>> = (() => {
       quotaPollMs: 300_000,
       autoFailoverEnabled: true,
       queueWaitEnabled: true,
-      queueWaitAttempts: 0,
+      queueWaitAttempts: 5,
       queueWaitSeconds: 30,
       routingStrategy: 'save-order',
       routingOrder: [],
       stickinessEnabled: true,
-      stickinessRounds: 3,
-      stickinessRequests: 200,
-      stickinessMinutes: 180,
+      stickinessRounds: 0,
+      stickinessRequests: 0,
+      stickinessMinutes: 240,
     }
   }
   return out
@@ -1975,6 +2021,27 @@ const lastIdentities = new Map<string, string>()
 const lastLiveFetchAt = new Map<string, number>()
 
 /**
+ * The cache key for one variant's catalog identity, scoped to a data root.
+ *
+ * Both maps above are module-level so they survive the settings write that
+ * re-applies the plugin — but "the plugin" is per data root, and one process can
+ * host more than one (two profiles, or two temporary roots in a test run).
+ * Keying by variant id alone let one root's last account and live-fetch time
+ * answer for another's: a second root with the same PAT then skipped its own
+ * catalog fetch, and an account switch in one root cleared another root's probe
+ * observations. The scope is the directory of the credential file (see
+ * `VariantRuntime.cacheScope`), so a custom store path stays isolated too.
+ */
+function identityCacheKey(cacheScope: string, variantId: string): string {
+  return `${cacheScope}\0${variantId}`
+}
+
+/** The same scoping rule for the live-fetch record, keyed by account. */
+function liveFetchCacheKey(cacheScope: string, identity: string): string {
+  return `${cacheScope}\0${identity}`
+}
+
+/**
  * Start both variants: their loopback endpoints, the `qoder` and
  * `qoder-global` providers, their configuration cards, and their
  * credential-driven catalog lifecycles.
@@ -2029,7 +2096,7 @@ export function apply(ctx: Context, config: Config): void {
       config,
       variant,
       () => current(),
-      id => lastIdentities.get(id),
+      (variantId, cacheScope) => lastIdentities.get(identityCacheKey(cacheScope, variantId)),
       pool,
       health,
     ))
@@ -2124,8 +2191,8 @@ export function apply(ctx: Context, config: Config): void {
    * @param identity - the account now in effect, or `undefined` when signed out.
    */
   const adoptIdentity = (runtime: VariantRuntime, identity: string | undefined): void => {
-    const id = runtime.variant.id
-    const known = lastIdentities.get(id)
+    const key = identityCacheKey(runtime.cacheScope, runtime.variant.id)
+    const known = lastIdentities.get(key)
     // "Same identity" may only short-circuit when THIS runtime has already
     // adopted: a fresh catalog starts hidden (`createVariantRuntime` sets
     // `visible=false`), and DSH 0.1.7's configuration write hot-reloads the
@@ -2137,8 +2204,8 @@ export function apply(ctx: Context, config: Config): void {
     // succeeds, and the refresh button routes through this same function.
     if (known === identity && runtime.catalog.isVisible()) return
     const hadCredential = known !== undefined
-    if (identity === undefined) lastIdentities.delete(id)
-    else lastIdentities.set(id, identity)
+    if (identity === undefined) lastIdentities.delete(key)
+    else lastIdentities.set(key, identity)
     // Any change of identity invalidates in-flight work and recorded answers.
     runtime.catalogGeneration += 1
     runtime.inflightFetch?.controller.abort()
@@ -2903,7 +2970,7 @@ export function apply(ctx: Context, config: Config): void {
       runtime.lastFetchAtMs = Date.now()
       // Shared across fiber reloads: a 0.1.7 settings write re-applies this
       // plugin, and the new instance must not re-fetch what was just fetched.
-      lastLiveFetchAt.set(identity, runtime.lastFetchAtMs)
+      lastLiveFetchAt.set(liveFetchCacheKey(runtime.cacheScope, identity), runtime.lastFetchAtMs)
       runtime.catalog.set([...models])
       runtime.catalogSource = 'live'
       runtime.catalogFetchedAtMs = runtime.client.lastCatalog?.fetchedAtMs ?? Date.now()
@@ -2914,7 +2981,7 @@ export function apply(ctx: Context, config: Config): void {
       // swallowed: the live catalog is already serving, and `fetchCatalog`
       // promises its callers that it never rejects (an escaped rejection from a
       // background sweep would terminate the host).
-      if (lastIdentities.get(runtime.variant.id) === identity) {
+      if (lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id)) === identity) {
         try {
           runtime.savedCatalogs.set(identity, {
             source: runtime.client.lastCatalog?.source ?? 'unknown',
@@ -2966,7 +3033,7 @@ export function apply(ctx: Context, config: Config): void {
     }
 
     const identity = credentialIdentity(credential)
-    const known = lastIdentities.get(runtime.variant.id)
+    const known = lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id))
     if (known === identity && runtime.catalog.isVisible()) {
       // Same account, already showing something. One case still needs a fetch:
       // an earlier attempt failed, so the group is on the fallback roster and
@@ -2980,7 +3047,7 @@ export function apply(ctx: Context, config: Config): void {
       // `lastFetchAtMs` starts at 0 — without the shared record every write
       // would immediately re-fetch both variants from upstream.
       const stale = runtime.catalogSource !== 'live'
-      const fetchedAt = lastLiveFetchAt.get(identity) ?? 0
+      const fetchedAt = lastLiveFetchAt.get(liveFetchCacheKey(runtime.cacheScope, identity)) ?? 0
       const due = Date.now() - fetchedAt >= credentialPollMs() * CATALOG_RETRY_SWEEPS
       if (stale && due) await fetchCatalog(runtime, identity)
       return
@@ -3014,7 +3081,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (credential === undefined) return
     const identity = credentialIdentity(credential)
-    if (lastIdentities.get(runtime.variant.id) !== identity || !runtime.catalog.isVisible()) {
+    if (lastIdentities.get(identityCacheKey(runtime.cacheScope, runtime.variant.id)) !== identity || !runtime.catalog.isVisible()) {
       adoptIdentity(runtime, identity)
     }
   }))).then(() => {

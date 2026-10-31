@@ -22,7 +22,7 @@ import { QoderUsageReader } from './account-reader.ts'
 import { QoderCheckInService, type QoderCheckInResult } from './checkin.ts'
 import type { QoderAccountInfo } from '../account.ts'
 import type { QoderPooledAccount, QoderTransport, QoderTransportOptions } from './index.ts'
-import type { QoderQueueWaitBasis } from '../queue-notice.ts'
+import type { QoderQueueWaitBasis, QoderQueueWaitSummary } from '../queue-notice.ts'
 import { streamQoderChat } from './chat.ts'
 import type { CosyCredentials } from './wire/cosy.ts'
 import type { QoderWireMessage } from './wire/wire-types.ts'
@@ -77,6 +77,51 @@ const queueWaitJitterMs = 2_000
  */
 function sessionIdOf(options: GenerateOptions): string | undefined {
   return options.sessionId === undefined ? undefined : String(options.sessionId)
+}
+
+/**
+ * Whether one request is the host's automatic session-title call.
+ *
+ * The host derives a session title with a synthetic one-message request whose
+ * single user message is framed by its `frameMessages` helper (seen verbatim in
+ * the host build): the text is `Generate the session title from this JSON
+ * array of human messages:` (first title) or `Update the session title from
+ * this JSON object:` (title refresh) followed by the framed JSON. The message
+ * source marker the session log carries (`dsh-session-title-llm`) is stamped
+ * over by this plugin's own shim before the transport sees the request, so the
+ * text prefix is the only surviving signal.
+ *
+ * A title call is bookkeeping, not a turn: it must neither pin a session nor
+ * spend any stickiness bound, otherwise every new conversation burns one round
+ * and one request of its first account before the user's turn even starts.
+ */
+function isTitleRequest(options: GenerateOptions): boolean {
+  const messages = options.messages
+  if (messages.length !== 1) return false
+  const only = messages[0]
+  if (only === undefined || only.role !== 'user') return false
+  const blocks = only.content
+  if (blocks.length !== 1) return false
+  const block = blocks[0]
+  if (block === undefined || block.type !== 'text') return false
+  return block.text.startsWith('Generate the session title from this JSON array of human messages:')
+    || block.text.startsWith('Update the session title from this JSON object:')
+}
+
+/**
+ * Whether one request OPENS a new user turn rather than continuing one.
+ *
+ * The host runs one `generate` call per model step, and a turn's later steps
+ * arrive with the previous step's tool results appended — their LAST message is
+ * a tool result. The stickiness bounds are examined only at turn openings, and
+ * the round bound is credited at the turn's FINAL answer, which is what keeps a
+ * multi-step turn on one account: a bound reached mid-turn waits for the next
+ * turn instead of splitting the turn across accounts.
+ */
+function opensNewTurn(options: GenerateOptions): boolean {
+  const messages = options.messages
+  const last = messages[messages.length - 1]
+  return last === undefined || last.role !== 'tool'
 }
 
 /**
@@ -153,8 +198,9 @@ function penaltyKind(error: unknown): QoderAccountPenaltyKind {
  * The `finish` chunk is the single terminal signal of a stream, and it carries
  * a failure reason for the two kinds that did not produce an answer: an upstream
  * error and a caller abort. Everything else — `stop`, `tool-calls`, `max-tokens`
- * — means the conversation was served to the end, which is what the stickiness
- * round bound counts and what exonerates an account in the penalty ledger.
+ * — means the step was served to the end, which exonerates the account in the
+ * penalty ledger. Only `stop` and `max-tokens` are a turn's FINAL answer; see
+ * `noteTurnProgress` for why `tool-calls` must not credit a round yet.
  */
 function isServedFinish(chunk: StreamChunk): boolean {
   if (chunk.type !== 'finish') return false
@@ -176,6 +222,13 @@ function isServedFinish(chunk: StreamChunk): boolean {
  * that stored an absolute expiry could not start counting from the instant the
  * account actually took over the session.
  */
+interface TurnObservation {
+  /** Identity of the turn this request opened or continued. */
+  token?: object
+  /** Whether a terminal chunk already ran the finish bookkeeping. */
+  terminal: boolean
+}
+
 interface SessionPin {
   id: string
   pat: string
@@ -187,21 +240,37 @@ interface SessionPin {
   region?: QoderRegion | undefined
   /** Wall-clock instant this account took over the session. */
   pinnedAtMs: number
-  /** Conversations this account served to the end while holding the pin. */
+  /** Turns this account served through their final answer while pinning. */
   rounds: number
   /** Requests this account started while holding the pin. */
   requests: number
 }
 
 /**
+ * Outcome of one attempt to rotate a session pin.
+ *
+ * `stale` means another request changed (or dropped) this session's pin while
+ * this one was choosing the next account. The caller must re-read the pin, not
+ * write back a choice computed from a pin that no longer exists: the account
+ * just picked would otherwise be re-inserted under the counters of the account
+ * the session left.
+ */
+type PinRotation =
+  | { kind: 'moved'; account: QoderPooledAccount }
+  | { kind: 'none' }
+  | { kind: 'stale' }
+
+/**
  * Per-attempt bookkeeping handed from the account walk down into `attempt`.
  *
  * `emitted` says bytes have already left this transport, so a retry would
- * duplicate rather than recover. `onServed` is the answer to the other question
+ * duplicate rather than recover. `onFinish` is the answer to the other question
  * a walk asks: did this account finish a response? It has to be a callback
  * rather than a flag the walk checks afterwards, because the HTTP layer closes
  * the body stream at the terminal chunk instead of resuming the generator — see
  * `attempt` — so the walk's own code after `yield*` never runs in production.
+ * The chunk is passed through because only the finish REASON distinguishes a
+ * turn's final answer from a step that still owes a tool call.
  */
 interface AttemptState {
   /**
@@ -209,13 +278,16 @@ interface AttemptState {
    */
   emitted: boolean
   /**
-   * Called once when this attempt produced a finished ANSWER, at the terminal
-   * chunk. Optional so an ambient attempt with no pool walk can pass none.
+   * Called once for this attempt's terminal `finish` chunk, whatever it says: a
+   * served answer, an upstream failure or a caller abort. Optional so an ambient
+   * attempt with no pool walk can pass none.
    *
-   * Cleared (deleted) by `attempt` after the first call, so it is declared
-   * optional-but-assignable rather than merely absent.
+   * The chunk is passed because the outcomes are not the same bookkeeping: only
+   * a FINAL answer credits a stickiness round, while `tool-calls` means the turn
+   * simply continues. Cleared by `attempt` after the first call, so a misbehaving
+   * source that yields twice cannot credit anything twice.
    */
-  onServed?: (() => void) | undefined
+  onFinish?: ((chunk: StreamChunk) => void) | undefined
 }
 
 /**
@@ -228,6 +300,37 @@ interface AttemptState {
  */
 interface AttemptAttribution {
   accountId: string | undefined
+}
+
+/**
+ * One request's queue-wait budget AND its record of waits really completed.
+ *
+ * The budget half decides whether another wait may still happen; the record half
+ * is what the final notice quotes. They live in the same per-request object on
+ * purpose: a transport-wide "last wait" would let one request's wait be reported
+ * beside another request's failure, and a wait that was aborted mid-sleep is not
+ * a completed wait, so only `waitOutQueue` returning normally may add to it.
+ */
+interface QueueWaitLedger {
+  /** Waits still allowed for this request. */
+  waitsLeft: number
+  /** The budget this request started with. */
+  total: number
+  /** Waits this request actually completed. */
+  attempts: number
+  /** Sum of the completed waits, milliseconds. */
+  totalWaitMs: number
+  /** What drove the last completed wait. */
+  lastBasis: QoderQueueWaitBasis | undefined
+}
+
+/** The summary the host renders from: the ledger's completed-wait half. */
+function queueWaitSummary(ledger: QueueWaitLedger): QoderQueueWaitSummary {
+  return {
+    attempts: ledger.attempts,
+    totalWaitMs: ledger.totalWaitMs,
+    ...(ledger.lastBasis === undefined ? {} : { lastBasis: ledger.lastBasis }),
+  }
 }
 
 function aborted(message: string): QoderLlmError {
@@ -384,6 +487,20 @@ export class DefaultQoderTransport implements QoderTransport {
    * storage, ordered by Map insertion so the oldest pin is the one evicted.
    */
   private readonly sessionPins = new Map<string, SessionPin>()
+  /**
+   * The turns currently in flight, keyed by conversation, with the account that
+   * served their LATEST step.
+   *
+   * A turn that ends in `tool-calls` is not finished, so it earns no round until
+   * its final answer arrives — which may be several steps and one failover
+   * later. This record is what lets that final answer complete the turn it
+   * belongs to instead of looking like the first step of something new. It is
+   * dropped when the turn completes, when it dies without an answer, when a new
+   * turn supersedes it, and when its session loses its pin.
+   */
+  private readonly pendingTurns = new Map<string, { accountId: string }>()
+  /** Current turn identity per session; late requests may not mutate a newer turn. */
+  private readonly sessionTurns = new Map<string, object>()
   /**
    * The conversations whose self-heal exchanged a fresh job token and whose
    * retry has not been accepted yet, with the time each rotation happened.
@@ -562,7 +679,21 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   stream(options: GenerateOptions, model?: QoderCatalogModel): AsyncIterable<StreamChunk> {
-    return this.generate(options, model)
+    // Async-generator bodies do not run until the first next(). Bind the turn
+    // now, at stream creation, so delayed consumption cannot adopt a newer
+    // turn's identity (and an older opening cannot register after a newer one).
+    const sessionId = isTitleRequest(options) ? undefined : sessionIdOf(options)
+    const tracking = sessionId !== undefined && this.stickiness !== undefined && this.stickinessEnabled(this.stickiness)
+    let turnToken: object | undefined
+    if (tracking && sessionId !== undefined) {
+      if (opensNewTurn(options)) {
+        turnToken = {}
+        this.sessionTurns.set(sessionId, turnToken)
+      } else {
+        turnToken = this.sessionTurns.get(sessionId)
+      }
+    }
+    return this.generate(options, model, turnToken)
   }
 
   /**
@@ -718,9 +849,20 @@ export class DefaultQoderTransport implements QoderTransport {
 
   private async * generate(
     options: GenerateOptions,
-    model?: QoderCatalogModel,
+    model: QoderCatalogModel | undefined,
+    observedTurnToken: object | undefined,
   ): AsyncGenerator<StreamChunk> {
-    if (options.signal?.aborted) throw aborted('Request was aborted prior to generation.')
+    if (options.signal?.aborted) {
+      const sessionId = sessionIdOf(options)
+      if (opensNewTurn(options)) {
+        if (sessionId !== undefined && this.sessionTurns.get(sessionId) === observedTurnToken) {
+          this.pendingTurns.delete(sessionId)
+        }
+      } else {
+        this.abandonTurn(sessionId, observedTurnToken)
+      }
+      throw aborted('Request was aborted prior to generation.')
+    }
 
     // Phase 1: static validation finishes before credential resolution or any
     // provider I/O, so an unusable request never consumes a subscription.
@@ -729,8 +871,18 @@ export class DefaultQoderTransport implements QoderTransport {
     // with, and the handlers below read it AFTER the walk has finished, so the
     // id they report is the one that actually produced the outcome.
     const attribution: AttemptAttribution = { accountId: undefined }
+    /*
+     * One wait budget per request, shared by every attempt of the walk below,
+     * and the record of waits it really completed. Created here — outside the
+     * walk — because the final-failure notice below is what quotes the record.
+     */
+    const queueBudget = this.newQueueWaitLedger()
+    const turn: TurnObservation = {
+      terminal: false,
+      ...observedTurnToken === undefined ? {} : { token: observedTurnToken },
+    }
     try {
-      yield* this.generateWithAccounts(options, model, attribution)
+      yield* this.generateWithAccounts(options, model, attribution, queueBudget, turn)
     } catch (error: unknown) {
       /*
        * The final failure of a request is where the queue explanation belongs.
@@ -747,9 +899,14 @@ export class DefaultQoderTransport implements QoderTransport {
        */
       const facts = error instanceof QoderLlmError ? error.qoderQueue : undefined
       if (facts !== undefined && options.signal?.aborted !== true) {
-        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options))
+        // The real wait record beside the real failure: the notice's wait
+        // sentence is a claim about THIS request, so it quotes the waits this
+        // request completed rather than the clock between two reports.
+        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options), queueWaitSummary(queueBudget))
       }
       throw error
+    } finally {
+      if (!turn.terminal) this.abandonTurn(sessionIdOf(options), turn.token)
     }
   }
 
@@ -771,16 +928,9 @@ export class DefaultQoderTransport implements QoderTransport {
     options: GenerateOptions,
     model: QoderCatalogModel | undefined,
     attribution: AttemptAttribution,
+    queueBudget: QueueWaitLedger,
+    turn: TurnObservation,
   ): AsyncGenerator<StreamChunk> {
-    /*
-     * One wait budget per request, shared by every attempt of the walk below.
-     *
-     * A queue wait is the caller choosing to wait for a busy model, so switching
-     * accounts must not hand the same caller a second full budget — see
-     * `queueWaitBudget`.
-     */
-    const totalWaits = this.queueWaitBudget()
-    const queueBudget = { waitsLeft: totalWaits, total: totalWaits }
     const failover = this.failover
     if (failover === undefined || !failover.enabled()) {
       // No pool to walk, or the user turned switching off: resolve the ambient
@@ -797,11 +947,27 @@ export class DefaultQoderTransport implements QoderTransport {
       yield* this.attempt(options, model, { pat: await this.requirePat(options.signal) }, { emitted: false }, undefined, queueBudget)
       return
     }
-    const sessionId = sessionIdOf(options)
+    const sessionId = isTitleRequest(options) ? undefined : sessionIdOf(options)
+    // Rotation is examined only when a request OPENS a turn: a turn's later
+    // steps keep the account their turn opened on, and a bound reached
+    // mid-turn waits for the next turn.
+    const newTurn = opensNewTurn(options)
+    const tracking = sessionId !== undefined && this.stickiness !== undefined && this.stickinessEnabled(this.stickiness)
+    const turnToken = turn.token
+    if (!tracking && sessionId !== undefined) {
+      this.sessionTurns.delete(sessionId)
+      this.pendingTurns.delete(sessionId)
+    }
+    // A turn that never reached an answer leaves a pending record behind. A
+    // current new opening supersedes it; an older opening that lost the
+    // creation-order race must not delete the newer turn's pending record.
+    if (newTurn && sessionId !== undefined && turnToken !== undefined && this.sessionTurns.get(sessionId) === turnToken) {
+      this.pendingTurns.delete(sessionId)
+    }
     // Stickiness chooses where a request STARTS, never whether the walk runs: a
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
-    const pinned = await this.pinnedAccount(sessionId)
+    const pinned = await this.pinnedAccount(sessionId, newTurn)
     /*
      * Precedence, and why it is exactly this order — this is the answer to
      * "轮换逻辑打架": one chain, no feature overriding another by accident.
@@ -836,7 +1002,16 @@ export class DefaultQoderTransport implements QoderTransport {
      * connection failure: it persisted a new active account, armed the
      * credential file for a rewrite, and told the user "已自动切换到下一个账号
      * 重试" 218ms into a request that never failed. So this branch only changes
-     * where this request starts; it does not touch the session pin.
+     * where this request starts and never announces a failover.
+     *
+     * It DOES move the session pin, though — see the pin write below. A session
+     * pin is this conversation's own "which account am I using", not the host's
+     * global active pointer, and a conversation whose request was served by
+     * another account is using that account from now on: its counters, its
+     * continuation steps, and its next bound check all belong to the account
+     * that ran the work. Leaving the pin on the skipped account would make the
+     * next step of the same turn collide with the busy account again, and would
+     * charge the skipped account for a request it never served.
      *
      * A cooldown IS a verdict on the account, though, and the host's metadata
      * reads (catalog, billing) sign with the store's active account. Leaving the
@@ -844,13 +1019,13 @@ export class DefaultQoderTransport implements QoderTransport {
      * card kept reading through it, so the skip is adopted silently: `adopted`
      * changes the active pointer without a notice or a failover time. A busy
      * account must NOT be adopted — another request is just using it this
-     * second. When nothing else is selectable the account is kept as the only
-     * option: the pool being all-cooling or all-busy is not a reason to invent a
-     * wait or to refuse a request that account may well serve now.
+     * second, which says nothing about the account's health. When nothing else
+     * is selectable the account is kept as the only option: the pool being
+     * all-cooling or all-busy is not a reason to invent a wait or to refuse a
+     * request that account may well serve now.
      */
     const firstCooling = this.penalties.isCooling(first.id)
     const firstBusy = this.traffic.isBusy(first.id)
-    let rerouted = false
     if (firstCooling || firstBusy) {
       const alternative = await this.nextWalkAccount(failover, first.id, new Set([first.id]))
       if (alternative !== undefined) {
@@ -880,13 +1055,20 @@ export class DefaultQoderTransport implements QoderTransport {
           penalty: this.penalties.snapshot(first.id),
         })
         first = alternative
-        rerouted = true
       }
     }
-    // Pin only a start that was not rerouted. A local skip is a statement about
-    // this request, so rewriting the session pin from it would carry the
-    // workaround into the next turn.
-    if (!rerouted && (pinned === undefined || first.id !== pinned.id)) this.pinSession(sessionId, first)
+    /*
+     * Pin the account this request ACTUALLY starts on — whichever way it was
+     * chosen. Counters are statements about work an account did, so they must
+     * follow the serving account: a reroute that left the pin behind charged the
+     * skipped account for a request it never served and sent the next step of
+     * the turn back into the busy one.
+     *
+     * This writes only the SESSION pin. The host's global active pointer is a
+     * different thing, owned by `adopted`/`switched`, and a busy skip must not
+     * touch it.
+     */
+    if (pinned === undefined || first.id !== pinned.id) this.pinSession(sessionId, first)
     // Count the request against whichever account it actually starts on. This
     // is the request bound of stickiness; the ROUND bound is counted only when
     // an answer is consumed to the end, below.
@@ -922,32 +1104,44 @@ export class DefaultQoderTransport implements QoderTransport {
        * Wired as a callback rather than left after the `yield*` below because
        * the HTTP layer closes the body stream at the terminal chunk instead of
        * resuming this generator (see `attempt`): code after `yield*` is
-       * unreachable in production, and the round bound plus this whole
+       * unreachable in production, and the round bookkeeping plus this whole
        * exoneration path died with it.
        */
-      state.onServed = ((): (() => void) => {
+      state.onFinish = ((): ((chunk: StreamChunk) => void) => {
         // Captured by value: `account` is reassigned as the walk moves, and a
         // late callback must credit the account that actually served, not
         // whichever one the walk happens to hold when it fires.
         const servedId = account.id
-        return (): void => {
+        const servedTurn = newTurn
+        return (chunk): void => {
+          turn.terminal = true
+          if (!isServedFinish(chunk)) {
+            // No answer: an upstream error or a caller abort. It neither
+            // exonerates the account nor completes a turn, and any turn that was
+            // in flight ends here without a round.
+            if (sessionId !== undefined) this.abandonTurn(sessionId, turnToken)
+            return
+          }
           this.penalties.noteSuccess(servedId)
           for (const blame of pendingBlame) this.penalties.noteFailure(blame.accountId, blame.kind)
-          this.completeRound(sessionId, servedId)
           // The walk is over and every deferred penalty has landed, so nothing
           // may blame these accounts again if the caller keeps pulling.
           pendingBlame.length = 0
+          this.noteTurnProgress(sessionId, servedId, chunk, servedTurn, turnToken)
         }
       })()
       // Set before the attempt, not after it: `attempt` reads it when it fires
       // the acceptance handler, and on a failure that escapes the walk it must
       // already name the account whose attempt failed last.
       attribution.accountId = account.id
+      // Capture ownership before the attempt can await the network. Reading it
+      // in catch would mistake a newer request's pin for this attempt's baseline.
+      const pinBeforeAttempt = sessionId === undefined ? undefined : this.sessionPins.get(sessionId)
       try {
         yield* this.attempt(options, model, account, state, account.id, queueBudget)
         // Reached only when the source ended without a terminal chunk at all,
-        // which the SSE layer treats as a failure. A normally finished answer
-        // was already recorded by `state.onServed` at its finish chunk.
+        // which the SSE layer treats as a failure. A normally finished stream
+        // was already recorded by `state.onFinish` at its finish chunk.
         return
       } catch (error: unknown) {
         if (options.signal?.aborted || state.emitted) throw error
@@ -978,7 +1172,9 @@ export class DefaultQoderTransport implements QoderTransport {
         // The session follows the walk. A pin left pointing at the account that
         // just failed would send the very next turn straight back to it, once
         // per request for as long as the pin lives — the opposite of recovery.
-        this.pinSession(sessionId, next)
+        if (sessionId === undefined || this.sessionPins.get(sessionId) === pinBeforeAttempt) {
+          this.pinSession(sessionId, next)
+        }
         // The retry is a request served by the account taking over, so it has
         // to count against that account's request bound. `pinSession` started
         // the counters at zero; without this line the account that rescued the
@@ -1003,7 +1199,7 @@ export class DefaultQoderTransport implements QoderTransport {
     account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: AttemptState = { emitted: false },
     accountId?: string,
-    queueBudget: { waitsLeft: number; total: number } = { waitsLeft: 0, total: 0 },
+    queueBudget: QueueWaitLedger = this.newQueueWaitLedger(),
   ): AsyncGenerator<StreamChunk> {
     /*
      * Hold one account's traffic slot for the whole attempt.
@@ -1046,23 +1242,23 @@ export class DefaultQoderTransport implements QoderTransport {
          */
         if (chunk.type === 'finish') release()
         /*
-         * Fire the served-answer hook at that same terminal chunk, for the same
-         * reason: the walk never resumes after the finish chunk, so anything it
-         * wants to record about a completed answer has to be recorded here,
-         * while the transport is still being pulled. `isServedFinish` keeps an
-         * error or aborted terminal chunk out of it — those produced no answer
-         * and must not count as a round or exonerate the account.
+         * Fire the finish hook at that same terminal chunk, for the same reason:
+         * the walk never resumes after the finish chunk, so anything it wants to
+         * record about the end of a step has to be recorded here, while the
+         * transport is still being pulled. The hook receives the chunk because
+         * the outcome matters — `stop`/`max-tokens` complete a turn, `tool-calls`
+         * continues it, and an error or abort completes nothing.
          */
-        if (state.onServed !== undefined && isServedFinish(chunk)) {
-          const onServed = state.onServed
-          // One shot: a misbehaving source that yields twice must not count the
+        if (chunk.type === 'finish' && state.onFinish !== undefined) {
+          const onFinish = state.onFinish
+          // One shot: a misbehaving source that yields twice must not credit the
           // round twice, and the callback must never be able to affect the
           // chunk stream by throwing.
-          state.onServed = undefined
+          state.onFinish = undefined
           try {
-            onServed()
+            onFinish(chunk)
           } catch (error: unknown) {
-            this.logger?.warn?.('[Qoder Stream] Served-answer bookkeeping threw; continuing the stream', {
+            this.logger?.warn?.('[Qoder Stream] Finish bookkeeping threw; continuing the stream', {
               message: error instanceof Error ? error.message : String(error),
             })
           }
@@ -1082,7 +1278,7 @@ export class DefaultQoderTransport implements QoderTransport {
     account: { readonly pat: string; readonly region?: QoderRegion | undefined },
     state: { emitted: boolean },
     accountId: string | undefined,
-    queueBudget: { waitsLeft: number; total: number },
+    queueBudget: QueueWaitLedger,
   ): AsyncGenerator<StreamChunk> {
     /*
      * Everything below signs against the ACCOUNT's region, not the variant's.
@@ -1171,6 +1367,12 @@ export class DefaultQoderTransport implements QoderTransport {
               }, pendingId)
             }
             await this.waitOutQueue(waitMs, options.signal)
+            // Only a wait that COMPLETED may be claimed: a thrown abort above
+            // leaves the record untouched, so the final notice cannot describe a
+            // sleep the caller cancelled.
+            queueBudget.attempts += 1
+            queueBudget.totalWaitMs += waitMs
+            queueBudget.lastBasis = plan.basis
             continue
           }
         }
@@ -1381,41 +1583,61 @@ export class DefaultQoderTransport implements QoderTransport {
    * hook the credential captured when the session was pinned is the best
    * available answer.
    *
-   * When the pin has reached one of its bounds the session is moved to the next
-   * account in the walk order — reaching a bound means "change account", not
-   * "stop remembering one". Only a session that has nobody to move to stays
-   * where it is, with its counters restarted so the same bound is not examined
-   * and rejected on every following request.
+   * When `examineBounds` is true (a turn-opening request) and the pin has
+   * reached one of its bounds the session is moved to the next account in the
+   * walk order — reaching a bound means "change account", not "stop
+   * remembering one". Only a session that has nobody to move to stays where
+   * it is, with its counters restarted so the same bound is not examined and
+   * rejected on every following request. Continuation steps pass `false`: the
+   * pin is re-resolved but never rotated, so a turn can never be split across
+   * accounts.
    */
-  private async pinnedAccount(sessionId: string | undefined): Promise<QoderPooledAccount | undefined> {
+  private async pinnedAccount(sessionId: string | undefined, examineBounds: boolean): Promise<QoderPooledAccount | undefined> {
     const policy = this.stickiness
     if (sessionId === undefined || policy === undefined || !this.stickinessEnabled(policy)) return undefined
-    const pin = this.sessionPins.get(sessionId)
-    if (pin === undefined) return undefined
     const resolve = this.failover?.accountById
-    if (resolve !== undefined) {
-      const account = await resolve(pin.id)
-      if (account === undefined) {
-        this.sessionPins.delete(sessionId)
-        return undefined
+    /*
+     * Read the pin, then read it AGAIN after every await and act only on the pin
+     * that is still in the table. Two requests of one session can run at once
+     * (a continuation while the next turn opens), and either can rotate the
+     * session while the other waits in a lookup. Writing back whatever the pin
+     * said when a request started is how a rotated session is dragged back to
+     * the account it just left, carrying that account's counters with it.
+     */
+    for (;;) {
+      const pin = this.sessionPins.get(sessionId)
+      if (pin === undefined) return undefined
+      if (resolve !== undefined) {
+        const account = await resolve(pin.id)
+        if (this.sessionPins.get(sessionId) !== pin) continue
+        if (account === undefined) {
+          this.sessionPins.delete(sessionId)
+          this.pendingTurns.delete(sessionId)
+          this.sessionTurns.delete(sessionId)
+          return undefined
+        }
+        pin.pat = account.pat
+        pin.region = account.region
       }
-      pin.pat = account.pat
-      pin.region = account.region
+      if (examineBounds && this.pinExhausted(pin, policy)) {
+        const moved = await this.rotatePin(sessionId, pin)
+        if (moved.kind === 'stale') continue
+        if (moved.kind === 'moved') return moved.account
+        // A pool of one, or a walk that has nobody after this account: the
+        // session cannot move, so restart its counters. Without this the bound
+        // would be re-examined and re-rejected on every request of the session.
+        pin.pinnedAtMs = this.now()
+        pin.rounds = 0
+        pin.requests = 0
+      }
+      // A pin rotated away while this request read it must not be re-inserted:
+      // that would resurrect a stale account AND the counters it made stale.
+      if (this.sessionPins.get(sessionId) !== pin) continue
+      // Re-inserting moves the pin to the young end of the eviction order.
+      this.sessionPins.delete(sessionId)
+      this.sessionPins.set(sessionId, pin)
+      return { id: pin.id, pat: pin.pat, ...pin.region === undefined ? {} : { region: pin.region } }
     }
-    if (this.pinExhausted(pin, policy)) {
-      const moved = await this.rotatePin(sessionId, pin)
-      if (moved !== undefined) return moved
-      // A pool of one, or a walk that has nobody after this account: the
-      // session cannot move, so restart its counters. Without this the bound
-      // would be re-examined and re-rejected on every request of the session.
-      pin.pinnedAtMs = this.now()
-      pin.rounds = 0
-      pin.requests = 0
-    }
-    // Re-inserting moves the pin to the young end of the eviction order.
-    this.sessionPins.delete(sessionId)
-    this.sessionPins.set(sessionId, pin)
-    return { id: pin.id, pat: pin.pat, ...pin.region === undefined ? {} : { region: pin.region } }
   }
 
   /**
@@ -1459,15 +1681,23 @@ export class DefaultQoderTransport implements QoderTransport {
   private async rotatePin(
     sessionId: string,
     pin: SessionPin,
-  ): Promise<QoderPooledAccount | undefined> {
+  ): Promise<PinRotation> {
     const failover = this.failover
-    if (failover === undefined) return undefined
+    if (failover === undefined) return { kind: 'none' }
     const tried = new Set<string>([pin.id])
     const free = await this.nextWalkAccount(failover, pin.id, tried)
+    // The walk awaits the host: the session may already have moved (or been
+    // dropped) by the time it answers. Committing a choice computed from the
+    // old pin would undo that newer decision.
+    if (this.sessionPins.get(sessionId) !== pin) return { kind: 'stale' }
     const next = free ?? await this.nextAccount(failover, pin.id, tried)
-    if (next === undefined || next.id === pin.id) return undefined
+    if (this.sessionPins.get(sessionId) !== pin) return { kind: 'stale' }
+    if (next === undefined || next.id === pin.id) return { kind: 'none' }
     this.pinSession(sessionId, next)
-    return { id: next.id, pat: next.pat, ...next.region === undefined ? {} : { region: next.region } }
+    return {
+      kind: 'moved',
+      account: { id: next.id, pat: next.pat, ...next.region === undefined ? {} : { region: next.region } },
+    }
   }
 
   /**
@@ -1485,17 +1715,67 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
-   * Count one completed conversation against the account that served it.
+   * Count one completed TURN against the account that served its final answer.
    *
-   * Fired only when the stream finished normally, which is the definition of a
-   * round the host asked for: a request that failed, or that the caller stopped
-   * reading, did not produce an output, so it must not move the session on.
+   * A turn is the user's message through its final answer, tool steps included,
+   * so it is worth exactly one round — credited when that answer arrives
+   * (`stop` or `max-tokens`), never when an intermediate step merely asked for a
+   * tool. A request that failed, or that the caller stopped reading, produced no
+   * answer and must not move the session on.
    */
   private completeRound(sessionId: string | undefined, accountId: string): void {
     if (sessionId === undefined) return
     const pin = this.sessionPins.get(sessionId)
     if (pin === undefined || pin.id !== accountId) return
     pin.rounds += 1
+  }
+
+  /**
+   * Record where a turn stands at the terminal chunk of one of its steps.
+   *
+   * A round is one COMPLETED turn, so it is credited only when the model's FINAL
+   * answer arrives: `stop`, or `max-tokens` (a truncated answer is still an
+   * answer). `tool-calls` means the model asked for tools and the SAME turn
+   * continues in the next request, so the turn is only remembered as pending —
+   * counting that step would spend the bound on a turn that has not finished.
+   *
+   * The final answer is credited to the account that actually served it. A turn
+   * can be rerouted mid-way (the opening account fails and the walk lands
+   * elsewhere), and the round belongs to the account that ran it to the end.
+   */
+  private noteTurnProgress(
+    sessionId: string | undefined,
+    accountId: string,
+    chunk: StreamChunk,
+    opening: boolean,
+    turnToken: object | undefined,
+  ): void {
+    if (sessionId === undefined || chunk.type !== 'finish') return
+    if (turnToken === undefined || this.sessionTurns.get(sessionId) !== turnToken) return
+    const kind = chunk.reason.kind
+    if (kind === 'stop' || kind === 'max-tokens') {
+      // An opening request whose answer is already final completes its turn on
+      // the spot; a continued step completes the turn its opening step started.
+      // A continuation with no pending turn (the transport restarted mid-turn,
+      // or was never told one started) credits nothing rather than inventing a
+      // turn that this transport did not see open.
+      if (opening || this.pendingTurns.has(sessionId)) this.completeRound(sessionId, accountId)
+      this.pendingTurns.delete(sessionId)
+      this.sessionTurns.delete(sessionId)
+      return
+    }
+    // `tool-calls`: the turn is in flight and now belongs to the account that
+    // served this step, which a failover may have changed. Without a pin there is
+    // no stickiness to serve, so there is nothing worth remembering.
+    if (this.sessionPins.has(sessionId)) this.pendingTurns.set(sessionId, { accountId })
+  }
+
+  /** Drop an unfinished turn only if no newer request has superseded it. */
+  private abandonTurn(sessionId: string | undefined, turnToken: object | undefined): void {
+    if (sessionId === undefined || turnToken === undefined) return
+    if (this.sessionTurns.get(sessionId) !== turnToken) return
+    this.sessionTurns.delete(sessionId)
+    this.pendingTurns.delete(sessionId)
   }
 
   /**
@@ -1521,6 +1801,8 @@ export class DefaultQoderTransport implements QoderTransport {
         const oldest = this.sessionPins.keys().next()
         if (oldest.done === true) break
         this.sessionPins.delete(oldest.value)
+        this.pendingTurns.delete(oldest.value)
+        this.sessionTurns.delete(oldest.value)
       }
     }
     this.sessionPins.delete(sessionId)
@@ -1555,15 +1837,24 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
-   * How many queue waits ONE REQUEST may spend.
+   * A fresh wait budget for ONE REQUEST, with nothing yet recorded against it.
    *
    * The budget belongs to the request, not to an attempt: a request that walks
    * from one account to the next is still one caller waiting, and refreshing
    * the budget on every switch would let an N-account pool hold that caller for
    * N times the configured number of waits (the reference implementation hit
-   * exactly that and saw a single request take 197s). It is computed once in
-   * `generateWithAccounts` and shared by every attempt of the walk.
+   * exactly that and saw a single request take 197s). It is minted once in
+   * `generate` and threaded through the whole walk.
+   *
+   * `attempts`/`totalWaitMs` start empty because they record what actually
+   * happened: a wait the caller aborted mid-sleep must not be reported as one
+   * the transport completed.
    */
+  private newQueueWaitLedger(): QueueWaitLedger {
+    const total = this.queueWaitBudget()
+    return { waitsLeft: total, total, attempts: 0, totalWaitMs: 0, lastBasis: undefined }
+  }
+
   private queueWaitBudget(): number {
     const policy = this.queueWait
     if (policy === undefined) return 0
