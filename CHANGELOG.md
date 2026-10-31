@@ -2,7 +2,7 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
-## Unreleased
+## 1.1.1 — 2026-11-01
 
 ### Changed — queued requests now wait five times by default
 
@@ -54,6 +54,12 @@ own shim) and takes no part in stickiness at all.
   configured 排队等待秒数 and was refused again used to be described as
   "本次未按上游建议等待即返回此结果"; the notice now distinguishes a completed
   configured wait, a completed upstream-advised wait, and no wait at all.
+  The settings card now reports the measured wait instead of the upstream's
+  advisory value, and a clock-based wait is never attributed to another
+  conversation.
+- **Overlapping requests can no longer erase newer progress.** Late failover
+  completions and stream finishes now update only the pin and turn they started
+  with; failed, aborted, and removed-account turns leave no pending state behind.
 - **Catalog and identity caches are scoped to the data root.** Two profiles
   (host and alternate data root) sharing one account no longer inherit each
   other's catalog freshness or mistake each other for an account switch.
