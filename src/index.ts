@@ -333,16 +333,23 @@ export interface Config {
    */
   stickinessEnabled?: boolean
   /**
-   * Conversation stickiness: how many completed rounds one account serves
-   * before the session moves to the next account. 0 disables round counting.
+   * Conversation stickiness: how many completed turns one account serves
+   * before the session moves to the next account. A turn is one user message
+   * through its final answer, tool-call steps included, and rotation only
+   * happens between turns. 0 disables round counting.
    */
   stickinessRounds?: number
   /**
    * Conversation stickiness: how many requests one account serves before the
-   * session moves to the next account. 0 disables request counting.
+   * session moves to the next account. Every model call counts; the bound is
+   * examined only between turns. 0 disables request counting.
    */
   stickinessRequests?: number
-  /** Conversation stickiness: how many minutes one account serves. 0 disables. */
+  /**
+   * Conversation stickiness: how many minutes one account serves before the
+   * session moves to the next account, examined only between turns.
+   * 0 disables.
+   */
   stickinessMinutes?: number
 }
 
@@ -520,19 +527,19 @@ const STICKINESS_ROUNDS_FIELD = volatileField(z.number()
   .default(0)
   .min(0)
   .max(100)
-  .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号（0 = 不限制）'))
+  .description('会话粘性：同一账号连续服务多少轮对话后自动换到下一个账号；一轮 = 一次用户提问到回答完成（含工具调用步骤），换号只在两轮之间发生（0 = 不限制）'))
 /** Stickiness requests: 0 disables. Default 0 — minutes still bound. */
 const STICKINESS_REQUESTS_FIELD = volatileField(z.number()
   .default(0)
   .min(0)
   .max(10_000)
-  .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号（0 = 不限制）'))
+  .description('会话粘性：同一账号连续服务多少次请求后自动换到下一个账号；换号只在两轮之间发生（0 = 不限制）'))
 /** Stickiness minutes: 0 disables. Default 240. */
 const STICKINESS_MINUTES_FIELD = volatileField(z.number()
   .default(240)
   .min(0)
   .max(1440)
-  .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号（0 = 不限制）'))
+  .description('会话粘性：同一账号连续服务多少分钟后自动换到下一个账号；换号只在两轮之间发生（0 = 不限制）'))
 
 export const Config: z<Config> = z.object({
   probeConsent: PROBE_CONSENT_FIELD,

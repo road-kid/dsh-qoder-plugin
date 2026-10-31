@@ -80,6 +80,52 @@ function sessionIdOf(options: GenerateOptions): string | undefined {
 }
 
 /**
+ * Whether one request is the host's automatic session-title call.
+ *
+ * The host derives a session title with a synthetic one-message request whose
+ * single user message is framed by its `frameMessages` helper (seen verbatim in
+ * the host build): the text is `Generate the session title from this JSON
+ * array of human messages:` (first title) or `Update the session title from
+ * this JSON object:` (title refresh) followed by the framed JSON. The message
+ * source marker the session log carries (`dsh-session-title-llm`) is stamped
+ * over by this plugin's own shim before the transport sees the request, so the
+ * text prefix is the only surviving signal.
+ *
+ * A title call is bookkeeping, not a turn: it must neither pin a session nor
+ * spend any stickiness bound, otherwise every new conversation burns one round
+ * and one request of its first account before the user's turn even starts.
+ */
+function isTitleRequest(options: GenerateOptions): boolean {
+  const messages = options.messages
+  if (messages.length !== 1) return false
+  const only = messages[0]
+  if (only === undefined || only.role !== 'user') return false
+  const blocks = only.content
+  if (blocks.length !== 1) return false
+  const block = blocks[0]
+  if (block === undefined || block.type !== 'text') return false
+  return block.text.startsWith('Generate the session title from this JSON array of human messages:')
+    || block.text.startsWith('Update the session title from this JSON object:')
+}
+
+/**
+ * Whether one request OPENS a new user turn rather than continuing one.
+ *
+ * The host runs one `generate` call per model step, and a turn's later steps
+ * arrive with the previous step's tool results appended — their LAST message is
+ * a tool result. The stickiness bounds are examined only at turn openings and
+ * the round bound is credited only to a turn-opening request that finishes
+ * normally, which is what keeps a multi-step turn on one account: a bound
+ * reached mid-turn waits for the next turn instead of splitting the turn
+ * across accounts.
+ */
+function opensNewTurn(options: GenerateOptions): boolean {
+  const messages = options.messages
+  const last = messages[messages.length - 1]
+  return last === undefined || last.role !== 'tool'
+}
+
+/**
  * The pending-notice map key for one conversation.
  *
  * A request that carries no session id — a direct API call, a host that passes
@@ -797,11 +843,15 @@ export class DefaultQoderTransport implements QoderTransport {
       yield* this.attempt(options, model, { pat: await this.requirePat(options.signal) }, { emitted: false }, undefined, queueBudget)
       return
     }
-    const sessionId = sessionIdOf(options)
+    const sessionId = isTitleRequest(options) ? undefined : sessionIdOf(options)
+    // Rotation is examined only when a request OPENS a turn: a turn's later
+    // steps keep the account their turn opened on, and a bound reached
+    // mid-turn waits for the next turn.
+    const newTurn = opensNewTurn(options)
     // Stickiness chooses where a request STARTS, never whether the walk runs: a
     // pinned account that fails still advances like any other, because a pin is
     // a statement about identity, not a promise about health.
-    const pinned = await this.pinnedAccount(sessionId)
+    const pinned = await this.pinnedAccount(sessionId, newTurn)
     /*
      * Precedence, and why it is exactly this order — this is the answer to
      * "轮换逻辑打架": one chain, no feature overriding another by accident.
@@ -930,10 +980,14 @@ export class DefaultQoderTransport implements QoderTransport {
         // late callback must credit the account that actually served, not
         // whichever one the walk happens to hold when it fires.
         const servedId = account.id
+        const servedTurn = newTurn
         return (): void => {
           this.penalties.noteSuccess(servedId)
           for (const blame of pendingBlame) this.penalties.noteFailure(blame.accountId, blame.kind)
-          this.completeRound(sessionId, servedId)
+          // Only a turn-opening request credits the round bound: a turn is the
+          // user's message through its final answer, tool steps included, so
+          // its later steps must not spend additional rounds.
+          if (servedTurn) this.completeRound(sessionId, servedId)
           // The walk is over and every deferred penalty has landed, so nothing
           // may blame these accounts again if the caller keeps pulling.
           pendingBlame.length = 0
@@ -1381,13 +1435,16 @@ export class DefaultQoderTransport implements QoderTransport {
    * hook the credential captured when the session was pinned is the best
    * available answer.
    *
-   * When the pin has reached one of its bounds the session is moved to the next
-   * account in the walk order — reaching a bound means "change account", not
-   * "stop remembering one". Only a session that has nobody to move to stays
-   * where it is, with its counters restarted so the same bound is not examined
-   * and rejected on every following request.
+   * When `examineBounds` is true (a turn-opening request) and the pin has
+   * reached one of its bounds the session is moved to the next account in the
+   * walk order — reaching a bound means "change account", not "stop
+   * remembering one". Only a session that has nobody to move to stays where
+   * it is, with its counters restarted so the same bound is not examined and
+   * rejected on every following request. Continuation steps pass `false`: the
+   * pin is re-resolved but never rotated, so a turn can never be split across
+   * accounts.
    */
-  private async pinnedAccount(sessionId: string | undefined): Promise<QoderPooledAccount | undefined> {
+  private async pinnedAccount(sessionId: string | undefined, examineBounds: boolean): Promise<QoderPooledAccount | undefined> {
     const policy = this.stickiness
     if (sessionId === undefined || policy === undefined || !this.stickinessEnabled(policy)) return undefined
     const pin = this.sessionPins.get(sessionId)
@@ -1402,7 +1459,7 @@ export class DefaultQoderTransport implements QoderTransport {
       pin.pat = account.pat
       pin.region = account.region
     }
-    if (this.pinExhausted(pin, policy)) {
+    if (examineBounds && this.pinExhausted(pin, policy)) {
       const moved = await this.rotatePin(sessionId, pin)
       if (moved !== undefined) return moved
       // A pool of one, or a walk that has nobody after this account: the
@@ -1485,11 +1542,14 @@ export class DefaultQoderTransport implements QoderTransport {
   }
 
   /**
-   * Count one completed conversation against the account that served it.
+   * Count one completed TURN against the account that served it.
    *
-   * Fired only when the stream finished normally, which is the definition of a
-   * round the host asked for: a request that failed, or that the caller stopped
-   * reading, did not produce an output, so it must not move the session on.
+   * Fired only for a turn-opening request whose stream finished normally —
+   * a turn is the user's message through its final answer, tool steps
+   * included, so the opening request stands for the whole turn and its later
+   * steps must not spend additional rounds. A request that failed, or that
+   * the caller stopped reading, did not produce an output, so it must not
+   * move the session on.
    */
   private completeRound(sessionId: string | undefined, accountId: string): void {
     if (sessionId === undefined) return

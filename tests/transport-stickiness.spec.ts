@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import {
+  createToolResultMessage,
+  createUserMessage,
+  ToolCallId,
+  type GenerateOptions,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
 import { sessionPinCapacity } from '../src/qoder/transport/default-transport.ts'
 import {
   createQoderTransport,
@@ -152,9 +158,60 @@ function request(sessionId?: Session): GenerateOptions {
   }
 }
 
+/**
+ * A continuation STEP of the same turn: the previous step produced a tool call
+ * and the host appended its result, so the last message is a tool result.
+ */
+function stepRequest(sessionId?: Session): GenerateOptions {
+  return {
+    provider: 'qoder-official',
+    model: 'cmodel',
+    messages: [
+      createUserMessage({ content: [{ type: 'text', text: 'Hello' }], source: { kind: 'user' } }),
+      createToolResultMessage({
+        callId: ToolCallId('call-step'),
+        content: [{ type: 'text', text: 'tool result' }],
+        isError: false,
+      }),
+    ],
+    ...sessionId === undefined ? {} : { sessionId },
+  }
+}
+
+/**
+ * The host's automatic session-title call, as its `frameMessages` helper
+ * builds it: one user message framing the human messages as JSON. This exact
+ * prefix is the only marker that survives the plugin's own shim translation.
+ */
+function titleRequest(sessionId?: Session): GenerateOptions {
+  return {
+    provider: 'qoder-official',
+    model: 'cmodel',
+    messages: [createUserMessage({
+      content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"Hello"}]' }],
+      source: { kind: 'user' },
+    })],
+    ...sessionId === undefined ? {} : { sessionId },
+  }
+}
+
 async function drain(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
   const chunks: StreamChunk[] = []
   for await (const chunk of transport.stream(request(sessionId))) chunks.push(chunk)
+  return chunks
+}
+
+/** Run one continuation step of the current turn. */
+async function drainStep(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(stepRequest(sessionId))) chunks.push(chunk)
+  return chunks
+}
+
+/** Run the host's automatic session-title call. */
+async function drainTitle(transport: QoderTransport, sessionId?: Session): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(titleRequest(sessionId))) chunks.push(chunk)
   return chunks
 }
 
@@ -325,6 +382,76 @@ describe('QoderTransport session stickiness', () => {
     // still walks back round to Alpha. Were the failed attempt counted as a
     // round, the rotation would have moved the session OFF Beta first.
     expect(failingHarness.upstream.chatPats.slice(before)).toEqual([BETA.pat, ALPHA.pat])
+  })
+
+  /**
+   * A turn is the user's message through its final answer, tool steps
+   * included, so a bound reached MID-TURN must wait for the next turn. Before
+   * the fix, "rounds" counted each completed model stream (each step), so a
+   * multi-step turn rotated its session halfway through.
+   */
+  it('keeps a multi-step turn on one account even after the round bound is reached mid-turn', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1: Alpha, one round spent
+    await drainStep(transport, SESSION) // turn 1, step 2: same account
+    await drainStep(transport, SESSION) // turn 1, step 3: same account
+    await drain(transport, SESSION) // turn 2 opens: the bound is reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('counts one round per turn regardless of how many steps it has', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 2, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1 → round 1
+    await drainStep(transport, SESSION)
+    await drainStep(transport, SESSION)
+    await drain(transport, SESSION) // turn 2 → round 2
+    await drain(transport, SESSION) // turn 3: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('does not let the automatic session-title request pin or spend any bound', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 1, requests: () => 0, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drainTitle(transport, SESSION) // bookkeeping: no pin, no round
+    await drain(transport, SESSION) // turn 1: Alpha, round 1 spent
+    await drain(transport, SESSION) // turn 2: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, BETA.pat])
+  })
+
+  it('waits for the next turn to rotate on the request bound, even when steps cross it', async () => {
+    const poolState = pool([ALPHA, BETA], ALPHA)
+    const { transport, upstream } = harness({
+      failover: poolState.hooks,
+      stickiness: { enabled: () => true, rounds: () => 0, requests: () => 2, minutes: () => 0 },
+      chat: () => accepted('from-any'),
+    })
+
+    await drain(transport, SESSION) // turn 1, step 1: requests = 1
+    await drainStep(transport, SESSION) // turn 1, step 2: requests = 2
+    await drainStep(transport, SESSION) // turn 1, step 3: requests = 3 — bound crossed mid-turn, no rotation
+    await drain(transport, SESSION) // turn 2 opens: bound reached, rotate to Beta
+
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat, ALPHA.pat, BETA.pat])
   })
 
   it('rotates on the request bound even when no round has been completed', async () => {

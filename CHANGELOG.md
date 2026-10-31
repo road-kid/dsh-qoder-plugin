@@ -20,6 +20,23 @@ The conversation-stickiness bounds now default to 0 rounds and 0 requests
 (round- and request-based rotation disabled) and 240 minutes. Only the minute
 bound still forces a rotation, so stickiness stays on.
 
+### Fixed — rotation no longer switches accounts in the middle of a turn
+
+Stickiness rotation used to count "rounds" per completed model stream — one
+per tool-call step — and to re-examine its bounds at the start of EVERY
+request, so a multi-step turn could reach a bound halfway through and switch
+accounts between two of its steps. Rotation is now examined only when a
+request OPENS a turn (the last message is not a tool result), and one round
+means one complete turn from the user's message to the final answer, tool
+steps included. A bound reached mid-turn waits for the next turn, so a
+conversation is never split across accounts in the middle of an answer.
+
+The host's automatic session-title call is also excluded: it used to burn one
+round and one request of the session's first account before the user's turn
+even started, because it shares the session id and looked like a turn. It is
+now detected by its framing text (the only marker that survives the plugin's
+own shim) and takes no part in stickiness at all.
+
 ## 1.1.0 — 2026-10-27
 
 The Global daily check-in no longer requires the Qoder desktop app. The identity
