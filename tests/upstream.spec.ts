@@ -313,9 +313,12 @@ describe('chatStream failure classification before the response exists', () => {
   it('answers a contentless completed response as a 502 server failure the host retries', async () => {
     // The REAL empty-response path, as the plugin runs it: the wire emits a
     // terminal `finish` failure carrying the structured EMPTY_RESPONSE code
-    // (src/qoder/transport/wire/sse.ts). Because no content preceded it, that
-    // chunk is also the FIRST chunk, so chatStream classifies it into an HTTP
-    // status instead of opening a 200 stream (src/upstream.ts, chatStream's
+    // (src/qoder/transport/wire/sse.ts), and it emits it BEFORE the usage chunk.
+    // That ordering is what makes this the FIRST chunk — with a usage chunk in
+    // front, chatStream would already have something to forward, open a 200
+    // stream, and the failure would reach the host as an SSE error frame it
+    // classifies PI_AI_ERROR, i.e. never retried. Being first, chatStream
+    // classifies it into an HTTP status instead (src/upstream.ts, chatStream's
     // early-failure arm): kindFromQoderFailure falls through to 'server', and
     // with no `status` on the failure the shim answers KIND_STATUS.server.
     const failure = { message: 'Model returned a completed response with no content.', code: 'EMPTY_RESPONSE' }

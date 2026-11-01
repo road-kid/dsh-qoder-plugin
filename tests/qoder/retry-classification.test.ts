@@ -3,8 +3,14 @@
  *
  * Thrown transport errors cross `dsh-llm-pi-ai`, which derives their code by
  * matching TEXT in the error message; `dsh-llm-retry` retries only codes in the
- * provider's `retryableCodes` set. Finish chunks instead carry their structured
- * `failure.code` directly to the retry policy and do not use the text classifier.
+ * provider's `retryableCodes` set.
+ *
+ * A finish failure does NOT reach the retry policy as a structured code: when it
+ * is the terminal FIRST chunk, `chatStream` turns it into an HTTP status and the
+ * shim answers with that status, so the host only has a thrown error whose text
+ * it classifies (`EMPTY_RESPONSE` therefore arrives as a 502 classified
+ * `SERVER`). The wire contract this file pins is the shape that keeps a request
+ * on that path — see the empty-completion test below.
  *
  * These tests therefore assert the CONTRACT that was violated, against the REAL
  * code paths (the SSE decoder and the chat stream), not against a copy of the
@@ -178,13 +184,14 @@ test('a truncated event stream is classified retryable by the host classifier', 
 
 test('a completed response with no content carries the retryable EMPTY_RESPONSE code', async () => {
   // What this pins is the WIRE contract: an empty completion is a structured
-  // finish failure whose code is retryable. It does NOT follow that the host
-  // reads that code — it cannot, the code never leaves this process. `chatStream`
-  // sees a terminal first chunk and answers HTTP 502 `server` (src/upstream.ts),
-  // so the host only ever has a 5xx thrown-error text, which
-  // `classifyPiAiError` maps to `SERVER` — retryable for that reason. The
-  // end-to-end path is pinned in `tests/upstream.spec.ts` ("answers a contentless
-  // completed response as a 502 server failure the host retries").
+  // finish failure whose code is retryable. The host does NOT read that code —
+  // it cannot, because the failure is the terminal first chunk, so `chatStream`
+  // answers HTTP 502 `server` (src/upstream.ts) and the host only has a 5xx
+  // thrown-error text, which `classifyPiAiError` maps to `SERVER` — retryable
+  // for that reason. The end-to-end path is pinned in `tests/upstream.spec.ts`
+  // ("answers a contentless completed response as a 502 server failure the host
+  // retries"), and the chunk ORDER that keeps the code out of the host is pinned
+  // by the next test.
   const chunks: unknown[] = []
   for await (const chunk of parseQoderSse(streamOf([
     frame({ choices: [{ index: 0, delta: {}, finishReason: 'stop' }] }),
@@ -206,6 +213,37 @@ test('a completed response with no content carries the retryable EMPTY_RESPONSE 
     code: EMPTY_RESPONSE_CODE,
   })
   assert.equal(DEFAULT_RETRYABLE_CODES.has(reason.failure.code), true)
+})
+
+test('an empty completion reports its failure before any usage chunk', async () => {
+  // Ordering is the whole contract. If the usage chunk came first, `chatStream`
+  // would already have a chunk to forward, so it would open a 200 stream; the
+  // failure would then reach the host as an SSE error frame instead of an HTTP
+  // status. The frame's text matches no retryable class, so the host classifies
+  // it PI_AI_ERROR — which is NOT in DEFAULT_RETRYABLE_CODES — and the request
+  // is never retried. This case fails if the usage yield moves back in front of
+  // the empty-content guard.
+  const chunks: unknown[] = []
+  for await (const chunk of parseQoderSse(streamOf([
+    frame({
+      choices: [{ index: 0, delta: {} }],
+      usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+    }),
+    frame({ choices: [{ index: 0, delta: {}, finishReason: 'stop' }] }),
+    'data: [DONE]\n\n',
+  ].join('')))) chunks.push(chunk)
+
+  // Exactly one chunk, and it is the failure: no usage was reported for a
+  // response that produced no content, so nothing preceded the failure.
+  assert.equal(chunks.length, 1)
+  const only = chunks[0] as { type: string; reason?: { kind: string; failure?: { code: string } } }
+  assert.equal(only.type, 'finish')
+  assert.equal(only.reason?.kind, 'error')
+  assert.equal(only.reason?.failure?.code, EMPTY_RESPONSE_CODE)
+  // The classifier would put this failure on the non-retryable path if it had
+  // escaped as an SSE frame text instead of an HTTP status.
+  assert.equal(classifyPiAiError('Model returned a completed response with no content.'), 'PI_AI_ERROR')
+  assert.equal(DEFAULT_RETRYABLE_CODES.has('PI_AI_ERROR'), false)
 })
 
 test('the phrases this transport used to emit would NOT have been retried', () => {

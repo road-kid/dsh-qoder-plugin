@@ -396,7 +396,14 @@ export async function* parseQoderSse(
     }
   }
 
-  if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
+  // The empty-completion failure is emitted BEFORE the usage chunk, and that
+  // order is load-bearing: `chatStream` only turns a terminal first chunk into
+  // an HTTP status (src/upstream.ts). A usage chunk in front of it would open a
+  // 200 stream, and the failure would then reach the host as an SSE error frame
+  // whose text matches no retryable class — the host would answer PI_AI_ERROR
+  // and never retry. Emitting the failure first keeps the request on the
+  // retryable path (502 `server`). The usage of a response that produced no
+  // content is not worth that, and the attempt is retried anyway.
   if (!sawContent) {
     yield {
       type: 'finish',
@@ -407,5 +414,6 @@ export async function* parseQoderSse(
     }
     return
   }
+  if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
   yield { type: 'finish', reason: { kind: toolCalls.size > 0 ? 'tool-calls' : terminalKind } }
 }
