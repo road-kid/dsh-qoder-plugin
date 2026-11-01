@@ -2,6 +2,57 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.1.3 — 2026-11-01
+
+### Fixed — a new conversation's first queue no longer prints two lines
+
+The host asks for a session title as soon as a conversation starts, and that
+request shares the upstream queue with the user's first message. When the model
+was saturated, both printed their own "排队中" progress line, so the first thing
+a new conversation showed was the same wait twice. The title call is bookkeeping,
+not a turn: it still waits, still retries and its wait is still recorded on the
+status card, but it no longer narrates in the conversation, and a request whose
+queue budget runs out no longer leaves its terminal notice behind either.
+
+The first attempt at this fix only changed which conversation the row was
+attributed to, which handed it to the printer's "whichever conversation was last
+running" fallback — the row still appeared, and when another conversation was
+busiest it appeared there. Attribution is now truthful (the title request reports
+the conversation that triggered it) and visibility is decided in the host.
+
+### Fixed — an empty completion is retried instead of ending the turn
+
+A model response that completed with no content — no text, no tool call — ended
+the turn instead of being retried. Two separate reasons, both now gone. The
+structured `EMPTY_RESPONSE` code never reaches the retry policy, because a
+failure that is the first thing on the wire is answered as an HTTP 502 and the
+host derives its code from that status; and whether it was first depended on
+whether the upstream sent its usage chunk before the completion. A usage chunk
+ahead of the failure opened a 200 stream, so the failure arrived as an in-band
+frame whose text matches no retryable class, and the turn ended on a `PI_AI_ERROR`
+that the retry table does not list. The failure is now reported before any usage
+chunk, so it always becomes a retryable 502. The cost is the usage record of a
+response that produced no content, on an attempt that is retried anyway.
+
+### Fixed — a delayed reroute can no longer reset a newer session pin
+
+Two overlapping requests in one conversation could let the older one finish its
+account lookup later and write its own pin over the newer one, resetting the
+request and round counters the newer request had already recorded. The reroute
+now commits its choice only while the pin it read at dispatch is still the
+current one, so a stale request leaves the conversation's account and counters
+alone.
+
+### Fixed — queue notices report the wait that actually happened
+
+The "已按上游建议等待 30 秒…" sentence quoted the upstream's advice as if it were
+the time the plugin had slept, and a wait could be inferred from elapsed host
+time even when no retry had happened. A wait is now claimed only after a
+completed transport wait, and both the configured and the upstream-advised
+wordings report the measured total, so the line and the status card describe the
+same wait. A request that never waited no longer borrows a wait from an earlier
+outage.
+
 ## 1.1.2 — 2026-11-01
 
 ### Fixed — a dropped response is retried instead of ending the turn
