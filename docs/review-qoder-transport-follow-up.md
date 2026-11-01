@@ -14,6 +14,7 @@ This record closes the actionable transport findings from the 1.1.1/1.1.2 review
 | A completed empty response was believed to lose its retryable code | Not a defect in the current host contract | The wire emits a finish failure with `EMPTY_RESPONSE_CODE`; the host retry policy retries structured finish failures by code. Text classification applies to thrown errors, not this finish path | `e9960c3 test(qoder): cover empty response retry contract` |
 | Queue notices inferred a wait from elapsed host time and quoted the last upstream advice as the total wait | Fixed | `waited` now requires completed transport waits; upstream and configured wording both use measured `totalWaitMs`, while outage recurrence remains clock-based | `b5dc363 fix(qoder): report measured queue waits` |
 | Default queue retry budget lacked direct host/runtime coverage | Covered without changing defaults | Schema and settings-face tests pin enabled/5/30; a real-plugin fake-timer end-to-end test proves six upstream chats and five measured configured waits | `ee9a4ee test(qoder): cover queue notice contracts` |
+| A new conversation's first queue showed two progress lines | Fixed | The session-title request shares the upstream queue but no longer owns the session, yet still reported its wait under the main session id. Its queue progress is now attributed to no session, so only the user-facing request narrates the wait. `tests/transport-queue-wait.spec.ts` guards both the title and conversation attributions | `ed0122a fix(qoder): keep title-request queue waits out of the conversation` |
 
 The pin fix captures the dispatch-time pin object and compares object identity after the asynchronous account walk. Comparing against the value returned by `pinnedAccount()` would be incorrect because that method returns a copy.
 
@@ -49,6 +50,12 @@ Both supported P2 findings are closed:
 2. The default queue budget remains enabled with `5` retries and a `30`-second fallback, now covered from schema through runtime.
 
 The empty-response wording change is explicitly excluded: it would not change retry behavior.
+
+## Title queue notice fix
+
+The title-request fix is a one-line attribution correction in `src/qoder/transport/default-transport.ts`: the pending id used for queue progress now follows the same `isTitleRequest(options)` rule that already excluded title requests from session stickiness. Internal queue budget, waiting and retry behavior are unchanged, so the title request still waits and retries exactly as before; it simply no longer writes a second progress line into the conversation.
+
+`pnpm run check` passed after this fix: typecheck, Vitest 55 files / 901 tests, `node:test` 231 tests, and the build. Generated output was committed in `ff3c8a6 chore(build): regenerate lib for title queue notice fix`. One full-suite run of the default-budget fake-timer test flaked with `upstreamChats` = 0; it passed in isolation, with the fix stashed, and on the next full run, which identifies it as timing flakiness in that test under load rather than a regression from this change.
 
 ## Deferred items
 
