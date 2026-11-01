@@ -146,6 +146,13 @@ interface WaitObservation {
   attempt: number
   remaining: number
   accountId: string | undefined
+  /**
+   * The conversation the waiting request was attributed to, as the host's
+   * `onQueueWait` consumer receives it. `undefined` means "no conversation" —
+   * a request the host runs as bookkeeping (the automatic session-title call)
+   * rather than as a turn.
+   */
+  sessionId: string | undefined
 }
 
 function harness(spec: UpstreamSpec & {
@@ -167,8 +174,8 @@ function harness(spec: UpstreamSpec & {
     onUpstreamQueue: (facts, accountId) => {
       notices.push({ facts: { isQueued: facts.isQueued, ...facts.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: facts.retryAfterSeconds } }, accountId })
     },
-    onQueueWait: (_facts, accountId, wait) => {
-      waits.push({ waitMs: wait.waitMs, attempt: wait.attempt, remaining: wait.remaining, accountId })
+    onQueueWait: (_facts, accountId, wait, sessionId) => {
+      waits.push({ waitMs: wait.waitMs, attempt: wait.attempt, remaining: wait.remaining, accountId, sessionId })
     },
   }
   return { transport: createQoderTransport(options), upstream, notices, waits }
@@ -196,6 +203,42 @@ async function drainError(transport: QoderTransport, signal?: AbortSignal): Prom
   } catch (error: unknown) {
     return error
   }
+}
+
+/** A conversation the host is driving; the transport attributes notices to it. */
+const SESSION = 'session-main'
+
+/** The main chat request of that conversation, in a given conversation. */
+function sessionRequest(sessionId?: string): GenerateOptions {
+  return {
+    ...request(),
+    ...sessionId === undefined ? {} : { sessionId: sessionId as NonNullable<GenerateOptions['sessionId']> },
+  }
+}
+
+/**
+ * The host's automatic session-title call, as its `frameMessages` helper builds
+ * it (see `isTitleRequest` in the transport): one user message whose text is
+ * the framing prefix plus the framed JSON, carrying the SAME session id as the
+ * conversation it names.
+ */
+function titleRequest(sessionId?: string): GenerateOptions {
+  return {
+    provider: 'qoder-official',
+    model: 'cmodel',
+    messages: [createUserMessage({
+      content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"Hello"}]' }],
+      source: { kind: 'user' },
+    })],
+    ...sessionId === undefined ? {} : { sessionId: sessionId as NonNullable<GenerateOptions['sessionId']> },
+  }
+}
+
+/** Run one arbitrary generate call — whatever shape `options` describes. */
+async function drainOptions(transport: QoderTransport, options: GenerateOptions): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of transport.stream(options)) chunks.push(chunk)
+  return chunks
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +394,52 @@ describe('QoderTransport queue waiting', () => {
     expect(upstream.chatPats).toEqual([ALPHA.pat])
     expect(notices).toEqual([])
     expect(poolState.switches).toEqual([])
+  })
+
+  it('attributes a wait to the conversation that opened it', async () => {
+    const poolState = pool()
+    const { transport, waits } = harness({
+      failover: poolState.hooks,
+      queueWait: { attempts: () => 1, seconds: () => 0.01 },
+      random: () => 0,
+      chat: (_pat, call) => call === 1 ? queued(0) : accepted('served-after-wait'),
+    })
+
+    await drainOptions(transport, sessionRequest(SESSION))
+
+    // The progress row is printed where the wait happened. A chat request names
+    // its conversation, so the host can print the row in that conversation.
+    expect(waits.map(wait => wait.sessionId)).toEqual([SESSION])
+    expect(poolState.switches).toEqual([])
+  })
+
+  it('never attributes the session-title request\'s wait to the conversation', async () => {
+    const poolState = pool()
+    const { transport, upstream, notices, waits } = harness({
+      failover: poolState.hooks,
+      queueWait: { attempts: () => 1, seconds: () => 0.01 },
+      random: () => 0,
+      // Busy once, served on the retry: the title call recovers exactly like a
+      // chat does, and must still say nothing anywhere the user can read.
+      chat: (_pat, call) => call === 1 ? queued(0) : accepted('first-conversation'),
+    })
+
+    const chunks = await drainOptions(transport, titleRequest(SESSION))
+
+    // The wait itself is unchanged: the same account is retried, after the same
+    // sleep, with the same budget accounting.
+    expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
+    expect(waits.map(wait => [wait.attempt, wait.remaining, wait.waitMs])).toEqual([[1, 0, 1010]])
+    expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'first-conversation')).toBe(true)
+    // What changes is the attribution: a title call is bookkeeping, not a turn,
+    // so it owns no conversation. Handing its wait to the main session made the
+    // host print a second "第 1 次等待" row in the user's chat — one for the
+    // chat's own wait and one for the title call's, whose durations differ by
+    // their independent jitter and so slip past the host's identical-text
+    // de-duplication.
+    expect(waits.map(wait => wait.sessionId)).toEqual([undefined])
+    expect(notices).toEqual([])
+    expect(poolState.nextCalls).toEqual([])
   })
 
   it('keeps a zero-second advice from turning into a busy retry loop', async () => {

@@ -1339,7 +1339,14 @@ export class DefaultQoderTransport implements QoderTransport {
     // the queue row, the deferred rotation row, the failed-heal row — is printed
     // here and nowhere else, and a pending rotation is filed under this key so
     // no other conversation can flush it.
-    const pendingId = sessionIdOf(options)
+    //
+    // A title request owns no conversation, for the same reason it pins none
+    // (see `isTitleRequest`): it is bookkeeping the host runs beside the turn,
+    // so attributing its notices to the session let the host print a second
+    // "waiting" row inside the user's chat — the title call's own wait, next to
+    // the chat's — and the two rows differ only by their independent jitter,
+    // which is what defeated the host's identical-text de-duplication.
+    const pendingId = isTitleRequest(options) ? undefined : sessionIdOf(options)
     for (;;) {
       try {
         // A pending notice from an earlier heal is reported as soon as this
