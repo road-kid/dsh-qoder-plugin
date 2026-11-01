@@ -4,3 +4,6 @@ node_modules/
 
 # local scratch (reference tarballs, baseline worktrees)
 .tmp/
+
+# process artifacts (planning/design records, not shipped docs)
+docs/superpowers/plans/
