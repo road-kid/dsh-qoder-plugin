@@ -177,8 +177,14 @@ test('a truncated event stream is classified retryable by the host classifier', 
 })
 
 test('a completed response with no content carries the retryable EMPTY_RESPONSE code', async () => {
-  // Finish chunks bypass the thrown-error text classifier: the host retry
-  // policy reads this structured code directly from the finish failure.
+  // What this pins is the WIRE contract: an empty completion is a structured
+  // finish failure whose code is retryable. It does NOT follow that the host
+  // reads that code — it cannot, the code never leaves this process. `chatStream`
+  // sees a terminal first chunk and answers HTTP 502 `server` (src/upstream.ts),
+  // so the host only ever has a 5xx thrown-error text, which
+  // `classifyPiAiError` maps to `SERVER` — retryable for that reason. The
+  // end-to-end path is pinned in `tests/upstream.spec.ts` ("answers a contentless
+  // completed response as a 502 server failure the host retries").
   const chunks: unknown[] = []
   for await (const chunk of parseQoderSse(streamOf([
     frame({ choices: [{ index: 0, delta: {}, finishReason: 'stop' }] }),

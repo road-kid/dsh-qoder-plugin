@@ -193,20 +193,34 @@ export interface QoderTransportOptions {
    *   from the request itself rather than from any remembered "current" agent:
    *   several conversations run at once, and a notice printed into whichever one
    *   most recently looked busy is a notice about someone else's request (this
-   *   is what made rows land in the wrong conversation). Absent when the request
-   *   carries no session, in which case the host falls back to its best guess.
+   *   is what made rows land in the wrong conversation). Absent only when the
+   *   request itself carries no session — a bookkeeping request still names its
+   *   conversation, because that is a fact about the request and not a decision
+   *   about whether to print it.
    * @param waits - The waits THIS request completed before the final answer,
    *   accumulated per request rather than remembered on the transport: requests
    *   run concurrently, and a transport-wide "last wait" would let one request's
    *   wait be reported beside another request's failure. Absent (or `attempts`
    *   0) when the request never waited, which the host needs to keep the "no
    *   wait" sentence honest.
+   * @param bookkeeping - Whether this request is one the host runs BESIDE the
+   *   user's turn rather than a turn of its own — today, the automatic
+   *   session-title call. A bookkeeping request produces the same queue answers
+   *   as any other, but its progress is not the user's progress: printing it
+   *   put a second "waiting" row inside the chat, beside the row its own turn
+   *   prints, differing only by jitter. The transport therefore keeps the
+   *   conversation id truthful and reports this flag, and the HOST decides
+   *   visibility: suppression cannot be expressed by dropping the id, because a
+   *   missing id is a different fact (a request that belongs to no
+   *   conversation) and the host is entitled to fall back on its best guess for
+   *   it.
    */
   onUpstreamQueue?: (
     facts: QoderQueueFacts,
     accountId?: string,
     sessionId?: string,
     waits?: QoderQueueWaitSummary,
+    bookkeeping?: boolean,
   ) => void
   /**
    * Called right before this transport waits out a queue answer, once per wait.
@@ -228,8 +242,17 @@ export interface QoderTransportOptions {
    * @param sessionId - The conversation whose request is waiting, for the same
    *   reason {@link onUpstreamQueue} carries it: the row must print where the
    *   wait actually happened.
+   * @param bookkeeping - Whether the waiting request is host bookkeeping rather
+   *   than a user turn; see {@link onUpstreamQueue}'s flag. The host keeps the
+   *   wait visible on its card but prints no conversation row for it.
    */
-  onQueueWait?: (facts: QoderQueueFacts, accountId: string | undefined, wait: QoderQueueWaitProgress, sessionId?: string) => void
+  onQueueWait?: (
+    facts: QoderQueueFacts,
+    accountId: string | undefined,
+    wait: QoderQueueWaitProgress,
+    sessionId?: string,
+    bookkeeping?: boolean,
+  ) => void
   /**
    * Called when the upstream accepted a chat — its first chunk is about to be
    * forwarded — so any condition an earlier failure notice described is over.

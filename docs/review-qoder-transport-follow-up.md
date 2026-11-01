@@ -11,14 +11,14 @@ This record closes the actionable transport findings from the 1.1.1/1.1.2 review
 | Finding | Verdict | Evidence | Commit |
 | --- | --- | --- | --- |
 | A delayed initial reroute could overwrite a newer session pin and reset its counters | Fixed | `tests/transport-stickiness.spec.ts` reproduces two concurrent requests around a gated account walk; the delayed request may no longer replace the newer pin | `1cb7adb fix(qoder): reject stale rerouted pin writes` |
-| A completed empty response was believed to lose its retryable code | Not a defect in the current host contract | The wire emits a finish failure with `EMPTY_RESPONSE_CODE`; the host retry policy retries structured finish failures by code. Text classification applies to thrown errors, not this finish path | `e9960c3 test(qoder): cover empty response retry contract` |
+| A completed empty response was believed to lose its retryable code | Not a defect in the current host contract — though not for the reason first recorded | The wire does emit a finish failure with `EMPTY_RESPONSE_CODE`, but that code never crosses the process boundary: `chatStream` sees a terminal first chunk, classifies it `server` and answers HTTP 502, so the host only has a 5xx thrown-error text and `classifyPiAiError` maps it to `SERVER`, which the default retry table retries. Retry is bought by the status, not by the structured code | `e9960c3 test(qoder): cover empty response retry contract` |
 | Queue notices inferred a wait from elapsed host time and quoted the last upstream advice as the total wait | Fixed | `waited` now requires completed transport waits; upstream and configured wording both use measured `totalWaitMs`, while outage recurrence remains clock-based | `b5dc363 fix(qoder): report measured queue waits` |
 | Default queue retry budget lacked direct host/runtime coverage | Covered without changing defaults | Schema and settings-face tests pin enabled/5/30; a real-plugin fake-timer end-to-end test proves six upstream chats and five measured configured waits | `ee9a4ee test(qoder): cover queue notice contracts` |
-| A new conversation's first queue showed two progress lines | Fixed | The session-title request shares the upstream queue but no longer owns the session, yet still reported its wait under the main session id. Its queue progress is now attributed to no session, so only the user-facing request narrates the wait. `tests/transport-queue-wait.spec.ts` guards both the title and conversation attributions | `ed0122a fix(qoder): keep title-request queue waits out of the conversation` |
+| A new conversation's first queue showed two progress lines | Fixed at the host layer | The session-title request shares the upstream queue but is bookkeeping, not a turn. The transport now reports its real conversation id PLUS a `bookkeeping` flag, and the host drops the conversation row for flagged requests while still recording the wait on the card. Dropping the session id — the first attempt — did not suppress anything: the printer treats a missing id as "print into whichever agent was last running" | `ed0122a` + host-layer fix in `src/index.ts` |
 
 The pin fix captures the dispatch-time pin object and compares object identity after the asynchronous account walk. Comparing against the value returned by `pinnedAccount()` would be incorrect because that method returns a copy.
 
-The empty-response regression test deliberately preserves the existing production message and code. It locks the actual structured retry contract rather than changing wording to satisfy the superseded review hypothesis.
+The empty-response regression test deliberately preserves the existing production message and code, and pins the wire contract rather than the host's reading of it: the code does not survive the HTTP boundary, so the retry that actually happens comes from the 502 status the shim answers with.
 
 ## Verification
 
@@ -53,9 +53,18 @@ The empty-response wording change is explicitly excluded: it would not change re
 
 ## Title queue notice fix
 
-The title-request fix is a one-line attribution correction in `src/qoder/transport/default-transport.ts`: the pending id used for queue progress now follows the same `isTitleRequest(options)` rule that already excluded title requests from session stickiness. Internal queue budget, waiting and retry behavior are unchanged, so the title request still waits and retries exactly as before; it simply no longer writes a second progress line into the conversation.
+The first attempt at this fix (`ed0122a`) changed one line: the pending id for queue progress became `undefined` for title requests. That did not work, and a review caught it. `emitUpstreamNotice` treats a missing session id as "print into whichever agent was last running" (`src/job-token-hint.ts`), a fallback the module itself documents as the source of cross-conversation leakage — so the row still printed, and when the last-running agent belonged to another conversation it printed there. The final notice was not touched at all: `onUpstreamQueue` passes `sessionIdOf(options)` and never looked at the pending id, so a title request whose budget ran out still wrote its row. The regression test added with the fix asserted the transport's callback arguments and never reached the printer, which is why it stayed green while users still saw the row.
 
-`pnpm run check` passed after this fix: typecheck, Vitest 55 files / 901 tests, `node:test` 231 tests, and the build. Generated output was committed in `ff3c8a6 chore(build): regenerate lib for title queue notice fix`. One full-suite run of the default-budget fake-timer test flaked with `upstreamChats` = 0; it passed in isolation, with the fix stashed, and on the next full run, which identifies it as timing flakiness in that test under load rather than a regression from this change.
+The fix now separates the two facts the transport was conflating:
+
+- **Attribution stays truthful.** The title request belongs to the conversation that triggered it, and the transport reports that real id, so the printer's strict rule ("a row for session X goes to session X, or nowhere") applies as it does for every other request. Restoring the id also restores the deferred rotation row, which had been filed under the session-less bucket while its own acceptance flushed the real session.
+- **Visibility is the host's decision.** Both queue hooks gained a trailing `bookkeeping` flag (`src/qoder/transport/index.ts`), set from the same `isTitleRequest(options)` predicate. The host (`src/index.ts`) still records the wait on the status card, still counts the outage and still logs, but returns before `emitUpstreamNotice` when the flag is set — for the progress row and for the terminal notice alike.
+
+Internal queue budget, waiting and retry behavior are unchanged: the title request still waits and retries exactly as before.
+
+Coverage is now at the layer that decides what the user sees. `tests/queue-notice-recovery.spec.ts` boots the real plugin, keeps a conversation running so the last-running-agent fallback would actually deliver a stray row, and asserts that a queued title request appends nothing — both when it recovers after a wait and when its budget runs out — while the same conversation's user-facing chat still prints its row. Reverting the host-layer change makes four of those five cases fail. `tests/transport-queue-wait.spec.ts` keeps the transport-level contract: the real session id plus the flag, for both hooks.
+
+`pnpm run check` passed after this fix (see the verification note below). Generated output was committed alongside it.
 
 ## Deferred items
 

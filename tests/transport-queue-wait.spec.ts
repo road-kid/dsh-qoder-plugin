@@ -139,6 +139,10 @@ function pool(): Pool {
 interface QueueObservation {
   facts: { isQueued: boolean; retryAfterSeconds?: number }
   accountId: string | undefined
+  /** The conversation the failing request named, when it named one. */
+  sessionId: string | undefined
+  /** Whether the failing request was host bookkeeping; see `onUpstreamQueue`. */
+  bookkeeping: boolean | undefined
 }
 
 interface WaitObservation {
@@ -147,12 +151,18 @@ interface WaitObservation {
   remaining: number
   accountId: string | undefined
   /**
-   * The conversation the waiting request was attributed to, as the host's
-   * `onQueueWait` consumer receives it. `undefined` means "no conversation" —
-   * a request the host runs as bookkeeping (the automatic session-title call)
-   * rather than as a turn.
+   * The conversation the waiting request belongs to, as the host's
+   * `onQueueWait` consumer receives it. A bookkeeping request (the automatic
+   * session-title call) still names its conversation — the id is a fact about
+   * the request, not a decision about printing — and the flag below is what
+   * tells the host to keep the row out of the chat.
    */
   sessionId: string | undefined
+  /**
+   * Whether this request is host bookkeeping rather than a turn. The host keeps
+   * the wait on its card and prints no conversation row for it.
+   */
+  bookkeeping: boolean | undefined
 }
 
 function harness(spec: UpstreamSpec & {
@@ -171,11 +181,16 @@ function harness(spec: UpstreamSpec & {
     ...spec.failover === undefined ? {} : { failover: spec.failover },
     ...spec.queueWait === undefined ? {} : { queueWait: spec.queueWait },
     ...spec.random === undefined ? {} : { random: spec.random },
-    onUpstreamQueue: (facts, accountId) => {
-      notices.push({ facts: { isQueued: facts.isQueued, ...facts.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: facts.retryAfterSeconds } }, accountId })
+    onUpstreamQueue: (facts, accountId, sessionId, _waits, bookkeeping) => {
+      notices.push({
+        facts: { isQueued: facts.isQueued, ...facts.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: facts.retryAfterSeconds } },
+        accountId,
+        sessionId,
+        bookkeeping,
+      })
     },
-    onQueueWait: (_facts, accountId, wait, sessionId) => {
-      waits.push({ waitMs: wait.waitMs, attempt: wait.attempt, remaining: wait.remaining, accountId, sessionId })
+    onQueueWait: (_facts, accountId, wait, sessionId, bookkeeping) => {
+      waits.push({ waitMs: wait.waitMs, attempt: wait.attempt, remaining: wait.remaining, accountId, sessionId, bookkeeping })
     },
   }
   return { transport: createQoderTransport(options), upstream, notices, waits }
@@ -258,7 +273,7 @@ describe('QoderTransport queue waiting', () => {
     // times must not grow a hidden retry, and the notice still carries the
     // upstream's own advice for the host's retry policy to use.
     expect(upstream.chatPats).toEqual([ALPHA.pat])
-    expect(notices).toEqual([{ facts: { isQueued: true, retryAfterSeconds: 30 }, accountId: ALPHA.id }])
+    expect(notices).toEqual([{ facts: { isQueued: true, retryAfterSeconds: 30 }, accountId: ALPHA.id, sessionId: undefined, bookkeeping: false }])
     expect((error as QoderLlmError).code).toBe('RATE_LIMIT')
     expect(poolState.switches).toEqual([])
   })
@@ -408,12 +423,14 @@ describe('QoderTransport queue waiting', () => {
     await drainOptions(transport, sessionRequest(SESSION))
 
     // The progress row is printed where the wait happened. A chat request names
-    // its conversation, so the host can print the row in that conversation.
+    // its conversation, so the host can print the row in that conversation, and
+    // it is a turn rather than bookkeeping, so the host prints it.
     expect(waits.map(wait => wait.sessionId)).toEqual([SESSION])
+    expect(waits.map(wait => wait.bookkeeping)).toEqual([false])
     expect(poolState.switches).toEqual([])
   })
 
-  it('never attributes the session-title request\'s wait to the conversation', async () => {
+  it('reports the session-title wait with its conversation id and the bookkeeping flag', async () => {
     const poolState = pool()
     const { transport, upstream, notices, waits } = harness({
       failover: poolState.hooks,
@@ -431,15 +448,51 @@ describe('QoderTransport queue waiting', () => {
     expect(upstream.chatPats).toEqual([ALPHA.pat, ALPHA.pat])
     expect(waits.map(wait => [wait.attempt, wait.remaining, wait.waitMs])).toEqual([[1, 0, 1010]])
     expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'first-conversation')).toBe(true)
-    // What changes is the attribution: a title call is bookkeeping, not a turn,
-    // so it owns no conversation. Handing its wait to the main session made the
-    // host print a second "第 1 次等待" row in the user's chat — one for the
-    // chat's own wait and one for the title call's, whose durations differ by
-    // their independent jitter and so slip past the host's identical-text
-    // de-duplication.
-    expect(waits.map(wait => wait.sessionId)).toEqual([undefined])
+    // What the transport reports is the FACT of the request: the conversation it
+    // belongs to (the title call carries the same session id as the chat that
+    // asked for it) plus the flag that says this is bookkeeping. The host is
+    // what turns the flag into "keep this row out of the chat".
+    //
+    // Dropping the id instead — the first attempt at this fix — could not work:
+    // the host's printer reads a missing id as "print into whichever agent
+    // looked busy last", so the row still appeared (and could appear in an
+    // unrelated conversation), and the title call's deferred rotation row was
+    // filed under the session-less bucket while its own acceptance flushed the
+    // real session, so that row was lost.
+    expect(waits.map(wait => wait.sessionId)).toEqual([SESSION])
+    expect(waits.map(wait => wait.bookkeeping)).toEqual([true])
+    // A title call that recovered explains nothing: the final-failure notice is
+    // for requests that ended on the queue.
     expect(notices).toEqual([])
     expect(poolState.nextCalls).toEqual([])
+  })
+
+  it('flags a session-title request that ends on the queue, and does not hide the failure', async () => {
+    const poolState = pool()
+    const { transport, notices, waits } = harness({
+      failover: poolState.hooks,
+      queueWait: { attempts: () => 1, seconds: () => 0.01 },
+      random: () => 0,
+      // Never served: the budget runs out, so the terminal notice fires too.
+      chat: () => queued(0),
+    })
+
+    let failure: unknown
+    try {
+      await drainOptions(transport, titleRequest(SESSION))
+    } catch (error: unknown) {
+      failure = error
+    }
+
+    // The request still fails exactly as it did, with the same code.
+    expect((failure as QoderLlmError).code).toBe('RATE_LIMIT')
+    // The terminal notice carries the same two facts as the progress row: the
+    // real conversation and the bookkeeping flag. A budget that runs out on a
+    // title call must print no row either — the host suppresses both hooks from
+    // this one flag, so neither path can be left behind.
+    expect(notices).toHaveLength(1)
+    expect([notices[0]?.sessionId, notices[0]?.bookkeeping]).toEqual([SESSION, true])
+    expect(waits.map(wait => wait.bookkeeping)).toEqual([true])
   })
 
   it('keeps a zero-second advice from turning into a busy retry loop', async () => {

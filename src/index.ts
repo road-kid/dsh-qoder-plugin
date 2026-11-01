@@ -1354,7 +1354,7 @@ function createVariantRuntime(
         emitUpstreamNotice(failoverNoticeText(info.reason), info.sessionId)
       },
     },
-    onUpstreamQueue: (facts, accountId, sessionId, waits) => {
+    onUpstreamQueue: (facts, accountId, sessionId, waits, bookkeeping) => {
       const at = Date.now()
       // Health is per account and outlives one notice: recorded before the
       // document-wide notice, which is replaced on every answer.
@@ -1400,13 +1400,25 @@ function createVariantRuntime(
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is not serviceable (${facts.subCode ?? 'no sub-code'}, retry after ${facts.retryAfterSeconds ?? 'unknown'}s)`,
       )
+      // Everything above is bookkeeping about the outage — the account health,
+      // the streak, the status document the card reads — and it applies whether
+      // or not the user is watching. The conversation row is different: it is
+      // the user's turn speaking, and a bookkeeping request (the automatic
+      // session-title call) runs BESIDE that turn. Printing its row put a second
+      // "waiting" line in the same chat, differing from the turn's own only by
+      // jitter, which is also what defeated the identical-text de-duplication.
+      // Suppressed HERE, in the layer that knows what a row means: the transport
+      // reports the request's real conversation id and this flag, because
+      // "belongs to no conversation" and "should not be printed" are different
+      // facts and the printer falls back to its best guess for the former.
+      if (bookkeeping === true) return
       emitUpstreamNotice(formatQueueNotice(facts, {
         waited,
         occurrences: queueNotice.occurrences,
         ...waits === undefined ? {} : { waits },
       }), sessionId)
     },
-    onQueueWait: (facts, accountId, wait, sessionId) => {
+    onQueueWait: (facts, accountId, wait, sessionId, bookkeeping) => {
       // Progress, not the explanation: this row is printed when the wait
       // starts, so a request that waits out one or two windows is visibly
       // working instead of indistinguishable from a hang. The final-failure
@@ -1414,6 +1426,9 @@ function createVariantRuntime(
       ctx.logger.warn(
         `dsh-qoder-plugin: ${variant.displayName} upstream model is queued; waiting ${Math.round(wait.waitMs / 1000)}s before retry ${wait.attempt}/${wait.attempt + wait.remaining} (account ${accountId ?? 'ambient'}, wait driven by ${wait.basis?.source ?? 'unknown'})`,
       )
+      // A bookkeeping wait is logged (above) but never printed: it is not the
+      // user's turn waiting. See `onUpstreamQueue`.
+      if (bookkeeping === true) return
       emitUpstreamNotice(formatQueueWaitNotice(facts, wait), sessionId)
     },
     onChatAccepted: (accountId, sessionId) => {

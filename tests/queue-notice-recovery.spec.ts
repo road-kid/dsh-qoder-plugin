@@ -261,8 +261,42 @@ async function chat(ctx: Context, sessionId?: string): Promise<string> {
   return text
 }
 
-/** The current status document, through the route `apply()` really registered. */
-async function statusDocument(): Promise<Record<string, unknown>> {
+/**
+ * The prompt the host sends for the automatic session-title call.
+ *
+ * The transport recognises bookkeeping by the SHAPE of the request — one user
+ * message, one text block, starting with this sentence — so the text is part of
+ * the contract under test, not decoration.
+ */
+const TITLE_PROMPT = 'Generate the session title from this JSON array of human messages:["hi"]'
+
+/**
+ * Drive one automatic session-title request, the way the host's title job does.
+ *
+ * The request is a real call through the same adapter, shim and transport as
+ * `chat()`; only its shape (and so its role as bookkeeping) differs.
+ */
+async function titleChat(ctx: Context, sessionId?: string): Promise<void> {
+  try {
+    for await (const chunk of ctx.llm.stream({
+      provider: 'qoder',
+      model: 'live-model',
+      ...sessionId === undefined ? {} : { sessionId: sessionId as NonNullable<GenerateOptions['sessionId']> },
+      messages: [createUserMessage({
+        content: [{ type: 'text', text: TITLE_PROMPT }],
+        source: { kind: 'user' },
+      })],
+    })) {
+      void chunk
+    }
+  } catch (error: unknown) {
+    // A queued title call ends on an error finish; these cases are about what the
+    // conversation received, not about this stream's outcome.
+    void error
+  }
+}
+
+/** The current status document, through the route `apply()` really registered. */async function statusDocument(): Promise<Record<string, unknown>> {
   // undici refuses to fetch a handful of reserved ports, and an ephemeral bind
   // can land on one — so a fresh port is asked for rather than failing a test on
   // the draw. Earlier servers stay until cleanup; they are only sockets.
@@ -532,6 +566,98 @@ describe('queue notice lifecycle', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(base + 5 * 60 * 1000 + 60_000)
     expect(noticeIn(await statusDocument())).toBeUndefined()
+  }, 30_000)
+})
+
+describe('bookkeeping requests stay out of the conversation', () => {
+  /**
+   * The automatic session-title call runs BESIDE the user's turn, against the
+   * same model, and queues exactly like it. Its wait must not become a second
+   * progress row in the chat: the user asked one question and would be told
+   * twice, in two slightly different sentences, that the model is busy.
+   *
+   * These cases exist because the first attempt at this fix could not be
+   * trusted by inspection. It dropped the session id instead of flagging the
+   * request, and the printer treats a missing id as "print into whichever agent
+   * looked busy last" — so the row still appeared, sometimes in an unrelated
+   * conversation. The earlier regression test asserted the transport's callback
+   * arguments and never reached the printer, so it stayed green while the user
+   * kept seeing the row. These assert the ROWS, with the conversation that would
+   * have received them running the whole time.
+   */
+  it('keeps the title request\'s wait out of the conversation and on the card', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn(
+      { chat: () => queueChatOneSecond() },
+      { queueWaitAttempts: 1, queueWaitSeconds: 60 },
+    )
+    // The conversation whose turn triggered the title call. It is the last agent
+    // to have been `running`, which is the fallback a notice with no session id
+    // lands on: if suppression were still expressed by dropping the id, this row
+    // would arrive here and the expectation below would fail.
+    session.running('session-title-wait')
+    await titleChat(ctx, 'session-title-wait')
+
+    // The wait itself is unchanged and still reported: the card is the user's
+    // window into what the plugin is doing, and a title call that sat out the
+    // budget really did wait. Suppression is about the chat row, not the record.
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ kind: 'queued', waited: true })
+    const waits = notice!.waits as { attempts?: number } | undefined
+    expect(waits?.attempts).toBe(1)
+
+    // ...and the user's conversation received nothing, on either path: this
+    // request waited once and then ended on the queue, so it fired the progress
+    // row AND the terminal notice. Both are bookkeeping.
+    expect(noticeLines(session.appended)).toEqual([])
+  }, 30_000)
+
+  it('keeps a title request that ends on the queue out of the conversation', async () => {
+    const session = conversation()
+    // The fixture default: zero waits, so the very first queue answer is
+    // terminal and only the final notice can fire.
+    const ctx = await bootSignedIn({ chat: () => queueChat() })
+    session.running('session-title-fail')
+    await titleChat(ctx, 'session-title-fail')
+
+    const notice = noticeIn(await statusDocument())
+    expect(notice).toMatchObject({ kind: 'queued', waited: false })
+    expect(noticeLines(session.appended)).toEqual([])
+  }, 30_000)
+
+  it('still prints the same conversation\'s user-facing chat', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn({ chat: () => queueChat() })
+    session.running('session-title-control')
+    // Same conversation, same upstream answer, same notice — only the request's
+    // role differs. Suppression must key on that role, not on the conversation or
+    // on the sentence, so this control proves the row is still reachable.
+    await titleChat(ctx, 'session-title-control')
+    expect(noticeLines(session.appended)).toEqual([])
+    await chat(ctx, 'session-title-control')
+    expect(noticeLines(session.appended)).toHaveLength(1)
+  }, 30_000)
+
+  it('prints nothing for a title request that names no conversation', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn({ chat: () => queueChat() })
+    // An agent IS running: a session-less notice that is not flagged as
+    // bookkeeping falls back to it and prints. Flagging, not the missing id, is
+    // what has to keep this row out.
+    session.running('session-bystander')
+    await titleChat(ctx)
+    expect(noticeLines(session.appended)).toEqual([])
+  }, 30_000)
+
+  it('keeps the last-running-agent fallback for a session-less direct call', async () => {
+    const session = conversation()
+    const ctx = await bootSignedIn({ chat: () => queueChat() })
+    session.running('session-direct-call')
+    // A direct API call — not a turn, not bookkeeping. It names no conversation,
+    // and the printer's fallback is the only thing that can show its row, so
+    // suppression must not be implemented as "no session id means print nothing".
+    await chat(ctx)
+    expect(noticeLines(session.appended)).toHaveLength(1)
   }, 30_000)
 })
 

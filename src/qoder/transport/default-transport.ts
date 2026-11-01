@@ -901,8 +901,17 @@ export class DefaultQoderTransport implements QoderTransport {
       if (facts !== undefined && options.signal?.aborted !== true) {
         // The real wait record beside the real failure: the notice's wait
         // sentence is a claim about THIS request, so it quotes the waits this
-        // request completed rather than the clock between two reports.
-        this.onUpstreamQueue?.(facts, attribution.accountId, sessionIdOf(options), queueWaitSummary(queueBudget))
+        // request completed rather than the clock between two reports. The
+        // conversation id is the request's own even for host bookkeeping: only
+        // the host knows whether the row should be printed, and it is told
+        // which kind of request this was.
+        this.onUpstreamQueue?.(
+          facts,
+          attribution.accountId,
+          sessionIdOf(options),
+          queueWaitSummary(queueBudget),
+          isTitleRequest(options),
+        )
       }
       throw error
     } finally {
@@ -1340,13 +1349,21 @@ export class DefaultQoderTransport implements QoderTransport {
     // here and nowhere else, and a pending rotation is filed under this key so
     // no other conversation can flush it.
     //
-    // A title request owns no conversation, for the same reason it pins none
-    // (see `isTitleRequest`): it is bookkeeping the host runs beside the turn,
-    // so attributing its notices to the session let the host print a second
-    // "waiting" row inside the user's chat — the title call's own wait, next to
-    // the chat's — and the two rows differ only by their independent jitter,
-    // which is what defeated the host's identical-text de-duplication.
-    const pendingId = isTitleRequest(options) ? undefined : sessionIdOf(options)
+    // A title request is bookkeeping the host runs beside the turn (see
+    // `isTitleRequest`), but it still belongs to the conversation that asked for
+    // it: this id is a fact about the request, not a decision about printing.
+    // Dropping it here was the earlier attempt at silencing the title call's
+    // queue row, and it failed twice over — the host's printer treats a missing
+    // id as "print into whichever agent looked busy last" (so the row still
+    // appeared, and could appear in an unrelated conversation), and the deferred
+    // rotation row was filed under the session-less bucket while acceptance
+    // flushed the real session, so the title call's own heal row was dropped.
+    // Visibility is the host's call and rides the `bookkeeping` flag below.
+    const pendingId = sessionIdOf(options)
+    // Whether this request is host bookkeeping rather than a turn. It is the
+    // host's call what to print, so the flag travels with the conversation id
+    // instead of replacing it.
+    const bookkeeping = isTitleRequest(options)
     for (;;) {
       try {
         // A pending notice from an earlier heal is reported as soon as this
@@ -1387,7 +1404,7 @@ export class DefaultQoderTransport implements QoderTransport {
                 attempt,
                 remaining: queueBudget.waitsLeft,
                 basis: plan.basis,
-              }, pendingId)
+              }, pendingId, bookkeeping)
             }
             await this.waitOutQueue(waitMs, options.signal)
             // Only a wait that COMPLETED may be claimed: a thrown abort above

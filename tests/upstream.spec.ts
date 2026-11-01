@@ -309,6 +309,34 @@ describe('chatStream failure classification before the response exists', () => {
     // The iterator is released rather than left dangling.
     expect(fake.closed()).toBe(true)
   })
+
+  it('answers a contentless completed response as a 502 server failure the host retries', async () => {
+    // The REAL empty-response path, as the plugin runs it: the wire emits a
+    // terminal `finish` failure carrying the structured EMPTY_RESPONSE code
+    // (src/qoder/transport/wire/sse.ts). Because no content preceded it, that
+    // chunk is also the FIRST chunk, so chatStream classifies it into an HTTP
+    // status instead of opening a 200 stream (src/upstream.ts, chatStream's
+    // early-failure arm): kindFromQoderFailure falls through to 'server', and
+    // with no `status` on the failure the shim answers KIND_STATUS.server.
+    const failure = { message: 'Model returned a completed response with no content.', code: 'EMPTY_RESPONSE' }
+    const { client, fake } = makeClient({
+      chunks: [{ type: 'finish', reason: { kind: 'error', failure } }],
+    })
+    const result = await client.chatStream(USER_BODY)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect([result.status, result.kind, result.message]).toEqual([502, 'server', failure.message])
+    expect(fake.closed()).toBe(true)
+    // Why this is still retried even though the structured code is invisible:
+    // the shim writes the failure as an HTTP 502 whose JSON body quotes the
+    // outbound status ("... upstream server (http 502): Model returned a
+    // completed response with no content."). The host's pi-ai adapter turns
+    // that into a thrown API error, and mapStopReason re-classifies it by TEXT
+    // through classifyPiAiError — /\b5\d\d\b/ matches the "502", yielding
+    // SERVER, which DEFAULT_RETRYABLE_CODES lists. The EMPTY_RESPONSE code
+    // never crosses the HTTP boundary, so the retry is bought by the 502
+    // status, not by the structured code; a host-side reader must not claim
+    // the code itself reaches the retry policy on this path.
+  })
 })
 
 describe('kindFromQoderFailure and classifyUpstreamError', () => {
