@@ -62,9 +62,11 @@ The fix now separates the two facts the transport was conflating:
 
 Internal queue budget, waiting and retry behavior are unchanged: the title request still waits and retries exactly as before.
 
+Identification is still by request SHAPE (`isTitleRequest`: one user message, one text block, one of the two title prefixes), the same predicate the stickiness code already uses at `src/qoder/transport/default-transport.ts`'s turn-tracking sites. So a genuine user turn whose text happens to begin with a title prefix is treated as bookkeeping — as it already was for stickiness, and it now also loses its queue row. The flag is applied in the host, so this stays a display-level consequence rather than a routing one. "Stable title-request identification" remains the deferred item that would remove the heuristic.
+
 Coverage is now at the layer that decides what the user sees. `tests/queue-notice-recovery.spec.ts` boots the real plugin, keeps a conversation running so the last-running-agent fallback would actually deliver a stray row, and asserts that a queued title request appends nothing — both when it recovers after a wait and when its budget runs out — while the same conversation's user-facing chat still prints its row. Reverting the host-layer change makes four of those five cases fail. `tests/transport-queue-wait.spec.ts` keeps the transport-level contract: the real session id plus the flag, for both hooks.
 
-`pnpm run check` passed after this fix (see the verification note below). Generated output was committed alongside it.
+`pnpm run check` passed after this fix: typecheck, Vitest 55 files / 908 tests, `node:test` 231 tests, and the build. Generated output was committed in `76aaf21 chore(build): regenerate lib for bookkeeping queue notice fix`, and a second build reproduces the same file hashes.
 
 ## Deferred items
 
