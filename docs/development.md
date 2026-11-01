@@ -53,6 +53,37 @@ as the first step of a release.
   timers rather than real multi-minute sleeps. Do not weaken production defaults or
   remove assertions to make a fixture finish quickly.
 
+## Fixing a reviewed branch
+
+A review that rejects a fix is a specification, not a suggestion. The loop that
+closed the transport review, and the one to reuse:
+
+1. **Reproduce before editing.** Read the review's claimed mechanism, then prove
+   or disprove it against the branch tip. A branch that "addressed" a finding may
+   only have renamed the symptom: of the commits added to the reviewed branch
+   after the report, one regenerated `lib/` and one added a doc line, and neither
+   touched the reported behaviour.
+2. **Fix where the decision is made.** The layer that owns the behaviour is the
+   one that must change. Suppressing a user-visible row belongs in the host's
+   emit path, not in the transport's attribution; a transport callback that drops
+   the session id to mean "stay quiet" hands the row to a fallback that prints it
+   somewhere worse.
+3. **Make the regression test fail first.** Revert the fix (stash the source file,
+   or flip the single line), run the new test, and confirm it fails for the stated
+   reason; then restore and confirm it passes. A test that is green on the unfixed
+   code is not a regression test, whatever it asserts. `git checkout --` may be
+   blocked by the session safety net, so restore with an editor and re-check
+   `git status`: `core.autocrlf` can leave a line-ending-only difference that
+   `git diff` reports as empty.
+4. **Test the layer that owns the claim.** A transport test asserting a callback
+   argument does not prove the user sees nothing. The visibility rule needs a
+   host-level test that boots the real plugin, keeps a conversation running so a
+   stray row would actually be delivered, and asserts the conversation stays
+   empty while the status card still records the wait.
+5. **Record the outcome next to the code.** Findings that were disproved, findings
+   that were real, and behaviour changes the fix implies all go into a
+   `docs/review-*.md` record. Reviewers read that file before the diff.
+
 ## Build output
 
 `lib/` is committed. This is deliberate: DSH installs the plugin from a GitHub ref
@@ -75,7 +106,7 @@ commit. A pull request that changes source without the bundle is incomplete.
 5. Tag and push: `git tag -a v<version> -m "v<version>"` then
    `git push origin main --tags`.
 
-The current release line is **1.1.2**. `prepack` guarantees the published tarball is
+The current release line is **1.1.3**. `prepack` guarantees the published tarball is
 built from the tagged source.
 
 ## Contribution conventions
@@ -90,6 +121,16 @@ built from the tagged source.
   dark mode.
 - **Tests for behaviour changes.** If you change what the plugin does, extend the
   suite that covers it. Purely cosmetic changes do not need a new test.
+- **Wire ordering is part of the contract.** `chatStream` turns a terminal FIRST
+  chunk into an HTTP status; anything yielded before a failure opens a 200 stream
+  and demotes that failure to an in-band frame, where the host derives the retry
+  code from the message text. A failure that should be retried has to be the
+  first chunk, and its test should pin the chunk ORDER, not just the final chunk.
+- **User-visible notices are decided in the host.** The transport reports facts
+  (which conversation, whether the request is bookkeeping); `src/index.ts`
+  decides what reaches a conversation. Never encode "do not print this" as a
+  missing session id — `emitUpstreamNotice` falls back to the last running agent
+  and prints it in whatever conversation was busiest.
 - **Commit messages in imperative English** — `fix: cancel in-flight catalog fetch on
   dispose`, not `fixed` and not `修复`. Keep the subject under ~72 characters and use
   the body for the why.
