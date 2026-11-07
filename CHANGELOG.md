@@ -2,6 +2,10 @@
 
 Entries describe user-visible behaviour; commit messages carry the mechanism.
 
+## 1.1.4 — 2026-11-07
+
+修复了新增模型刷新不出来的问题。Qoder 会把只在「应用（app）」场景先上线的模型（例如本次的 QoDuck / `lmodel`）单独放在 `app` 列表里；此前刷新模型目录时只读取了「助手（assistant）」列表，导致这类新模型即使点击「从 Qoder 刷新」也不会出现。现在目录会同时读取 `assistant` 与 `app` 两个场景，新增模型可正常刷新显示。
+
 ## 1.1.3 — 2026-11-01
 
 修复了排队通知可能重复发送的问题。
