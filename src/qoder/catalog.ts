@@ -132,10 +132,25 @@ export function normalizeQoderModels(
   payload: unknown,
   onConflict?: (conflict: CatalogConflict) => void,
 ): QoderCatalogModel[] {
-  if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as { assistant?: unknown }).assistant)) return []
+  if (typeof payload !== 'object' || payload === null) return []
+  /*
+   * Qoder splits the catalog into per-surface scenes (assistant, chat, app,
+   * developer, quest, qwork, experts, inline, qwake, ...). The conversational
+   * roster the desktop picker shows is the `assistant` scene PLUS any
+   * `app`-only additions: a model can launch in the app surface before it
+   * reaches `assistant` (for example a newly added free model), so reading
+   * only `assistant` silently dropped it. Read both, de-duplicated by key with
+   * `assistant` first, so an `app` copy can never overwrite assistant's
+   * permissions/prices for a model present in both scenes.
+   */
+  const candidates: QoderModelEntry[] = []
+  for (const scene of ['assistant', 'app'] as const) {
+    const list = (payload as Record<string, unknown>)[scene]
+    if (Array.isArray(list)) candidates.push(...(list as QoderModelEntry[]))
+  }
   const models: QoderCatalogModel[] = []
   const seen = new Set<string>()
-  for (const raw of (payload as { assistant: QoderModelEntry[] }).assistant) {
+  for (const raw of candidates) {
     if (typeof raw !== 'object' || raw === null || raw.enable !== true) continue
     const id = typeof raw.key === 'string' ? raw.key.trim() : ''
     if (!id || seen.has(id)) continue

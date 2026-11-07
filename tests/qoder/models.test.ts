@@ -161,6 +161,31 @@ test('normalizeQoderModels keeps enabled unique models and their transport metad
   }])
 })
 
+test('app-only conversational models are included and never override assistant rows', () => {
+  // Regression: a model launched only in the `app` surface (before it reaches
+  // `assistant`) used to be dropped. Seen live: `lmodel` / "QoDuck" existed
+  // only in payload.app, so the refresh produced 12 models and hid it.
+  const body = {
+    assistant: [{ key: 'reasoner', enable: true, display_name: 'Reasoner', price_factor: 0.5 }],
+    app: [
+      { key: 'reasoner', enable: true, display_name: 'Assistant name wins', price_factor: 0.1 },
+      { key: 'lmodel', enable: true, display_name: 'QoDuck', price_factor: 0, is_free: true },
+      { key: 'hidden', enable: false, display_name: 'Hidden' },
+    ],
+  }
+
+  const models = normalizeQoderModels(body)
+  assert.deepEqual(models.map(model => model.id), ['reasoner', 'lmodel'])
+
+  const reasoner = models.find(model => model.id === 'reasoner')
+  assert.equal(reasoner?.name, 'Reasoner')
+  assert.equal(reasoner?.priceFactor, 0.5)
+
+  const lmodel = models.find(model => model.id === 'lmodel')
+  assert.equal(lmodel?.name, 'QoDuck')
+  assert.equal(lmodel?.priceFactor, 0)
+})
+
 test('mergeQoderDiscoveryMetadata restores effort and rate data stripped by generic discovery', () => {
   const configured = [{
     id: 'reasoner',
